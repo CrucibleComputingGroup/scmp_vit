@@ -31,6 +31,16 @@
 
 On 1000 images: Δtop-1 = −0.108, Δtop-5 = −0.060.
 
+### 1000-image comparison across SC configs (seed=0, identical subset)
+| Config | Top-1 | Top-5 | img/s |
+|---|---|---|---|
+| FP baseline                   | 0.854 | 0.983 | 232.8 |
+| SC: QK                        | 0.746 | 0.923 |   8.2 |
+| SC: QK + AV                   | 0.723 | 0.915 |   3.5 |
+| SC: QK + AV + qkv_proj + out_proj | 0.705 | 0.886 |   2.9 |
+
+Cumulative SC load → top-1 cost: +AV adds −2.3 pt over QK-only; +projections adds another −1.8 pt. All attention operators (both matmuls + both linears) are now stochastic while MLP and linear_head stay FP.
+
 ### Extending SC to Attn@V and MLP linears (100 imgs, seed=0, same subset)
 All three ops now use `sc_matmul_grouped_enable_triton(mode="bipolar", group_a=1, group_b=1)` — per-row (per-token / per-output-channel) symmetric bipolar quantization plus sign bits. This is the same primitive Q-DiT's `SCAttention._sc_av_uniform` uses for AV. First attempt with per-tensor `sc_matmul` failed because softmax'd attn has most values ≪ max, so per-tensor bipolar quant zeroed them.
 
