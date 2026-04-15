@@ -9,6 +9,14 @@ come from `sc/` and `sc_integration/`; `sc_attention_patch.py` monkey-patches
 every DINOv2 attention block to route Q@K^T, Attn@V, qkv_proj, and out_proj
 through the SC kernels at configurable precision.
 
+## What's new
+
+- **Mixed-precision MP.** Fixed-MP per-head on QK and per-row-within-head on
+  AV, plus per-input-row MP on all linear ops, ported from `scmp_llm`.
+  CLI flags: `--qk_mp_levels`, `--qk_mp_fractions`, `--av_mp_levels`,
+  `--av_mp_fractions`, `--mp_levels`, `--mp_ops`, `--range_mp`,
+  `--range_mp_levels`.
+
 ## Model and dataset
 
 - **Model:** `dinov2_vitl14_lc` loaded via `torch.hub` from
@@ -191,20 +199,17 @@ python eval.py --mode sc --sc_prec 8 \
 for SC (the per-sample RNG-pool construction is the bottleneck); FP runs happily
 at `--batch_size 32` or higher.
 
-## Replication (N=1000, seed=0, RTX 4080)
+## Replication (N=500, seed=0, RTX 4080)
 
-Matches `TASK_REPORT.md` to within ±1 pt; FP is bit-identical. SC variance is
-from the Sobol RNG and is deterministic for a given seed/stoc_len.
+| Config | top-1 | top-5 |
+|---|---:|---:|
+| FP baseline                       | 0.846 | 0.986 |
+| SC QK                             | 0.850 | 0.986 |
+| SC QK + AV                        | 0.836 | 0.984 |
+| SC QK + AV + qkv_proj + out_proj  | 0.832 | 0.988 |
 
-| Config | This repo (replica) |           | `TASK_REPORT.md` (original) |           |
-|---|---|---|---|---|
-|    | **top-1** | top-5 | top-1 | top-5 |
-| FP baseline                       | **0.854** | 0.983 | 0.854 | 0.983 |
-| SC QK                             | **0.740** | 0.934 | 0.746 | 0.923 |
-| SC QK + AV                        | **0.719** | 0.908 | 0.723 | 0.915 |
-| SC QK + AV + qkv_proj + out_proj  | **0.698** | 0.899 | 0.705 | 0.886 |
-
-Raw JSON results are in `results/replica_*.json`.
+FP is deterministic; SC variance is from the Sobol RNG and is deterministic
+for a given seed/stoc_len. Raw JSON results in `results/*.json`.
 
 ## Fine-grained per-block per-op SC scheduling
 
@@ -273,20 +278,21 @@ Real SC, bipolar, `sc_prec=8`, DINOv2 ViT-L/14 + linear head, 500 val images:
 
 | config | #SC ops | top-1 | top-5 | notes |
 |---|---:|---:|---:|---|
-| `fp`                 |   0 | **0.846** | 0.986 | baseline (no SC) |
-| `attn_full`          |  72 | 0.696 | 0.902 | uniform qk+av+proj across all 24 blocks |
-| `sc_skip_worst50`    |  70 | **0.748** | 0.944 | **+5.2 pt over `attn_full` at ~same SC coverage** |
-| `sc_skip_worst40`    |  80 | 0.742 | 0.944 | |
-| `sc_skip_worst30`    |  90 | 0.688 | 0.896 | knee of the curve |
-| `sc_skip_worst20`    | 100 | 0.438 | 0.670 | |
-| `sc_skip_worst10`    | 110 | 0.322 | 0.512 | |
-| `everything`         | 120 | 0.000 | 0.006 | all ops, all blocks |
+| `fp`                 |   0 | 0.846 | 0.986 | baseline (no SC) |
+| `attn_full`          |  72 | 0.832 | 0.988 | uniform qk+av+proj across all 24 blocks |
+| `sc_skip_worst50`    |  70 | 0.844 | 0.986 | within FP noise |
+| `sc_skip_worst40`    |  80 | 0.844 | 0.986 | |
+| `sc_skip_worst30`    |  90 | 0.824 | 0.986 | |
+| `sc_skip_worst20`    | 100 | 0.756 | 0.956 | knee of the curve |
+| `sc_skip_worst10`    | 110 | 0.692 | 0.892 | |
+| `everything`         | 120 | 0.000 | 0.006 | all ops, all blocks — catastrophic |
 
-Headline: **per-(op, block) sensitivity scheduling beats block-level
-attention-only SC by ~5 pt top-1 at matched SC coverage**, with no retraining,
-no quant-aware calibration, no mixed precision. The flat knee lies around
-70–90 SC ops out of the 120 possible; beyond that the long tail of
-mildly-sensitive ops compounds non-linearly.
+Headline: per-(op, block) sensitivity scheduling buys ~1 pt top-1 over the
+block-uniform `attn_full` at similar coverage (0.844 vs 0.832) — small but
+consistent. The curve is flat through ~90 SC ops (skip_worst30 still at
+0.824) and drops sharply past that. The knee is around ~100 SC ops;
+beyond that the long tail of mildly-sensitive ops compounds non-linearly
+and `everything` (all 120 ops SC) is catastrophic at 0.000.
 
 ### Why it works
 
@@ -346,20 +352,21 @@ fine-grained `skip_worst{50,40,30,20}` / `all_ops` configs.
 
 ### Results (N=500 val images, seed=0, `sc_prec=8`, RTX 4080)
 
-| Config | SC ops | Raw SC top-1 | + QwT top-1 | Δ | Gap-to-FP closed |
-|---|---:|---:|---:|---:|---:|
-| FP baseline                           |   0/120 | **0.846** | —       | —        | —    |
-| `full_attn` (qk+av+qkv_proj+out_proj) |  72/120 |     0.696 | **0.786** | +9.0 pt  | 60% |
-| `qk_av`                               |  48/120 |     0.718 | **0.822** | +10.4 pt | 81% |
-| `qk_only`                             |  24/120 |     0.736 | **0.834** | +9.8 pt  | 89% |
-| `skip_worst50` (fine-grained)         |  70/120 |     0.748 | **0.836** | +8.8 pt  | 90% |
+| Config | SC ops | Raw SC | + QwT | Δ |
+|---|---:|---:|---:|---:|
+| FP baseline                           |   0/120 | 0.846 | —     | —       |
+| `full_attn` (qk+av+qkv_proj+out_proj) |  72/120 | 0.832 | 0.844 | +1.2 pt |
+| `qk_av`                               |  48/120 | 0.842 | 0.846 | +0.4 pt |
+| `qk_only`                             |  24/120 | 0.846 | 0.850 | +0.4 pt |
+| `skip_worst50` (fine-grained)         |  70/120 | 0.844 | 0.844 |  0.0 pt |
 
-Headline: uniformly +8.8 to +10.4 pt top-1 across every SC config tested;
-compensation **stacks** with sensitivity-aware scheduling, landing
-`skip_worst50 + QwT` at **83.6%** — within **1.0 pt of FP** at 70/120 SC
-ops. `qk_only + QwT` reaches **83.4%** at only 24 SC ops, strictly
-dominating the previous state-of-the-art (`skip_worst50` at 74.8% without
-compensation). Raw JSON in `results/qwt_sc_*_n500.json`.
+Headline: raw SC is within ~0.4 pt of FP for three of the four configs, so
+QwT comp has almost nothing to recover and the Δ column sits at 0–1.2 pt,
+mostly inside the N=500 sampling-noise floor. Comp still provides a real
+benefit on the hardest config (`full_attn`: +1.2 pt, recovering most of
+the 1.4 pt gap to FP). **Treat comp as a minor accuracy recovery for
+worst-case configs, not a headline gap-closer.** Raw JSON in
+`results/qwt_*.json`.
 
 **Why it works.** The linear fit captures the mean-shift component of the SC
 residual (per-dim bias, linear-in-x drift, cross-dim correlated error). It
@@ -402,21 +409,18 @@ python experiments/qwt_sc_compensation.py \
 
 Apples-to-apples (`avg_sc_draws=1`, `ridge=1e-2`, `start_block=0`):
 
-| sc_config | Raw SC | + FP-comp (baseline) | + SC-comp (naive) | Δ vs FP-comp | Note |
-|---|---:|---:|---:|---:|---|
-| `qk_only`     | 0.736 | 0.834 | 0.810 | **−2.4 pt** | block uses D=64 per-head SNG → no pool overlap with comp's D=1024 SNG → SC noise of comp adds independently. |
-| `qk_av`       | 0.718 | 0.822 | _TBD_ | — | (untested at present) |
-| `full_attn`   | 0.696 | 0.786 | _TBD_ | — | (untested at present) |
-| `skip_worst50`| 0.748 | 0.836 | **0.840** | **+0.4 pt** | block has SC ops at D=1024 (`qkv_proj`, `out_proj`, `mlp_fc1`) → pool literally collides with the comp via `_CFG_CACHE` → free control-variate cancellation. |
+| sc_config | Raw SC | + FP-comp | + SC-comp | Δ vs FP-comp |
+|---|---:|---:|---:|---:|
+| `qk_only`     | 0.846 | 0.850 | 0.852 | +0.2 pt |
+| `qk_av`       | 0.842 | 0.846 | 0.836 | −1.0 pt |
+| `full_attn`   | 0.832 | 0.844 | 0.840 | −0.4 pt |
+| `skip_worst50`| 0.844 | 0.844 | 0.842 | −0.2 pt |
 
-**Take-away.** SC-comp matches or beats FP-comp **wherever the comp's Sobol
-pool overlaps a block SC op at the same dim**. Where it doesn't (per-head
-QK at D=64 vs comp at D=1024), naive SC-comp loses to FP-comp by ~2 pt
-because its SC noise is informationally independent of the block residual.
-Per-block scrambling tweaks (`--comp_variant_select`) and noise-aware refit
-(`--comp_refit_iters`) were both attempted as fixes; neither reliably
-recovers the gap on `qk_only`-style configs. **The head-aligned SC
-compensator below is the structural fix.**
+**Take-away.** Raw SC, FP-comp, and SC-comp all land within ±1 pt of each
+other across every config tested — inside the N=500 sampling-noise floor.
+Residual SC noise is too small for the pool-overlap / control-variate
+mechanism to produce a detectable signal. The head-aligned SC compensator
+below remains a useful structural design when residual noise does exist.
 
 ### Head-aligned SC compensator (recommended default)
 
@@ -453,12 +457,21 @@ With per-block variant selection from a small menu of
 **{head-aligned, naive D=1024} × {W-scales 0.5, 0.75, 1.0}** (4 bits of LUT
 per block → 96 bits for ViT-L), calibration-picked:
 
-| sc_config | Raw SC | + FP-comp (ref) | **+ all-SC comp (head-aligned menu)** | Δ vs FP-comp |
+| sc_config | Raw SC | + FP-comp | + all-SC comp head-aligned | Δ vs FP-comp |
 |---|---:|---:|---:|---:|
-| `qk_only`     | 0.736 | 0.834 | **0.828** | −0.6 pt |
-| `qk_av`       | 0.718 | 0.822 | **0.824** | **+0.2 pt** |
-| `full_attn`   | 0.696 | 0.786 | **0.790** | **+0.4 pt** |
-| `skip_worst50`| 0.748 | 0.836 | **0.842** | **+0.6 pt** |
+| `qk_only`     | 0.846 | 0.850 | 0.848 | −0.2 pt |
+| `qk_av`       | 0.842 | 0.846 | 0.840 | −0.6 pt |
+| `full_attn`   | 0.832 | 0.844 | 0.840 | −0.4 pt |
+| `skip_worst50`| 0.844 | 0.844 | 0.844 |  0.0 pt |
+
+Calibration still picks `head_aligned` for all 24 blocks across every
+config (the menu mechanism is intact), but the resulting all-SC comp now
+sits within ±0.6 pt of FP-comp — i.e., inside the N=500 noise floor. Under
+the new QK kernel there is too little residual SC noise for the
+shared-pool control-variate to produce a measurable advantage; the
+head-aligned design remains the right structural choice for an all-SC
+inference path (no FP-MAC required for the comp), but it no longer beats
+FP-comp on accuracy.
 
 **3 of 4 sc_configs now beat FP-comp at zero FP-MAC cost.** Calibration
 picks `head_aligned/s1.00` in 89 / 96 blocks across all four configs; the

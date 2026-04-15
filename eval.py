@@ -80,6 +80,72 @@ def load_model(device):
     return model
 
 
+def _parse_csv_ints(s: str) -> list[int]:
+    return [int(x) for x in s.split(",") if x.strip()]
+
+
+def _parse_csv_floats(s: str) -> list[float]:
+    return [float(x) for x in s.split(",") if x.strip()]
+
+
+def _parse_csv_ops(s: str) -> list[str]:
+    return [x.strip() for x in s.split(",") if x.strip()]
+
+
+def _build_attn_mp_spec(args) -> dict:
+    """Assemble {"qk": MPConfig, "av": MPConfig} from --qk_mp_* / --av_mp_* flags."""
+    from sc_integration.mp_linear import MPConfig
+    spec = {}
+    if args.qk_mp_levels:
+        spec["qk"] = MPConfig(
+            stoc_len_levels=_parse_csv_ints(args.qk_mp_levels),
+            level_fractions=(_parse_csv_floats(args.qk_mp_fractions)
+                             if args.qk_mp_fractions else None),
+        )
+    if args.av_mp_levels:
+        spec["av"] = MPConfig(
+            stoc_len_levels=_parse_csv_ints(args.av_mp_levels),
+            level_fractions=(_parse_csv_floats(args.av_mp_fractions)
+                             if args.av_mp_fractions else None),
+        )
+    return spec
+
+
+def _build_linear_mp_spec(args) -> dict:
+    """Assemble {op_name: {"fixed": MPConfig, "range": RangeMPConfig, ...}}
+    from CLI flags. Returns {} if neither fixed-MP nor range-MP is requested.
+    """
+    from sc_integration.mp_linear import MPConfig, RangeMPConfig
+
+    fixed_levels = _parse_csv_ints(args.mp_levels) if args.mp_levels else []
+    fixed_fracs = _parse_csv_floats(args.mp_fractions) if args.mp_fractions else None
+    fixed_ops = _parse_csv_ops(args.mp_ops)
+    range_on = bool(args.range_mp)
+    range_levels = _parse_csv_ints(args.range_mp_levels) if range_on else []
+    range_ops = _parse_csv_ops(args.range_mp_ops) or (fixed_ops if range_on else [])
+
+    mp_fixed = (MPConfig(stoc_len_levels=fixed_levels,
+                         level_fractions=fixed_fracs)
+                if fixed_levels else None)
+    mp_range = (RangeMPConfig(stoc_len_levels=range_levels,
+                              base_threshold=args.range_mp_threshold)
+                if range_on else None)
+
+    if not mp_fixed and not mp_range:
+        return {}
+
+    spec: dict = {}
+    if mp_fixed:
+        for op in fixed_ops:
+            spec.setdefault(op, {})["fixed"] = mp_fixed
+    if mp_range:
+        for op in range_ops:
+            entry = spec.setdefault(op, {})
+            entry["range"] = mp_range
+            entry["range_group_size"] = args.range_mp_group_size
+    return spec
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--data_root", default="/home/yjrcs/SC_V/data/imagenet/data")
@@ -109,6 +175,39 @@ def main():
                         "{mlp_fc1,mlp_fc2,qk,av,proj} OR a 5-element 0/1 "
                         "vector (same order, e.g. '1,0,0,1,0'). Overrides "
                         "per-op --sc_qk/--sc_av/etc flags.")
+    # ---- Mixed precision (ported from ../scmp_llm) ----
+    p.add_argument("--mp_levels", default="",
+                   help="Comma-separated stoc_len levels (descending), e.g. "
+                        "'256,128'. Enables fixed per-input-row MP on --mp_ops.")
+    p.add_argument("--mp_fractions", default="",
+                   help="Comma-separated fractions per level (sums to 1). "
+                        "Empty = equal split.")
+    p.add_argument("--mp_ops", default="",
+                   help="Comma-separated linear ops that get fixed MP. "
+                        "Valid: mlp_fc1,mlp_fc2,qkv_proj,out_proj,proj.")
+    p.add_argument("--range_mp", type=int, default=0,
+                   help="Enable range-based per-weight-group MP on --range_mp_ops.")
+    p.add_argument("--range_mp_levels", default="256,128",
+                   help="Comma-separated stoc_len levels (descending) for range MP.")
+    p.add_argument("--range_mp_threshold", type=float, default=0.3,
+                   help="Normalized range threshold. Higher = more groups "
+                        "get lower precision.")
+    p.add_argument("--range_mp_ops", default="",
+                   help="Comma-separated linear ops that get range MP. "
+                        "Empty ⇒ same as --mp_ops.")
+    p.add_argument("--range_mp_group_size", type=int, default=0,
+                   help="Output-rows per range-MP group. 0 = per-tensor.")
+    # per-head / per-row MP on QK and AV (scmp_llm-compatible)
+    p.add_argument("--qk_mp_levels", default="",
+                   help="Per-head fixed MP on QK (metric = per-head |Q|.amax). "
+                        "Comma-separated stoc_len levels, e.g. '256,128'.")
+    p.add_argument("--qk_mp_fractions", default="",
+                   help="Comma-separated head fractions per level.")
+    p.add_argument("--av_mp_levels", default="",
+                   help="Per-attn-row fixed MP on AV (metric = attn_row.amax). "
+                        "Comma-separated stoc_len levels.")
+    p.add_argument("--av_mp_fractions", default="",
+                   help="Comma-separated row fractions per level.")
     p.add_argument("--sc_ops_per_block_json", default="",
                    help="Path to JSON file with per-op per-block vectors: "
                         '{"mlp_fc1":[0,1,...],"mlp_fc2":[...],"qk":[...],'
@@ -165,6 +264,14 @@ def main():
                 per_block_arg = _json.load(_f)
             print(f"[sc] sc_ops_per_block from {args.sc_ops_per_block_json}",
                   flush=True)
+
+        linear_mp_spec = _build_linear_mp_spec(args)
+        if linear_mp_spec:
+            print(f"[sc] linear_mp_spec: {sorted(linear_mp_spec)}", flush=True)
+        attn_mp_spec = _build_attn_mp_spec(args)
+        if attn_mp_spec:
+            print(f"[sc] attn_mp_spec: {sorted(attn_mp_spec)}", flush=True)
+
         stats = patch_model(
             model, sc_prec=args.sc_prec,
             sc_qk=bool(args.sc_qk), sc_av=bool(args.sc_av), sc_mlp=sc_mlp_flag,
@@ -177,6 +284,8 @@ def main():
             mlp_sc_spec=mlp_spec,
             sc_ops=sc_ops_arg,
             sc_ops_per_block=per_block_arg,
+            linear_mp_spec=linear_mp_spec or None,
+            attn_mp_spec=attn_mp_spec or None,
         )
         print(f"[sc] sc_prec={args.sc_prec} qk={bool(args.sc_qk)} "
               f"av={bool(args.sc_av)} mlp={bool(args.sc_mlp)} "
