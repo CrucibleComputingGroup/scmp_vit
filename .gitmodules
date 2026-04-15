@@ -1,0 +1,3 @@
+[submodule "QwT-SC"]
+	path = third_party/QwT-SC
+	url = git@github.com:Allenjin123/QwT.git

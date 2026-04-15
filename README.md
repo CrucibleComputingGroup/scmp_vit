@@ -215,6 +215,67 @@ ops across all five kinds, which is why it outperforms a naive "SC all
 attention" rule that leaves all fc1/fc2 FP but SCs *every* block's qk+av+proj
 — including the final ones that hurt most.
 
+## QwT-style residual compensation (no retraining)
+
+Port of [QwT's](https://arxiv.org/abs/2411.13918) closed-form
+`CompensationBlock` to the SC setting. Per block, fit a small residual
+`(Y_fp − Y_sc) ≈ X W + b` on 256 calibration images via ridge LS, then wrap
+each block as `out = block_sc(x) + x·W + b`. No backprop, no fine-tuning,
+~5 min on an RTX 4080. The library lives in the QwT-SC fork, vendored here
+as a git submodule at `third_party/QwT-SC/QwT-vit-sc/` — see that
+sub-project's [README](third_party/QwT-SC/QwT-vit-sc/README.md) for the full
+formulation, overhead analysis, and API.
+
+### Setup
+
+After cloning this repo:
+
+```bash
+git submodule update --init --recursive
+```
+
+### Reproducing the sweep
+
+```bash
+# Worst-hit baseline: full-attention SC.
+python experiments/qwt_sc_compensation.py \
+    --sc_config full_attn --n_calib 256 --n_eval 500 \
+    --batch_size 8 --out_json results/qwt_sc_full_attn_n500.json
+
+# Best combo: fine-grained sensitivity scheduling + QwT comp.
+python experiments/qwt_sc_compensation.py \
+    --sc_config skip_worst50 --n_calib 256 --n_eval 500 \
+    --batch_size 8 --out_json results/qwt_sc_skip_worst50_n500.json
+```
+
+Supported `--sc_config` presets: `full_attn`, `qk_only`, `qk_av`, and the
+fine-grained `skip_worst{50,40,30,20}` / `all_ops` configs.
+
+### Results (N=500 val images, seed=0, `sc_prec=8`, RTX 4080)
+
+| Config | SC ops | Raw SC top-1 | + QwT top-1 | Δ | Gap-to-FP closed |
+|---|---:|---:|---:|---:|---:|
+| FP baseline                           |   0/120 | **0.846** | —       | —        | —    |
+| `full_attn` (qk+av+qkv_proj+out_proj) |  72/120 |     0.696 | **0.786** | +9.0 pt  | 60% |
+| `qk_av`                               |  48/120 |     0.718 | **0.822** | +10.4 pt | 81% |
+| `qk_only`                             |  24/120 |     0.736 | **0.834** | +9.8 pt  | 89% |
+| `skip_worst50` (fine-grained)         |  70/120 |     0.748 | **0.836** | +8.8 pt  | 90% |
+
+Headline: uniformly +8.8 to +10.4 pt top-1 across every SC config tested;
+compensation **stacks** with sensitivity-aware scheduling, landing
+`skip_worst50 + QwT` at **83.6%** — within **1.0 pt of FP** at 70/120 SC
+ops. `qk_only + QwT` reaches **83.4%** at only 24 SC ops, strictly
+dominating the previous state-of-the-art (`skip_worst50` at 74.8% without
+compensation). Raw JSON in `results/qwt_sc_*_n500.json`.
+
+**Why it works.** The linear fit captures the mean-shift component of the SC
+residual (per-dim bias, linear-in-x drift, cross-dim correlated error). It
+can't chase the per-sample Sobol-realization variance, but downstream
+LayerNorm + 257-token aggregation averages that remainder, so the logit
+error is dominated by the correctable mean-shift. See the sub-project
+README for per-block r² diagnostics and overhead analysis (+25 M params,
++21% FLOPs, no inference slowdown — lost in the SC bottleneck).
+
 ## File layout
 
 ```
@@ -229,6 +290,8 @@ experiments/                         Sensitivity sweeps + end-to-end configs
     e2e_fine_grained.py              Real-SC eval of sc_skip_worstK schedules
     mlp_onebyone.py                  MLP first-N / last-N block sensitivity sweep
     calibrate_noise_model.py         Calibrate surrogate correction factor against real SC
-results/                             Per-run JSON (top-1, top-5, sensitivity data)
+    qwt_sc_compensation.py           QwT-style residual compensation driver (uses QwT-SC submodule)
+third_party/QwT-SC/                  git submodule -> Allenjin123/QwT.git (QwT fork with QwT-vit-sc)
+results/                             Per-run JSON (top-1, top-5, sensitivity data, qwt_sc_*)
 TASK_REPORT.md                       Original run log on gl1804 (2×RTX PRO 6000)
 ```
