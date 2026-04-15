@@ -322,18 +322,100 @@ QK at D=64 vs comp at D=1024), naive SC-comp loses to FP-comp by ~2 pt
 because its SC noise is informationally independent of the block residual.
 Per-block scrambling tweaks (`--comp_variant_select`) and noise-aware refit
 (`--comp_refit_iters`) were both attempted as fixes; neither reliably
-recovers the gap on `qk_only`-style configs. See the sub-project README for
-the formal control-variate analysis and the open question of *head-aligned
-SC compensators* (sharing the block's per-head QK SNG with the comp).
+recovers the gap on `qk_only`-style configs. **The head-aligned SC
+compensator below is the structural fix.**
+
+### Head-aligned SC compensator (recommended default)
+
+The naive SC compensator uses a monolithic `SCLinear` at D=1024 — its Sobol
+pool is `_CFG_CACHE[(1024, 8)]`, which has zero informational overlap with a
+block's per-head QK operating at D=64. `HeadAlignedSCLinear`
+(`sc_integration/head_aligned_comp.py`) fixes this by restructuring the
+comp into **16 per-head (D=64) SC matmuls** whose Sobol pool is literally
+the same `_CFG_CACHE[(64, 8)]` the block QK uses.
+
+```
+Naive SC comp:     x (N,1024) ─[SCLinear D=1024]─> Δ(N,1024)       pool: _CFG_CACHE[(1024,8)]
+Head-aligned comp: x (N,1024)─reshape (N,16,64)
+                   ├─head 0: (N,64) ─[SCLinear D=64 ] ─> Δ0
+                   ├─head 1: (N,64) ─[SCLinear D=64 ] ─> Δ1        each pool: _CFG_CACHE[(64,8)]
+                   ├─ …                                             = same as block QK
+                   └─head15: (N,64) ─[SCLinear D=64 ] ─> Δ15
+                   sum + bias ─────────────────────> Δ(N,1024)
+```
+
+**Identical FLOPs:** 16 × 64 × 1024 = 1024 × 1024 inner reductions. Same
+bit-level work, same weights (just sliced differently). **Different noise
+structure:** comp's SC noise now shares the block's per-head Sobol
+sequences → anti-correlation reappears via shared-pool control-variate.
+
+GPU speed: the 16-launch overhead is mitigated by CUDA-stream dispatch
+(bit-exact same output; 22 % faster than the sequential version; actually
+slightly *faster* than monolithic D=1024 SCLinear on ViT-L token counts
+because smaller kernels overlap better).
+
+#### Results — all-SC comp, head-aligned variant (N=500, sc_prec=8, RTX 4080)
+
+With per-block variant selection from a small menu of
+**{head-aligned, naive D=1024} × {W-scales 0.5, 0.75, 1.0}** (4 bits of LUT
+per block → 96 bits for ViT-L), calibration-picked:
+
+| sc_config | Raw SC | + FP-comp (ref) | **+ all-SC comp (head-aligned menu)** | Δ vs FP-comp |
+|---|---:|---:|---:|---:|
+| `qk_only`     | 0.736 | 0.834 | **0.828** | −0.6 pt |
+| `qk_av`       | 0.718 | 0.822 | **0.824** | **+0.2 pt** |
+| `full_attn`   | 0.696 | 0.786 | **0.790** | **+0.4 pt** |
+| `skip_worst50`| 0.748 | 0.836 | **0.842** | **+0.6 pt** |
+
+**3 of 4 sc_configs now beat FP-comp at zero FP-MAC cost.** Calibration
+picks `head_aligned/s1.00` in 89 / 96 blocks across all four configs; the
+remaining 7 picks are minor scale/architecture tweaks on `skip_worst50`
+only. Antithetic Sobol and random alternative seeds were never selected —
+the head-alignment architecture does essentially all the work.
+
+#### Reproduce
+
+```bash
+# Pure all-SC comp with head-aligned menu (recommended default):
+python experiments/qwt_sc_overnight.py \
+    --sc_config qk_only --n_calib 256 --n_eval 500 --batch_size 8 \
+    --comp_mode sc --n_variants 4 --w_scales 0.5,0.75,1.0 \
+    --head_aligned --n_heads 16 --skip_baseline \
+    --out_json results/pure_sc_qk_only_combined_pureSC.json
+
+# Batch all four sc_configs + ablations (≈2 hours on a 4080):
+bash experiments/run_overnight_pure_sc.sh
+```
+
+**Driver flags (head-aligned):**
+
+| Flag | Default | What it does |
+|---|---|---|
+| `--head_aligned` | off | Add head-aligned variants to the per-block menu. |
+| `--head_aligned_only` | off | Drop regular SC variants entirely; menu is head-aligned only. |
+| `--n_heads INT` | `16` | Number of head splits (must divide D=1024). |
+| `--n_variants INT` | `1` | Sobol seed-bank size (default + antithetic + random alt K-side seeds). Empirically K=1 is usually enough when head-aligned is in the menu. |
+| `--w_scales LIST` | `"1.0"` | Comma-separated W-premultipliers. `"0.5,0.75,1.0"` is the recommended menu. |
+
+See `OVERNIGHT_REPORT.md` for the full ablation and variant-usage
+statistics.
 
 ### Hardware framing
 
 For an SC accelerator, the relevant cost is **SC ops removed from the FP
-path**, not GPU wall-clock. SC-comp removes the per-block FP matmul (~21%
-of the FP inference FLOPs in QwT-SC's accounting) at the cost of one extra
-SC matmul of the same dim. On a GPU the Triton SC kernel has launch
-overhead so wall-clock can be slower; the headline numbers above are
-**accuracy at theoretical FLOPs/energy parity**, not stopwatch numbers.
+path**, not GPU wall-clock:
+
+- FP comp: 24 × 1024² = **25.2 M FP-MACs per image** (21 % of total FP).
+- All-SC (head-aligned) comp: 24 × (16 × 64 × 1024) = **25.2 M SC-MACs**
+  (identical inner reductions; one SC-MAC at sc_prec=8 = 256 bit-ANDs +
+  popcount, no FP multiplier needed).
+- Per-block scheduler LUT: ≤ 4 bits × 24 blocks = 96 bits.
+- Net silicon delta: **one fewer FP multiplier**. No other mandatory new
+  hardware (the SC matmul unit is already required for the attention path).
+
+On GPU the Triton SC kernel has launch overhead (see above — mitigated by
+CUDA streams but still present); the numbers above are **accuracy at
+theoretical FLOPs/energy parity**, not stopwatch numbers.
 
 ## File layout
 
