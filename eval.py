@@ -92,6 +92,28 @@ def main():
     p.add_argument("--mlp_skip_first_k", type=int, default=0)
     p.add_argument("--sc_qkv_proj", type=int, default=0)
     p.add_argument("--sc_out_proj", type=int, default=0)
+    p.add_argument("--sc_mlp_mode", choices=["bipolar", "unipolar"],
+                   default="bipolar",
+                   help="MLP SC quantization: bipolar=symmetric |max|, "
+                        "unipolar=asymmetric zero-point (better for post-GELU)")
+    p.add_argument("--sc_proj_mode", choices=["bipolar", "unipolar"],
+                   default="bipolar",
+                   help="qkv/out proj SC quant mode (default bipolar).")
+    p.add_argument("--mlp_sc_spec_json", default="",
+                   help="Path to JSON file with list of [block_idx, fc_name] "
+                        "pairs specifying exactly which MLP linears go SC. "
+                        "Overrides --mlp_skip_first_k / --mlp_skip_last_k. "
+                        "Sets --sc_mlp 1 implicitly.")
+    p.add_argument("--sc_ops", default="",
+                   help="Comma-separated op names from "
+                        "{mlp_fc1,mlp_fc2,qk,av,proj} OR a 5-element 0/1 "
+                        "vector (same order, e.g. '1,0,0,1,0'). Overrides "
+                        "per-op --sc_qk/--sc_av/etc flags.")
+    p.add_argument("--sc_ops_per_block_json", default="",
+                   help="Path to JSON file with per-op per-block vectors: "
+                        '{"mlp_fc1":[0,1,...],"mlp_fc2":[...],"qk":[...],'
+                        '"av":[...],"proj":[...]}. Each list has length '
+                        "n_blocks (24 for DINOv2 ViT-L/14). Highest priority.")
     p.add_argument("--batch_size", type=int, default=16)
     p.add_argument("--workers", type=int, default=4)
     p.add_argument("--max_images", type=int, default=0, help="0 = full val")
@@ -123,16 +145,42 @@ def main():
     model = load_model(device)
 
     if args.mode == "sc":
+        mlp_spec = None
+        sc_mlp_flag = bool(args.sc_mlp)
+        if args.mlp_sc_spec_json:
+            import json as _json
+            with open(args.mlp_sc_spec_json) as _f:
+                mlp_spec = [tuple(p) for p in _json.load(_f)]
+            sc_mlp_flag = True
+            print(f"[sc] mlp_sc_spec: {len(mlp_spec)} linears from "
+                  f"{args.mlp_sc_spec_json}", flush=True)
+        sc_ops_arg = args.sc_ops or None
+        if sc_ops_arg:
+            from sc_attention_patch import parse_sc_ops
+            print(f"[sc] sc_ops={sorted(parse_sc_ops(sc_ops_arg))}", flush=True)
+        per_block_arg = None
+        if args.sc_ops_per_block_json:
+            import json as _json
+            with open(args.sc_ops_per_block_json) as _f:
+                per_block_arg = _json.load(_f)
+            print(f"[sc] sc_ops_per_block from {args.sc_ops_per_block_json}",
+                  flush=True)
         stats = patch_model(
             model, sc_prec=args.sc_prec,
-            sc_qk=bool(args.sc_qk), sc_av=bool(args.sc_av), sc_mlp=bool(args.sc_mlp),
+            sc_qk=bool(args.sc_qk), sc_av=bool(args.sc_av), sc_mlp=sc_mlp_flag,
             mlp_skip_last_k=args.mlp_skip_last_k,
             mlp_skip_first_k=args.mlp_skip_first_k,
             sc_qkv_proj=bool(args.sc_qkv_proj),
             sc_out_proj=bool(args.sc_out_proj),
+            sc_mlp_mode=args.sc_mlp_mode,
+            sc_proj_mode=args.sc_proj_mode,
+            mlp_sc_spec=mlp_spec,
+            sc_ops=sc_ops_arg,
+            sc_ops_per_block=per_block_arg,
         )
         print(f"[sc] sc_prec={args.sc_prec} qk={bool(args.sc_qk)} "
               f"av={bool(args.sc_av)} mlp={bool(args.sc_mlp)} "
+              f"mlp_mode={args.sc_mlp_mode} proj_mode={args.sc_proj_mode} "
               f"skip_first={args.mlp_skip_first_k} skip_last={args.mlp_skip_last_k} "
               f"patched={stats}",
               flush=True)
