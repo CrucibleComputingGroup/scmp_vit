@@ -53,6 +53,99 @@ PY
 This places the 14 val shards under `./data/imagenet/data/` — that directory
 is what `--data_root` expects.
 
+### Running on a SLURM cluster (recipe: UMich GreatLakes `gpu-rtx6000`)
+
+Concrete recipe for the `nbleier_owned1` allocation on a 4× RTX PRO 6000
+Blackwell (97 GB each) node. Generalises cleanly to any multi-GPU SLURM
+partition — the only non-obvious tunable is `--mem`.
+
+**Rules of thumb (from this repo's profiling):**
+
+| Knob | Value | Why |
+|---|---|---|
+| `--mem` (total) | **≥ 32 GB × #GPUs** (so `128G` for 4 GPUs) | `--mem` is the cgroup total across the whole allocation, **not** per-GPU. A single ViT-L SC + QwT-comp job peaks at ~10–15 GB RAM (FP+SC model copies + calib activation buffer + DataLoader workers). Setting `--mem=32G` on a 4-GPU job is the #1 cause of silent SIGKILL the moment two jobs load models simultaneously. |
+| `--cpus-per-gpu` | 16 | Enough for `--workers 2–4` per job; DataLoader is never the bottleneck (SC kernel is). |
+| `--workers` (DataLoader) | `2` when 4-way parallel, `4` solo | Fewer fork-COW spikes against the cgroup cap. |
+| `--batch_size` | `8` for SC eval, `32+` for FP | SC is launch-bound on the per-sample Sobol pool construction, not compute-bound — bigger batches barely help. |
+| Data placement | `/scratch` | 6.3 GB of parquet shards — never put on `/home` (slow + quota). |
+| `--out_json` paths | unique per run | Otherwise parallel jobs race on the same file. |
+
+**One-shot allocation template** (runs until 1 AM tomorrow):
+
+```bash
+current_time=$(date +%s)
+tomorrow_1am=$(date -d "tomorrow 01:00:00" +%s)
+diff=$((tomorrow_1am - current_time))
+time_string=$(printf "%d:%02d:00" $((diff/3600)) $(((diff%3600)/60)))
+
+salloc --account=nbleier_owned1 --partition=gpu-rtx6000 \
+       --gres=gpu:4 --time=$time_string \
+       --cpus-per-gpu=16 --mem=128G
+```
+
+**Env + data setup (once per fresh env)** — run after `salloc` drops you on
+the compute node:
+
+```bash
+# Conda env (see top-level Setup for full pip steps)
+conda activate vit_sc
+git submodule update --init --recursive   # pulls QwT-SC submodule
+
+# Download 6.3 GB of ImageNet val parquet to /scratch, once.
+DATA_ROOT=/scratch/nbleier_owned_root/nbleier_owned1/shared_data/imagenet
+export HF_TOKEN=hf_xxxxxxxx
+python - <<PY
+from huggingface_hub import snapshot_download
+snapshot_download(repo_id="ILSVRC/imagenet-1k", repo_type="dataset",
+                  allow_patterns=["data/validation-*.parquet"],
+                  local_dir="$DATA_ROOT")
+PY
+```
+
+**Four-way parallel sweep** — one config per GPU, `CUDA_VISIBLE_DEVICES`
+pinning, backgrounded, joined with `wait`:
+
+```bash
+DATA=/scratch/nbleier_owned_root/nbleier_owned1/shared_data/imagenet/data
+mkdir -p logs results
+for i in 50 40 30 20; do
+    gpu=$(( (50 - i) / 10 ))    # 50→0, 40→1, 30→2, 20→3
+    CUDA_VISIBLE_DEVICES=$gpu nohup python -u experiments/qwt_sc_overnight.py \
+        --sc_config skip_worst$i --n_calib 256 --n_eval 500 \
+        --batch_size 8 --workers 2 \
+        --comp_mode sc --n_variants 4 --w_scales 0.5,0.75,1.0 \
+        --head_aligned --n_heads 16 --skip_baseline \
+        --data_root $DATA \
+        --out_json results/skip_worst${i}_sccomp_headaligned.json \
+        > logs/skip_worst${i}.log 2>&1 &
+done
+wait
+echo "all done; summaries:"
+for i in 50 40 30 20; do grep -A4 "=== SUMMARY ===" logs/skip_worst${i}.log; done
+```
+
+Each run is ~8 min (calib 5 min + eval 2 min + FP reference 3 s). With 4
+GPUs in parallel the whole sweep finishes in ~10 min wall-clock (vs ~32 min
+serial). Per-GPU throughput is identical to an RTX 4080 — SC is
+launch-overhead bound, so Blackwell doesn't speed up the kernel, it just
+lets you run four configs at once.
+
+**Diagnosing silent kills.** If a run exits without writing its `--out_json`
+and the log tail is stuck at `[data] building loaders`, it was SIGKILL'd by
+the cgroup. Check with:
+
+```bash
+sacct -j $SLURM_JOB_ID --format=JobID,State,ExitCode,MaxRSS,ReqMem
+```
+
+`MaxRSS` close to `ReqMem` = cgroup OOM — bump `--mem` and re-run. (Note:
+pipelines like `python ... 2>&1 | tee log` mask the kill as "exit 0" because
+`tee` itself exits cleanly; prefer `> log 2>&1` for unambiguous exit codes.)
+
+**Serial fallback** if `--mem` can't be raised: drop the `&` and `wait`,
+keep every run on GPU 0. Memory footprint per job is fine under 32 GB
+alone; the problem is only parallelism.
+
 ## Running eval
 
 `XFORMERS_DISABLED=1` is required so DINOv2 falls back to the SDPA forward path
