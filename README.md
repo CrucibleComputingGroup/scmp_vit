@@ -276,6 +276,65 @@ error is dominated by the correctable mean-shift. See the sub-project
 README for per-block r² diagnostics and overhead analysis (+25 M params,
 +21% FLOPs, no inference slowdown — lost in the SC bottleneck).
 
+### SC-kernel compensator (`--comp_mode sc`)
+
+The driver also supports running the residual `x @ W + b` itself through SC
+kernels — the same XNOR / Sobol kernels that the block uses — instead of
+keeping it in FP. Goal: a *fully SC* inference path so an SC accelerator
+doesn't need an FP unit just for the comp. The W, b solve stays closed-form
+ridge; only the inference-time matmul flips to SC via `SCLinear`. The comp's
+`(D=1024, sc_prec=8)` SNG is taken from the same `_CFG_CACHE` entry as any
+block ops at the same dim, so the comp's Sobol pool is deterministic across
+calibration ↔ inference and overlaps with block ops at matching dims.
+
+```bash
+# SC-kernel comp — drop-in replacement of FP comp.
+python experiments/qwt_sc_compensation.py \
+    --sc_config skip_worst50 --n_calib 256 --n_eval 500 \
+    --batch_size 8 --comp_mode sc --comp_sc_prec 8 \
+    --out_json results/qwt_sc_skip_worst50_n500_sccomp.json
+```
+
+**Driver flags (SC comp):**
+
+| Flag | Default | What it does |
+|---|---|---|
+| `--comp_mode {fp,sc}` | `fp` | Comp matmul kernel. `sc` uses `SCLinear`. |
+| `--comp_sc_prec INT` | `8` | SC bit-precision of the comp matmul. |
+| `--comp_sc_mode {bipolar,unipolar}` | `bipolar` | Per-row SC quant mode of the comp matmul. |
+| `--comp_refit_iters INT` | `0` | If `>0` and `comp_mode=sc`: K rounds of *noise-aware refit* — measure the comp's own SC noise δ on the calibration set, refit `W` against `R − δ`. Linearization can overshoot on early/small-residual blocks; tune cautiously. |
+| `--comp_variant_select` | off | Per-block, try `{default, antithetic-K}` Sobol configs for the comp and pick the lower-residual one (1 config bit per block in HW). Empirically only ~−0.15 noise correlation, so gain is small and not strictly Pareto. |
+
+### Results — SC comp vs FP comp (N=500, sc_prec=8, RTX 4080)
+
+Apples-to-apples (`avg_sc_draws=1`, `ridge=1e-2`, `start_block=0`):
+
+| sc_config | Raw SC | + FP-comp (baseline) | + SC-comp (naive) | Δ vs FP-comp | Note |
+|---|---:|---:|---:|---:|---|
+| `qk_only`     | 0.736 | 0.834 | 0.810 | **−2.4 pt** | block uses D=64 per-head SNG → no pool overlap with comp's D=1024 SNG → SC noise of comp adds independently. |
+| `qk_av`       | 0.718 | 0.822 | _TBD_ | — | (untested at present) |
+| `full_attn`   | 0.696 | 0.786 | _TBD_ | — | (untested at present) |
+| `skip_worst50`| 0.748 | 0.836 | **0.840** | **+0.4 pt** | block has SC ops at D=1024 (`qkv_proj`, `out_proj`, `mlp_fc1`) → pool literally collides with the comp via `_CFG_CACHE` → free control-variate cancellation. |
+
+**Take-away.** SC-comp matches or beats FP-comp **wherever the comp's Sobol
+pool overlaps a block SC op at the same dim**. Where it doesn't (per-head
+QK at D=64 vs comp at D=1024), naive SC-comp loses to FP-comp by ~2 pt
+because its SC noise is informationally independent of the block residual.
+Per-block scrambling tweaks (`--comp_variant_select`) and noise-aware refit
+(`--comp_refit_iters`) were both attempted as fixes; neither reliably
+recovers the gap on `qk_only`-style configs. See the sub-project README for
+the formal control-variate analysis and the open question of *head-aligned
+SC compensators* (sharing the block's per-head QK SNG with the comp).
+
+### Hardware framing
+
+For an SC accelerator, the relevant cost is **SC ops removed from the FP
+path**, not GPU wall-clock. SC-comp removes the per-block FP matmul (~21%
+of the FP inference FLOPs in QwT-SC's accounting) at the cost of one extra
+SC matmul of the same dim. On a GPU the Triton SC kernel has launch
+overhead so wall-clock can be slower; the headline numbers above are
+**accuracy at theoretical FLOPs/energy parity**, not stopwatch numbers.
+
 ## File layout
 
 ```

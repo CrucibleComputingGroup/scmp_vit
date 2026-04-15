@@ -55,7 +55,7 @@ def _sym_range(t: torch.Tensor) -> tuple[float, float]:
 
 
 def _sc_linear(x: torch.Tensor, weight: torch.Tensor, bias, sc_prec: int,
-               mode: str = "bipolar"):
+               mode: str = "bipolar", cfg_override: dict = None):
     """y = x @ weight^T + bias via SC.
 
     mode="bipolar": per-row symmetric quant (|max|), q_max = 2^(sc_prec-1)-1.
@@ -63,6 +63,9 @@ def _sc_linear(x: torch.Tensor, weight: torch.Tensor, bias, sc_prec: int,
     mode="unipolar": per-row asymmetric quant (scale = range/q_max, zero-point),
         q_max = 2^sc_prec - 1 → ~2× grid resolution. Good for heavy-tailed /
         asymmetric tensors (post-GELU activations for fc2).
+
+    ``cfg_override``: when not None, use this SC config instead of the cached
+    default — lets the comp use an alternative Sobol scrambling per block.
     """
     orig_shape = x.shape
     D_in = orig_shape[-1]
@@ -72,7 +75,7 @@ def _sc_linear(x: torch.Tensor, weight: torch.Tensor, bias, sc_prec: int,
         y = noisy_sc_matmul_grouped(x2, w, group_a=1, group_b=1,
                                     mode=mode, sc_prec=sc_prec)
     else:
-        cfg = _get_config(D_in, sc_prec)
+        cfg = cfg_override if cfg_override is not None else _get_config(D_in, sc_prec)
         y = sc_matmul_grouped_bipolar(x2, w, group_a=1, group_b=1,
                                       mode=mode, sc_prec=sc_prec, config=cfg)
     if bias is not None:
@@ -148,7 +151,8 @@ class SCLinear(nn.Module):
     mode selects symmetric (bipolar) or asymmetric zero-point (unipolar) quant.
     """
 
-    def __init__(self, linear: nn.Linear, sc_prec: int, mode: str = "bipolar"):
+    def __init__(self, linear: nn.Linear, sc_prec: int, mode: str = "bipolar",
+                 cfg_override: dict = None):
         super().__init__()
         self.sc_prec = sc_prec
         self.mode = mode
@@ -156,9 +160,13 @@ class SCLinear(nn.Module):
         self.bias = linear.bias
         self.in_features = linear.in_features
         self.out_features = linear.out_features
+        # Stored as a plain dict (not a buffer): used to pick an alternative
+        # Sobol scrambling for the comp's SC matmul, baked at calibration time.
+        self.cfg_override = cfg_override
 
     def forward(self, x):
-        return _sc_linear(x, self.weight, self.bias, self.sc_prec, mode=self.mode)
+        return _sc_linear(x, self.weight, self.bias, self.sc_prec,
+                          mode=self.mode, cfg_override=self.cfg_override)
 
 
 # Canonical op names for the sc_ops vector API.

@@ -37,13 +37,35 @@ if not (QWT_SC_LIB / "qwt_sc").exists():
 sys.path.insert(0, str(QWT_SC_LIB))
 
 import torch
+import torch.nn as nn
 from torch.utils.data import DataLoader, Subset
 
 from eval import build_transform, load_model, seed_all
 from imagenet_parquet import ImageNetParquetVal
-from sc_attention_patch import patch_model, set_noise_model, SC_OP_NAMES
+from sc_attention_patch import patch_model, set_noise_model, SC_OP_NAMES, SCLinear
 
 from qwt_sc import calibrate_qwt  # noqa: E402
+
+
+def make_sc_comp_factory(sc_prec: int, mode: str, cfg_override=None):
+    """Return a closure (W, b) -> SCLinear init'd from W, b.
+
+    When ``cfg_override`` is None, SCLinear uses the cached default Sobol
+    config (same as the block's D=D_in SC ops). When provided, the comp's SC
+    matmul uses ``cfg_override`` — a different Sobol scrambling — to give the
+    comp a *different* SC noise realization than the block. Per-block variant
+    selection at calibration picks whichever realization correlates *least*
+    with the block's residual.
+    """
+    def factory(W: torch.Tensor, b: torch.Tensor) -> nn.Module:
+        D_in, D_out = W.shape
+        layer = nn.Linear(D_in, D_out, bias=True)
+        with torch.no_grad():
+            layer.weight.copy_(W.t().contiguous())
+            layer.bias.copy_(b)
+        return SCLinear(layer, sc_prec=sc_prec, mode=mode,
+                         cfg_override=cfg_override)
+    return factory
 
 SENSITIVITY_JSON = HERE / "results" / "sensitivity_all_ops.json"
 
@@ -143,6 +165,23 @@ def main():
     ap.add_argument("--fwd_chunk", type=int, default=32)
     ap.add_argument("--skip_baseline", action="store_true",
                     help="skip the no-comp SC baseline eval (saves time)")
+    ap.add_argument("--comp_mode", choices=["fp", "sc"], default="fp",
+                    help="fp = original QwT-SC linear comp; sc = SC matmul comp "
+                         "reusing the block's _CFG_CACHE Sobol pool.")
+    ap.add_argument("--comp_sc_prec", type=int, default=8)
+    ap.add_argument("--comp_sc_mode", choices=["bipolar", "unipolar"],
+                    default="bipolar")
+    ap.add_argument("--comp_refit_iters", type=int, default=0,
+                    help="if >0 and comp_mode=sc, do K rounds of "
+                         "noise-aware refit: subtract the comp's measured SC "
+                         "noise δ from the LS target before refitting W.")
+    ap.add_argument("--comp_variant_select", action="store_true",
+                    help="per-block, try {default, antithetic-K} Sobol "
+                         "configs for the comp and pick the lower-residual "
+                         "one. 1 config-bit per block in hardware. NOTE: "
+                         "value-complement antithetic gives only ~−0.15 "
+                         "noise correlation in our kernel, so empirical gain "
+                         "is small and not strictly Pareto.")
     ap.add_argument("--out_json", default="results/qwt_sc_pilot.json")
     args = ap.parse_args()
 
@@ -202,6 +241,32 @@ def main():
         res_sc_raw = evaluate(model_sc, eval_loader, device)
         print("[result:sc_raw]", res_sc_raw, flush=True)
 
+    comp_factory = None
+    comp_factory_variants = None
+    if args.comp_mode == "sc":
+        if args.comp_variant_select:
+            # The comp matmul has D_in == D_out == 1024 for ViT-L (residual
+            # stream). Build both candidate Sobol scramblings at that D and
+            # let calibration pick per block.
+            from config_helpers import make_sobol_simple_config, make_sobol_antithetic_config
+            D = 1024
+            cfg_default = make_sobol_simple_config(D, D, args.comp_sc_prec)
+            cfg_anti    = make_sobol_antithetic_config(D, D, args.comp_sc_prec)
+            comp_factory_variants = [
+                ("default",    make_sc_comp_factory(args.comp_sc_prec, args.comp_sc_mode, cfg_override=cfg_default)),
+                ("antithetic", make_sc_comp_factory(args.comp_sc_prec, args.comp_sc_mode, cfg_override=cfg_anti)),
+            ]
+            print(f"[comp] SC compensator: sc_prec={args.comp_sc_prec} "
+                  f"mode={args.comp_sc_mode}  variants=2 (default, antithetic)",
+                  flush=True)
+        else:
+            comp_factory = make_sc_comp_factory(
+                sc_prec=args.comp_sc_prec, mode=args.comp_sc_mode)
+            print(f"[comp] SC compensator: sc_prec={args.comp_sc_prec} "
+                  f"mode={args.comp_sc_mode}", flush=True)
+    else:
+        print(f"[comp] FP compensator (baseline)", flush=True)
+
     print("[calib] starting QwT-style sequential calibration", flush=True)
     t_cal = time.time()
     seed_all(args.calib_seed)
@@ -218,6 +283,9 @@ def main():
         start_block=args.start_block,
         fwd_chunk=args.fwd_chunk,
         avg_sc_draws=args.avg_sc_draws,
+        comp_factory=comp_factory,
+        comp_factory_variants=comp_factory_variants,
+        comp_refit_iters=args.comp_refit_iters,
     )
     calib_s = time.time() - t_cal
     print(f"[calib] done in {calib_s:.1f}s", flush=True)
@@ -240,6 +308,11 @@ def main():
             "ridge": args.ridge, "start_block": args.start_block,
             "avg_sc_draws": args.avg_sc_draws,
             "batch_size": args.batch_size,
+            "comp_mode": args.comp_mode,
+            "comp_sc_prec": args.comp_sc_prec,
+            "comp_sc_mode": args.comp_sc_mode,
+            "comp_refit_iters": args.comp_refit_iters,
+            "comp_variant_select": args.comp_variant_select,
         },
         "calib": {"per_block": calib_report, "elapsed_s": calib_s},
         "results": {"fp": res_fp, "sc_raw": res_sc_raw, "sc_comp": res_sc_comp},

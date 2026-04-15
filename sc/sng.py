@@ -128,7 +128,9 @@ class SNG:
     stochastic bitstreams for SC computation.
     """
 
-    def __init__(self, rng_pool: RNGPool, rng_id: int, scramble: Optional[list[int]] = None):
+    def __init__(self, rng_pool: RNGPool, rng_id: int,
+                 scramble: Optional[list[int]] = None,
+                 complement: bool = False):
         """
         Initialize the SNG.
 
@@ -136,10 +138,15 @@ class SNG:
             rng_pool: The RNG pool to draw sequences from
             rng_id: Index of the RNG to use from the pool
             scramble: Optional bit permutation to apply
+            complement: If True, apply value-complement (max-1) - seq after
+                scramble. Same uniform distribution → same expected SC value;
+                different realization → ANTITHETIC SC noise. Used for the
+                comp's K-side to give η_antithetic ≈ -η_default exactly.
         """
         self.rng_pool = rng_pool
         self.rng_id = rng_id
         self.scramble = scramble
+        self.complement = bool(complement)
 
     def get_sequence(self, stoc_len: int) -> np.ndarray:
         """
@@ -149,12 +156,17 @@ class SNG:
             stoc_len: Length of sequence
 
         Returns:
-            NumPy array of (possibly scrambled) random values
+            NumPy array of (possibly scrambled / complemented) random values
         """
         seq = self.rng_pool.get_sequence(self.rng_id, stoc_len)
         if self.scramble is not None:
-            return apply_scramble(seq, self.scramble)
-        return seq.copy()  # Return copy to avoid modifying cached sequence
+            seq = apply_scramble(seq, self.scramble)
+        else:
+            seq = seq.copy()
+        if self.complement:
+            max_val = 1 << self.rng_pool.sc_prec
+            seq = (max_val - 1) - seq
+        return seq
 
 
 class SNGBank:
@@ -177,7 +189,8 @@ class SNGBank:
         self.rng_pool = rng_pool
         self.sng_configs = sng_configs
         self.sngs = [
-            SNG(rng_pool, cfg["rng_id"], cfg.get("scramble"))
+            SNG(rng_pool, cfg["rng_id"], cfg.get("scramble"),
+                complement=cfg.get("complement", False))
             for cfg in sng_configs
         ]
 
@@ -206,7 +219,9 @@ class SNGBank:
         # Check if we can use batch scrambling (all use same base RNG)
         unique_rng_ids = set(sng.rng_id for sng in self.sngs)
 
-        if len(unique_rng_ids) == 1:
+        any_complement = any(sng.complement for sng in self.sngs)
+
+        if len(unique_rng_ids) == 1 and not any_complement:
             # All SNGs share same RNG - use efficient batch scrambling
             base_rng_id = list(unique_rng_ids)[0]
             base_seq = rng_id_to_seq[base_rng_id]
@@ -223,7 +238,8 @@ class SNGBank:
                 base_seqs = np.broadcast_to(base_seq, (n_elements, stoc_len)).copy()
                 return apply_scramble_batch(base_seqs, scrambles, self.rng_pool.sc_prec)
         else:
-            # Multiple RNGs - process individually
+            # Mixed RNGs OR any complement flag set — process individually so
+            # the per-SNG complement handling in SNG.get_sequence runs.
             sequences = np.zeros((n_elements, stoc_len), dtype=np.int32)
             for i, sng in enumerate(self.sngs):
                 sequences[i] = sng.get_sequence(stoc_len)

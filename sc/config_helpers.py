@@ -607,6 +607,71 @@ def make_sobol_simple_config(q_e: int, k_e: int, sc_prec: int = 8) -> dict:
     }
 
 
+def make_sobol_antithetic_config(q_e: int, k_e: int, sc_prec: int = 8) -> dict:
+    """Sobol config with VALUE-COMPLEMENT antithetic on K-side (true antithetic).
+
+    Same Sobol RNGs as ``make_sobol_simple_config`` for both Q and K, but the
+    K-side SNGs apply ``τ' = (max−1) − τ`` after their RNG draw. Same uniform
+    distribution → preserved low-discrepancy and preserved expected SC matmul
+    value. Different bit realization → SC noise η_antithetic = −η_default to
+    leading order.
+
+    For variant selection: pairing this with ``make_sobol_simple_config``
+    realizes the polarity-flip primitive `pol ∈ {+1, −1}` from the math.
+    Per-block pick of pol then provably reduces ‖e_FP + pol·η‖² by
+    `2|⟨e_FP, η⟩|` (positive iff e_FP correlates with the comp's noise).
+    """
+    return {
+        "rng_pool": [
+            {"type": "sobol", "seed_type": "q"},
+            {"type": "sobol", "seed_type": "k"},
+        ],
+        "sng": {
+            "q": [{"rng_id": 0, "scramble": None} for _ in range(q_e)],
+            "k": [{"rng_id": 1, "scramble": None, "complement": True}
+                  for _ in range(k_e)],
+        }
+    }
+
+
+def make_sobol_altseed_config(q_e: int, k_e: int, sc_prec: int = 8,
+                                k_seed: Optional[list[int]] = None) -> dict:
+    """Sobol config with an *alternative* K-side direction-vector seed.
+
+    Same Sobol RNG family as ``make_sobol_simple_config`` for Q (low-
+    discrepancy preserved); K uses a different valid Sobol seed → an
+    independent low-discrepancy sequence with low SCC vs Q. Different bit
+    pattern, *same* uniformity properties, *different* SC noise realization.
+
+    For the QwT-SC compensator, this gives a hardware-friendly knob: pick
+    one of a small set of K-side Sobol seeds per block at calibration so the
+    comp's SC noise correlates with — and partially cancels — the block's
+    residual SC noise.
+
+    Args:
+        q_e, k_e, sc_prec: as in ``make_sobol_simple_config``
+        k_seed: Length-``sc_prec`` direction vector. Default for sc_prec=8 is
+            ``[1, 3, 7, 15, 31, 63, 127, 255]`` — the canonical Niederreiter-
+            style seed (different family than k=[1,1,1,1,9,1,41,255]).
+    """
+    if k_seed is None:
+        if sc_prec == 8:
+            k_seed = [1, 3, 7, 15, 31, 63, 127, 255]
+        else:
+            # Generic valid seed: seed[i] = 2^(i+1) - 1 (odd, in range).
+            k_seed = [(1 << (i + 1)) - 1 for i in range(sc_prec)]
+    return {
+        "rng_pool": [
+            {"type": "sobol", "seed_type": "q"},
+            {"type": "sobol", "seed": list(k_seed)},
+        ],
+        "sng": {
+            "q": [{"rng_id": 0, "scramble": None} for _ in range(q_e)],
+            "k": [{"rng_id": 1, "scramble": None} for _ in range(k_e)],
+        }
+    }
+
+
 def make_sobol_dse_config(q_e: int, k_e: int, sc_prec: int,
                           use_scrambling: bool = True) -> dict:
     """
