@@ -88,8 +88,7 @@ def main():
     print("\n" + "=" * 120)
     print("LEGEND: Δ vs raw = +pt over no-comp SC; Δ vs FPcmp = vs README's "
           "FP-comp baseline (negative = behind FP comp).")
-    print("        SC%blocks = fraction of blocks where calibration chose an SC "
-          "comp (vs FP) when --mixed_fp_sc.")
+    print("        SC%blocks = fraction of blocks where calibration chose an SC comp.")
     print("=" * 120)
 
 

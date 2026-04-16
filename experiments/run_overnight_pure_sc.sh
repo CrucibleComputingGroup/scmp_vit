@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Pure-SC overnight matrix: NO mixed FP/SC, NO FP fallback.
+# Pure-SC overnight matrix: NO FP fallback.
 # ASIC-realistic: the hardware design picks ONE comp architecture at tape-out;
 # per-block it only chooses among pre-selected SC variants (seed + scale + head-layout).
 #

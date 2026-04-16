@@ -31,33 +31,33 @@ run_one() {
     echo "[done] $name" >&2
 }
 
-# 2: skip_worst50 with K=6 + scales + mixed (counterpart to Run 1 already running)
-run_one skip_worst50_K6_scales_mixed --sc_config skip_worst50 \
-    "${COMMON[@]}" --n_variants 6 --w_scales 0.25,0.5,0.75,1.0 --mixed_fp_sc
+# 2: skip_worst50 with K=6 + scales
+run_one skip_worst50_K6_scales --sc_config skip_worst50 \
+    "${COMMON[@]}" --n_variants 6 --w_scales 0.25,0.5,0.75,1.0
 
 # 3: qk_only with head-aligned variants ONLY (head-aligned vs original SC)
 run_one qk_only_head_aligned_only --sc_config qk_only \
     "${COMMON[@]}" --n_variants 1 --w_scales 0.5,0.75,1.0 \
     --head_aligned_only --n_heads 16
 
-# 4: qk_only with head-aligned + regular SC + mixed FP/SC (lets calibration pick best per block)
+# 4: qk_only with head-aligned + regular SC (lets calibration pick best per block)
 run_one qk_only_full_kitchen_sink --sc_config qk_only \
     "${COMMON[@]}" --n_variants 4 --w_scales 0.5,0.75,1.0 \
-    --head_aligned --mixed_fp_sc --n_heads 16
+    --head_aligned --n_heads 16
 
-# 5: qk_av with K=6 + scales + mixed (intermediate config)
-run_one qk_av_K6_scales_mixed --sc_config qk_av \
-    "${COMMON[@]}" --n_variants 6 --w_scales 0.5,0.75,1.0 --mixed_fp_sc
+# 5: qk_av with K=6 + scales (intermediate config)
+run_one qk_av_K6_scales --sc_config qk_av \
+    "${COMMON[@]}" --n_variants 6 --w_scales 0.5,0.75,1.0
 
-# 6: full_attn with K=6 + scales + mixed (worst case)
-run_one full_attn_K6_scales_mixed --sc_config full_attn \
-    "${COMMON[@]}" --n_variants 6 --w_scales 0.5,0.75,1.0 --mixed_fp_sc
+# 6: full_attn with K=6 + scales (worst case)
+run_one full_attn_K6_scales --sc_config full_attn \
+    "${COMMON[@]}" --n_variants 6 --w_scales 0.5,0.75,1.0
 
 # 7: W-scale only (no seed search) — isolates scale effect on qk_only
 run_one qk_only_wscale_only --sc_config qk_only \
     "${COMMON[@]}" --n_variants 1 --w_scales 0.0,0.25,0.5,0.75,1.0
 
-# 8: Pure-FP comp baseline + mixed FP/SC for qk_only (validates mixed FP/SC works)
+# 8: Pure-FP comp baseline for qk_only
 run_one qk_only_fp_only --sc_config qk_only \
     "${COMMON[@]}" --comp_mode fp --w_scales 1.0
 

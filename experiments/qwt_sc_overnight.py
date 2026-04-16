@@ -1,18 +1,17 @@
-"""Extended QwT-SC compensator with K-seed bank, polarity flip, W-scale
-search, and per-block FP/SC mixed choice. Also records per-block correlation
-diagnostics so we can tell *why* a variant was selected.
+"""Extended QwT-SC compensator with K-seed bank, polarity flip, and W-scale
+search. Also records per-block correlation diagnostics so we can tell *why*
+a variant was selected.
 
 The hardware framing is unchanged from the parent driver: each chosen
 non-default option is at most O(log K) config bits per block (a tiny LUT in
-the SC accelerator's per-block scheduler), or in the mixed-FP/SC case, a
-single 1-bit "use FP comp" flag per block (24 bits total for ViT-L).
+the SC accelerator's per-block scheduler).
 
 Usage::
 
     python experiments/qwt_sc_overnight.py --sc_config qk_only \\
         --n_calib 256 --n_eval 500 --batch_size 8 \\
         --comp_mode sc --n_variants 8 --polarity_flip \\
-        --w_scales 0.5,0.75,1.0 --mixed_fp_sc \\
+        --w_scales 0.5,0.75,1.0 \\
         --out_json results/qwt_sc_qk_only_overnight.json
 """
 import argparse
@@ -145,7 +144,7 @@ def make_sc_factory(sc_prec, mode, cfg_override=None, scale=1.0, polarity=1):
 
 
 def make_fp_factory(scale=1.0, polarity=1):
-    """Factory returning an nn.Linear (FP comp) for mixed FP/SC selection."""
+    """Factory returning an nn.Linear (FP comp) for --comp_mode fp."""
     def factory(W, b):
         D_in, D_out = W.shape
         layer = nn.Linear(D_in, D_out, bias=True)
@@ -201,9 +200,6 @@ def main():
     ap.add_argument("--w_scales", type=str, default="1.0",
                     help="Comma-separated W magnitudes to try, e.g. '0.5,0.75,1.0'. "
                          "Per-block selection. ⌈log_2 n_scales⌉ extra config bits.")
-    ap.add_argument("--mixed_fp_sc", action="store_true",
-                    help="Per block, also try an FP comp; pick winner. "
-                         "1 extra config bit per block. Reports SC-coverage of comp.")
     ap.add_argument("--head_aligned", action="store_true",
                     help="Add head-aligned SC comp variants (per-head D=64 SC "
                          "matmul reusing _CFG_CACHE[(64,8)] = block QK pool).")
@@ -284,8 +280,7 @@ def main():
         res_sc_raw = evaluate(model_sc, eval_loader, device)
         print("[result:sc_raw]", res_sc_raw, flush=True)
 
-    # Build the comp variants: cartesian of {seed configs} x {polarities} x {scales}
-    # x {fp/sc} (if mixed_fp_sc).
+    # Build the comp variants: cartesian of {seed configs} x {polarities} x {scales}.
     D_resid = 1024  # ViT-L residual dim
     seed_bank = build_seed_bank(D_resid, args.comp_sc_prec, args.n_variants)
     polarities = [1, -1] if args.polarity_flip else [1]
@@ -312,11 +307,6 @@ def main():
                         args.comp_sc_prec, args.comp_sc_mode,
                         n_heads=args.n_heads, cfg_override=None,
                         scale=sc, polarity=pol)))
-        if args.mixed_fp_sc:
-            for pol in polarities:
-                for sc in scales:
-                    name = f"fp/p{'+' if pol > 0 else '-'}/s{sc:.2f}"
-                    variants.append((name, make_fp_factory(scale=sc, polarity=pol)))
     else:  # comp_mode == "fp"
         for pol in polarities:
             for sc in scales:
@@ -325,7 +315,7 @@ def main():
 
     print(f"[comp] variants={len(variants)}  "
           f"(seeds={len(seed_bank)} pols={len(polarities)} "
-          f"scales={len(scales)} mixed_fp_sc={args.mixed_fp_sc})",
+          f"scales={len(scales)})",
           flush=True)
     for name, _ in variants[:8]:
         print(f"        - {name}", flush=True)
@@ -391,7 +381,7 @@ def main():
             "comp_mode": args.comp_mode,
             "comp_sc_prec": args.comp_sc_prec, "comp_sc_mode": args.comp_sc_mode,
             "n_variants": args.n_variants, "polarity_flip": args.polarity_flip,
-            "w_scales": args.w_scales, "mixed_fp_sc": args.mixed_fp_sc,
+            "w_scales": args.w_scales,
         },
         "calib": {
             "per_block": calib_report,
