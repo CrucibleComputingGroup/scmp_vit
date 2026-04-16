@@ -35,7 +35,8 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Subset
 
-from eval import build_transform, load_model, seed_all
+from eval import (build_transform, load_model, seed_all,
+                  _build_attn_mp_spec, _build_linear_mp_spec)
 from imagenet_parquet import ImageNetParquetVal
 from sc_attention_patch import patch_model, set_noise_model, SC_OP_NAMES, SCLinear
 
@@ -212,6 +213,19 @@ def main():
     ap.add_argument("--n_heads", type=int, default=16,
                     help="Number of heads for head-aligned comp (must divide D=1024).")
     ap.add_argument("--out_json", default="results/qwt_sc_overnight.json")
+    # ---- Mixed precision (same CLI as eval.py; piped into patch_model) ----
+    ap.add_argument("--mp_levels", default="")
+    ap.add_argument("--mp_fractions", default="")
+    ap.add_argument("--mp_ops", default="")
+    ap.add_argument("--range_mp", type=int, default=0)
+    ap.add_argument("--range_mp_levels", default="256,128")
+    ap.add_argument("--range_mp_threshold", type=float, default=0.3)
+    ap.add_argument("--range_mp_ops", default="")
+    ap.add_argument("--range_mp_group_size", type=int, default=0)
+    ap.add_argument("--qk_mp_levels", default="")
+    ap.add_argument("--qk_mp_fractions", default="")
+    ap.add_argument("--av_mp_levels", default="")
+    ap.add_argument("--av_mp_fractions", default="")
     args = ap.parse_args()
 
     os.environ.setdefault("XFORMERS_DISABLED", "1")
@@ -247,10 +261,21 @@ def main():
     model_fp = load_model(device).eval()
     model_sc = load_model(device).eval()
 
+    linear_mp_spec = _build_linear_mp_spec(args) or None
+    attn_mp_spec = _build_attn_mp_spec(args) or None
+    if linear_mp_spec:
+        print(f"[mp] linear_mp_spec ops={sorted(linear_mp_spec)}", flush=True)
+    if attn_mp_spec:
+        print(f"[mp] attn_mp_spec ops={sorted(attn_mp_spec)}", flush=True)
     if preset is not None:
-        stats = patch_model(model_sc, sc_prec=args.sc_prec, **preset)
+        stats = patch_model(model_sc, sc_prec=args.sc_prec,
+                            linear_mp_spec=linear_mp_spec,
+                            attn_mp_spec=attn_mp_spec, **preset)
     else:
-        stats = patch_model(model_sc, sc_prec=args.sc_prec, sc_ops_per_block=fine_schedule)
+        stats = patch_model(model_sc, sc_prec=args.sc_prec,
+                            sc_ops_per_block=fine_schedule,
+                            linear_mp_spec=linear_mp_spec,
+                            attn_mp_spec=attn_mp_spec)
     print(f"[sc] patched={stats}", flush=True)
 
     res_sc_raw = None
