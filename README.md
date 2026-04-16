@@ -308,7 +308,14 @@ The 24×5 sensitivity matrix surfaces three universal patterns (see
 
 - **Late-block fc2 is the dominant damage path.** Block 22's fc2 alone has
   surrogate logit-L2 = 35.3 — larger than the next 4 worst (op, block) pairs
-  combined. Blocks 20–23's fc2 are ranks 1–4.
+  combined. Blocks 20–23's fc2 are ranks 1–4. Layer-by-layer profiling
+  shows fc2 causes **norm inflation** (‖SC‖/‖FP‖ up to 2.5× at block 22
+  even with clean FP input) due to the post-activation input distribution:
+  67 % of values quantize to `|x_int| ≤ 2` under per-row bipolar
+  quantization, leaving the enable-signal multiplication with Sobol
+  prefixes too short for accurate products. The SC noise on these
+  near-zero values dominates the output, inflating its norm; this
+  compounds through the residual stream across 24 blocks.
 - **All five operators are depth-monotonic in late layers.** Every op's
   sensitivity curve is flat for blocks 0–15, then rises sharply toward the
   classifier. The final LN + linear head has no downstream averaging
@@ -324,13 +331,75 @@ attention" rule that leaves all fc1/fc2 FP but SCs *every* block's qk+av+proj
 ## QwT-style residual compensation (no retraining)
 
 Port of [QwT's](https://arxiv.org/abs/2411.13918) closed-form
-`CompensationBlock` to the SC setting. Per block, fit a small residual
-`(Y_fp − Y_sc) ≈ X W + b` on 256 calibration images via ridge LS, then wrap
-each block as `out = block_sc(x) + x·W + b`. No backprop, no fine-tuning,
-~5 min on an RTX 4080. The library lives in the QwT-SC fork, vendored here
-as a git submodule at `third_party/QwT-SC/QwT-vit-sc/` — see that
-sub-project's [README](third_party/QwT-SC/QwT-vit-sc/README.md) for the full
-formulation, overhead analysis, and API.
+`CompensationBlock` to the SC setting. The library lives in the QwT-SC
+fork, vendored as a git submodule at `third_party/QwT-SC/QwT-vit-sc/`.
+
+### Formulation
+
+For each transformer block `i`, the compensation fits a linear residual
+correction to the SC noise on 256 calibration images (no backprop, no
+fine-tuning, ~5 min on an RTX 4080):
+
+```
+minimize  ||R_i − (X_i W_i + b_i)||²  +  λ ||W_i||²
+
+where  R_i = Y_fp_i − Y_sc_i       (FP − SC residual per block)
+       X_i = input to block i       (N × D, D=1024)
+       W_i = (D × D) = (1024 × 1024)
+       b_i = (D,) = (1024,)
+       λ   = ridge = 1e-4 (default)
+```
+
+Solved in closed form via the normal equations:
+
+```
+X_aug = [X | 1]                                   (append ones for bias)
+[W; b] = (X_aug^T X_aug + λ I)^{-1} X_aug^T R    (ridge only on W, not b)
+```
+
+At inference, each block is wrapped:
+
+```
+out = block_sc(x) + comp(x)       where comp(x) = x @ W + b
+```
+
+With `--comp_mode sc --head_aligned` (recommended), the `x @ W` matmul
+runs through HeadAlignedSCLinear — 16 per-head SC matmuls reusing the
+same Sobol pool as the block's QK path. **The entire inference path is
+SC**: block ops, comp matmul, and bias addition (a trivial accumulator on
+an SC ASIC). The only FP operation is the ridge LS solve during
+offline calibration.
+
+Blocks are fitted **sequentially (Gauss–Seidel)**: after fitting block
+`i`, its compensated output feeds block `i+1`'s calibration. This ensures
+each block is fitted on the distribution it will actually see at
+inference, preventing error compounding across the 24-block depth.
+
+### Ridge regularization
+
+Ridge is needed because SC noise is **stochastic** (Sobol RNG variance),
+unlike INT quantization noise which is deterministic. The regression
+target `R = Y_fp − Y_sc` has per-sample noise from the SC realization,
+acting as label noise in the LS fit. Ridge shrinks W toward zero, trading
+a small bias for reduced sensitivity to this target noise.
+
+Original QwT (INT quantization) uses **no ridge** — same input always
+produces the same rounding error, so the target is noise-free. The SC
+adaptation requires ridge specifically because of the stochastic noise.
+
+Ridge ablation on skip_worst40, N=500, 4× RTX PRO 6000:
+
+| ridge | no MP (comp top-1) | + 3-level MP (comp top-1) |
+|---:|---:|---:|
+| 0 (no reg) | 0.830 | *pending* |
+| **1e-4** | **0.852** | **0.846** |
+| 1e-2 | 0.848 | 0.842 |
+| 1.0 | 0.848 | 0.836 |
+
+The effect is larger under MP (1.0 pt spread) than without MP (0.4 pt),
+confirming ridge compensates for SC-specific stochastic noise — MP
+amplifies this noise (shorter bitstreams → higher Sobol variance →
+noisier regression target). Default is `ridge=1e-4`.
 
 ### Setup
 
@@ -375,13 +444,50 @@ the 1.4 pt gap to FP). **Treat comp as a minor accuracy recovery for
 worst-case configs, not a headline gap-closer.** Raw JSON in
 `results/qwt_*.json`.
 
-**Why it works.** The linear fit captures the mean-shift component of the SC
-residual (per-dim bias, linear-in-x drift, cross-dim correlated error). It
-can't chase the per-sample Sobol-realization variance, but downstream
-LayerNorm + 257-token aggregation averages that remainder, so the logit
-error is dominated by the correctable mean-shift. See the sub-project
-README for per-block r² diagnostics and overhead analysis (+25 M params,
-+21% FLOPs, no inference slowdown — lost in the SC bottleneck).
+**Why it works.** Layer-by-layer profiling of SC vs FP block outputs
+reveals the dominant error mechanism: **quantization-induced norm
+inflation**, not mean-shift. Per-row bipolar quantization sets
+`scale = abs_max_row / 127`, so rows with a few large outliers push the
+majority of values to `|x_int| ≤ 2` (boundary ≤ 4). At such tiny
+boundaries the enable-signal count uses a Sobol prefix of length 0–4 —
+effectively a coin flip, not a precise product. The SC noise on these
+near-zero quantized values is proportionally huge, inflating the output
+norm by a factor that compounds through the residual stream.
+
+Concretely, with all SC ops enabled (`everything` config, sc_prec=8,
+N=32 images):
+
+| Block | ‖SC‖/‖FP‖ | Quantized zero_frac | `|x_int|≤2` frac |
+|---|---:|---:|---:|
+| 0  | 1.04 | 0.75 | 0.90 |
+| 10 | 1.06 | 0.02 | 0.09 |
+| 19 | 2.10 | — | — |
+| 22 | **3.40** | 0.30 | **0.67** |
+
+The inflation is worst at blocks whose post-activation input is
+**sparse** — many near-zero values with a few outliers setting the
+per-row scale. Block 22 fc2 alone inflates by 2.5× even with clean
+FP input, because 67 % of its post-GELU input quantizes to `|x_int| ≤ 2`.
+Gaussian inputs with the same mean/std show only ~1.005× inflation,
+confirming the cause is the specific outlier-dominated distribution, not
+SC noise in general.
+
+The linear compensator `out = block_sc(x) + x·W + b` works because:
+
+1. **The inflation is deterministic** — same Sobol sequences and same
+   quantization grid produce the same per-element error for the same
+   input. The error is a fixed function of the boundary values, which
+   are (approximately) linear functions of x.
+2. **The error is approximately linear in x** — ridge LS on 256
+   calibration images captures this mapping. Per-sample Sobol variance
+   is averaged by downstream LayerNorm + 257-token aggregation.
+3. **Sequential (Gauss–Seidel) fitting** corrects each block's output
+   before the next block sees it, breaking the compounding loop that
+   drives ‖SC‖/‖FP‖ from 1.04 at block 0 to 3.40 at block 22.
+
+See the sub-project README for per-block r² diagnostics and overhead
+analysis (+25 M params, +21% FLOPs, no inference slowdown — lost in the
+SC bottleneck).
 
 ### SC-kernel compensator (`--comp_mode sc`)
 
@@ -544,13 +650,18 @@ energy win on an SC ASIC. The cliff is sharp: below eff_sl ≈ 140 (roughly
 the 4-level recipe), raw SC is destroyed and comp can no longer fully
 recover.
 
-**Why comp works under MP.** MP introduces a large but *systematic*
-per-dim mean-shift (short-bitstream rows consistently over/under-estimate
-their outputs). The linear residual `Y_fp − Y_sc ≈ X·W + b` captures
-this shift. Per-sample Sobol variance is averaged out by downstream
-LayerNorm + 257-token aggregation, so the correctable mean-shift
-dominates the logit error — until the per-sample variance grows large
-enough to overwhelm the correction (the cliff).
+**Why comp works under MP.** MP assigns shorter bitstreams to
+low-importance rows, which amplifies the quantization-induced norm
+inflation described above: shorter streams mean smaller Sobol prefixes,
+so even moderately-quantized values (not just near-zero ones) suffer
+from imprecise enable-signal counts. This inflates the per-block output
+norm further. The linear residual `Y_fp − Y_sc ≈ X·W + b` captures
+this inflation because it remains a deterministic, approximately-linear
+function of the input — the shorter bitstreams just increase its
+magnitude. Per-sample Sobol variance is averaged out by downstream
+LayerNorm + 257-token aggregation, so the correctable systematic
+component dominates the logit error — until the per-sample variance
+grows large enough to overwhelm the correction (the cliff).
 
 #### skip_worst30 + MP (N=500)
 

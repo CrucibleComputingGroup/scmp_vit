@@ -245,7 +245,7 @@ def main():
     ap.add_argument("--eval_seed", type=int, default=0)
     ap.add_argument("--batch_size", type=int, default=8)
     ap.add_argument("--workers", type=int, default=4)
-    ap.add_argument("--ridge", type=float, default=1e-2)
+    ap.add_argument("--ridge", type=float, default=1e-4)
     ap.add_argument("--start_block", type=int, default=0)
     ap.add_argument("--avg_sc_draws", type=int, default=1)
     ap.add_argument("--fwd_chunk", type=int, default=32)
