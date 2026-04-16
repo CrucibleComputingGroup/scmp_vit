@@ -1,0 +1,9 @@
+{
+  "fp": 0.846,
+  "sc_qk_original": 0.844,
+  "sc_qk_fixed": 0.844,
+  "sc_qk_av_original": 0.844,
+  "sc_qk_av_fixed": 0.846,
+  "full_attn_original": 0.834,
+  "full_attn_fixed": 0.8
+}

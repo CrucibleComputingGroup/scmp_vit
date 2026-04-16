@@ -50,6 +50,68 @@ from sc_integration.head_aligned_comp import HeadAlignedSCLinear
 
 SENSITIVITY_JSON = HERE / "results" / "sensitivity_all_ops.json"
 
+# Per-op MACs per block (DINOv2 ViT-L/14: D=1024, 16 heads, head_dim=64, seq=257)
+_SEQ = 257
+_OP_MACS = {
+    "qk":      16 * _SEQ * 64 * _SEQ,
+    "av":      16 * _SEQ * _SEQ * 64,
+    "proj":    _SEQ * 1024 * 3072 + _SEQ * 1024 * 1024,  # qkv + out
+    "mlp_fc1": _SEQ * 1024 * 4096,
+    "mlp_fc2": _SEQ * 4096 * 1024,
+}
+_COMP_MACS = _SEQ * 1024 * 1024
+
+
+def _avg_sl(levels_str, fracs_str, default):
+    if not levels_str:
+        return default
+    levels = [int(x) for x in levels_str.split(",")]
+    if fracs_str:
+        fracs = [float(x) for x in fracs_str.split(",")]
+    else:
+        fracs = [1.0 / len(levels)] * len(levels)
+    return sum(l * f for l, f in zip(levels, fracs))
+
+
+def compute_stoc_len_stats(args, fine_schedule, preset, n_blocks=24):
+    base_sl = 2 ** args.sc_prec
+    mp_ops = {x.strip() for x in args.mp_ops.split(",") if x.strip()}
+    sl_linear = _avg_sl(args.mp_levels, args.mp_fractions, base_sl)
+    op_sl = {
+        "qk":      _avg_sl(args.qk_mp_levels, args.qk_mp_fractions, base_sl),
+        "av":      _avg_sl(args.av_mp_levels, args.av_mp_fractions, base_sl),
+        "proj":    sl_linear if mp_ops & {"qkv_proj", "out_proj", "proj"} else base_sl,
+        "mlp_fc1": sl_linear if "mlp_fc1" in mp_ops else base_sl,
+        "mlp_fc2": sl_linear if "mlp_fc2" in mp_ops else base_sl,
+    }
+    if fine_schedule is not None:
+        active = {op: sum(fine_schedule.get(op, [0] * n_blocks)) for op in _OP_MACS}
+    elif preset is not None:
+        active = {
+            "qk": n_blocks if preset.get("sc_qk") else 0,
+            "av": n_blocks if preset.get("sc_av") else 0,
+            "proj": n_blocks if (preset.get("sc_qkv_proj") or preset.get("sc_out_proj")) else 0,
+            "mlp_fc1": n_blocks if preset.get("sc_mlp") else 0,
+            "mlp_fc2": n_blocks if preset.get("sc_mlp") else 0,
+        }
+    else:
+        active = {op: 0 for op in _OP_MACS}
+    main_macs = sum(_OP_MACS[op] * active[op] for op in _OP_MACS)
+    main_bitops = sum(_OP_MACS[op] * active[op] * op_sl[op] for op in _OP_MACS)
+    main_sl = main_bitops / main_macs if main_macs > 0 else 0
+    comp_sl = 2 ** args.comp_sc_prec if args.comp_mode == "sc" else 0
+    comp_macs = n_blocks * _COMP_MACS if args.comp_mode == "sc" else 0
+    comp_bitops = comp_macs * comp_sl
+    total_macs = main_macs + comp_macs
+    eff_sl = (main_bitops + comp_bitops) / total_macs if total_macs > 0 else 0
+    return {
+        "main_sl": round(main_sl, 1),
+        "eff_sl": round(eff_sl, 1),
+        "eff_reduction_pct": round((1 - eff_sl / base_sl) * 100, 1),
+        "main_macs_B": round(main_macs / 1e9, 2),
+        "comp_macs_B": round(comp_macs / 1e9, 2),
+    }
+
 
 def build_skip_worst_k_schedule(k, n_blocks=24):
     with open(SENSITIVITY_JSON) as f:
@@ -274,6 +336,12 @@ def main():
                             attn_mp_spec=attn_mp_spec)
     print(f"[sc] patched={stats}", flush=True)
 
+    sl_stats = compute_stoc_len_stats(args, fine_schedule, preset)
+    print(f"[sl] main_sl={sl_stats['main_sl']}  eff_sl={sl_stats['eff_sl']}  "
+          f"reduction={sl_stats['eff_reduction_pct']}%  "
+          f"(main={sl_stats['main_macs_B']}B + comp={sl_stats['comp_macs_B']}B MACs)",
+          flush=True)
+
     res_sc_raw = None
     if not args.skip_baseline:
         seed_all(args.eval_seed)
@@ -391,6 +459,7 @@ def main():
             "variant_counts": dict(cnt),
         },
         "results": {"fp": res_fp, "sc_raw": res_sc_raw, "sc_comp": res_sc_comp},
+        "stoc_len": sl_stats,
     }
     Path(args.out_json).parent.mkdir(parents=True, exist_ok=True)
     with open(args.out_json, "w") as f:
@@ -402,6 +471,8 @@ def main():
     if res_sc_raw:
         print(f"  SC (raw)          : top1={res_sc_raw['top1']:.4f}")
     print(f"  SC + comp         : top1={res_sc_comp['top1']:.4f}")
+    print(f"  main_sl={sl_stats['main_sl']}  eff_sl={sl_stats['eff_sl']}  "
+          f"reduction={sl_stats['eff_reduction_pct']}%")
     if args.comp_mode == "sc":
         print(f"  Comp SC coverage  : {n_sc_comp}/{len(chosen)} blocks "
               f"({100*n_sc_comp/max(1,len(chosen)):.0f}% no-FP-mac)")

@@ -16,6 +16,13 @@ through the SC kernels at configurable precision.
   CLI flags: `--qk_mp_levels`, `--qk_mp_fractions`, `--av_mp_levels`,
   `--av_mp_fractions`, `--mp_levels`, `--mp_ops`, `--range_mp`,
   `--range_mp_levels`.
+- **MP support in the overnight comp driver.** `qwt_sc_overnight.py` now
+  accepts all MP flags and pipes them into `patch_model`, so MP + SC-comp +
+  fine-grained scheduling compose in a single run.
+- **Effective stoc_len reporting (`main_sl` / `eff_sl`).** The driver now
+  computes and prints FLOP-weighted average bitstream length for the main SC
+  ops (`main_sl`) and including the compensation block (`eff_sl`), plus
+  effective reduction vs full-precision SC. Saved in JSON under `"stoc_len"`.
 
 ## Model and dataset
 
@@ -505,6 +512,111 @@ bash experiments/run_overnight_pure_sc.sh
 
 See `OVERNIGHT_REPORT.md` for the full ablation and variant-usage
 statistics.
+
+### Mixed-precision MP + SC compensation
+
+MP assigns variable bitstream lengths per row/head/op: high-importance
+rows keep the full stoc_len, low-importance rows use shorter (faster,
+noisier) streams. The overnight driver now accepts the same MP flags as
+`eval.py` and composes them with fine-grained scheduling + SC comp.
+
+**Effective stoc_len (`eff_sl`)** is the FLOP-weighted average bitstream
+length across *all* SC operations including the compensation block (which
+runs at `comp_sc_prec=8` → stoc_len 256). For skip_worst40, the comp
+block is 12.8 % of total SC MACs (6.47 B / 50.41 B), so the dilution
+from comp is modest.
+
+#### Results — skip_worst40, varying MP aggressiveness (N=500, seed=0, 4× RTX PRO 6000)
+
+| MP recipe | main_sl | eff_sl | reduction | raw top-1 | + SC-comp | vs FP (0.846) |
+|---|---:|---:|---:|---:|---:|---:|
+| no MP `[256]` | 256 | 256.0 | 0 % | 0.850 | 0.848 | +0.002 |
+| `[256,128]` 50/50 | 192 | 200.2 | 21.8 % | 0.822 | 0.836 | −0.010 |
+| `[256,128,64]` ⅓ each | 149 | 163.0 | 36.3 % | 0.296 | **0.842** | −0.004 |
+| uniform `[128]` | 128 | 144.4 | 43.6 % | 0.032 | 0.830 | −0.016 |
+| `[256,128,64,32]` ¼ each | 120 | 137.5 | 46.3 % | 0.000 | 0.634 | −0.212 |
+| uniform `[64]` | 64 | 88.6 | 65.4 % | 0.000 | 0.498 | −0.348 |
+
+**Headline.** SC-comp is most valuable *with* MP: at the 3-level recipe
+(`[256,128,64]`), raw SC collapses to 29.6 % but comp recovers to 0.842
+(−0.4 pt of FP) at 36.3 % effective bitstream reduction — a genuine
+energy win on an SC ASIC. The cliff is sharp: below eff_sl ≈ 140 (roughly
+the 4-level recipe), raw SC is destroyed and comp can no longer fully
+recover.
+
+**Why comp works under MP.** MP introduces a large but *systematic*
+per-dim mean-shift (short-bitstream rows consistently over/under-estimate
+their outputs). The linear residual `Y_fp − Y_sc ≈ X·W + b` captures
+this shift. Per-sample Sobol variance is averaged out by downstream
+LayerNorm + 257-token aggregation, so the correctable mean-shift
+dominates the logit error — until the per-sample variance grows large
+enough to overwhelm the correction (the cliff).
+
+#### skip_worst30 + MP (N=500)
+
+| MP recipe | main_sl | eff_sl | raw top-1 | + SC-comp | vs FP |
+|---|---:|---:|---:|---:|---:|
+| no MP | 256 | 256.0 | 0.826 | 0.838 | −0.008 |
+| `[256,128]` 50/50 | 192 | 200.2 | 0.774 | 0.834 | −0.012 |
+
+skip_worst30 has 90 SC ops (vs 80 for skip_worst40), so MP has more
+surface to damage. The 50/50 recipe drops raw SC to 0.774, but comp
+recovers +6.0 pt to 0.834. Without MP, comp slightly hurts (−1.2 pt)
+because raw SC is already above FP.
+
+#### Reproduce
+
+```bash
+DATA=/scratch/nbleier_owned_root/nbleier_owned1/shared_data/imagenet/data
+
+# skip_worst40 + 3-level MP + head-aligned SC comp (best tradeoff):
+python experiments/qwt_sc_overnight.py \
+    --sc_config skip_worst40 --n_calib 256 --n_eval 500 --batch_size 64 \
+    --comp_mode sc --n_variants 1 --w_scales 1.0 \
+    --head_aligned --n_heads 16 \
+    --mp_levels 256,128,64 --mp_fractions 0.333,0.334,0.333 \
+    --mp_ops mlp_fc1,mlp_fc2,qkv_proj,out_proj \
+    --qk_mp_levels 256,128,64 --qk_mp_fractions 0.333,0.334,0.333 \
+    --av_mp_levels 256,128,64 --av_mp_fractions 0.333,0.334,0.333 \
+    --out_json results/mp_test/sw40_3lvl.json
+
+# 4-way parallel sweep (one MP level per GPU):
+for cfg in "256,128:0.5,0.5" "256,128,64:0.333,0.334,0.333" \
+           "128:1.0" "64:1.0"; do
+    IFS=: read lvls fracs <<< "$cfg"
+    gpu=$((i++))
+    CUDA_VISIBLE_DEVICES=$gpu nohup python -u experiments/qwt_sc_overnight.py \
+        --sc_config skip_worst40 --n_calib 256 --n_eval 500 --batch_size 64 \
+        --comp_mode sc --n_variants 1 --w_scales 1.0 \
+        --head_aligned --n_heads 16 --workers 2 \
+        --mp_levels $lvls --mp_fractions $fracs \
+        --mp_ops mlp_fc1,mlp_fc2,qkv_proj,out_proj \
+        --qk_mp_levels $lvls --qk_mp_fractions $fracs \
+        --av_mp_levels $lvls --av_mp_fractions $fracs \
+        --data_root $DATA \
+        --out_json results/mp_aggressive/sw40_${lvls//,/_}.json \
+        > logs/sw40_${lvls//,/_}.log 2>&1 &
+done
+wait
+```
+
+#### Driver MP flags
+
+| Flag | Default | What it does |
+|---|---|---|
+| `--mp_levels LIST` | `""` | Stoc_len levels (descending) for per-input-row MP on linear ops. |
+| `--mp_fractions LIST` | `""` | Fraction of rows per level (sums to 1). Empty = equal split. |
+| `--mp_ops LIST` | `""` | Linear ops receiving MP: `mlp_fc1,mlp_fc2,qkv_proj,out_proj`. |
+| `--qk_mp_levels LIST` | `""` | Per-head fixed MP on QK (metric = per-head \|Q\|.amax). |
+| `--qk_mp_fractions LIST` | `""` | Head fractions per QK level. |
+| `--av_mp_levels LIST` | `""` | Per-attn-row fixed MP on AV (metric = attn_row.amax). |
+| `--av_mp_fractions LIST` | `""` | Row fractions per AV level. |
+| `--range_mp 0\|1` | `0` | Enable range-based per-weight-group MP. |
+| `--range_mp_levels LIST` | `"256,128"` | Stoc_len levels for range MP. |
+| `--range_mp_threshold FLOAT` | `0.3` | Normalized range threshold (higher = more low-prec groups). |
+
+The driver now also reports `main_sl` (main ops only) and `eff_sl`
+(including comp) in both the log summary and JSON (`"stoc_len"` key).
 
 ### Hardware framing
 
