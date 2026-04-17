@@ -1,7 +1,7 @@
 #!/bin/bash
 source ~/miniconda3/etc/profile.d/conda.sh
-conda activate qwt_d2
-cd /home/yjrcs/SC_V/vit_sc/det
+conda activate vit_sc
+cd "$(dirname "$0")"
 SD=results/sensitivity/schedules
 
 CUDA_VISIBLE_DEVICES=0 python -u sc_eval.py --n-eval 10 --sc_ops_per_block_json $SD/skip_worst_20.json --out-tag skip_worst_20 > results/log_skip_worst_20.txt 2>&1 &

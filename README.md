@@ -170,7 +170,6 @@ that `sc_attention_patch.py` can patch; `eval.py` sets it by default.
 
 ```bash
 python eval.py --mode fp \
-    --data_root ./data/imagenet/data \
     --batch_size 32 --workers 4 \
     --max_images 1000 --seed 0 \
     --out_json results/fp_n1k.json
@@ -196,7 +195,6 @@ Example — full attention in SC, MLP and head stay FP:
 ```bash
 python eval.py --mode sc --sc_prec 8 \
     --sc_qk 1 --sc_av 1 --sc_qkv_proj 1 --sc_out_proj 1 \
-    --data_root ./data/imagenet/data \
     --batch_size 8 --workers 4 \
     --max_images 1000 --seed 0 \
     --out_json results/sc_full_attn_n1k.json
@@ -258,7 +256,6 @@ Write the same dict as JSON, then:
 ```bash
 python eval.py --mode sc --sc_prec 8 \
     --sc_ops_per_block_json my_schedule.json \
-    --data_root ./data/imagenet/data \
     --batch_size 8 --max_images 500 --seed 0 \
     --out_json results/my_run.json
 ```
@@ -746,6 +743,43 @@ On GPU the Triton SC kernel has launch overhead (see above — mitigated by
 CUDA streams but still present); the numbers above are **accuracy at
 theoretical FLOPs/energy parity**, not stopwatch numbers.
 
+## Portability
+
+All data/checkpoint paths default to the GreatLakes shared_data location but
+can be overridden via CLI flags so the repo runs on any machine:
+
+| Script | Flag | Default (GreatLakes) |
+|---|---|---|
+| `eval.py` | `--data_root` | `/scratch/.../shared_data/imagenet/data` |
+| `det/fp_eval.py`, `det/sc_eval.py` | `--d2_datasets`, `--ckpt` | `/scratch/.../shared_data`, `.../pretrained/eva_coco_det.pth` |
+| `experiments/qwt_sc_overnight.py` etc. | `--data_root` | same |
+
+Shell scripts (`det/run_*.sh`) use `cd "$(dirname "$0")"` and `conda activate vit_sc`
+instead of hardcoded absolute paths.
+
+## Detection extension (`det/`)
+
+Ports the SC pipeline to **object detection + instance segmentation on COCO**
+using **EVA-01 ViT-L/14 ViTDet** (Cascade Mask R-CNN, 40 blocks). Uses
+**module-swap** instead of monkey-patching because EVA's 4-D window-partitioned
+attention (`B, H, W, C`) is incompatible with the DINOv2 forward rewrite.
+
+```bash
+cd det/
+
+# FP baseline
+python fp_eval.py --n-eval 100
+
+# SC eval (QK + AV + projections)
+python sc_eval.py --n-eval 100 --sc_ops 'qk,av,proj' --sc_prec 8
+
+# Visualize detection results on images
+python visualize.py --results_dir results/sc_p8 --n_images 5
+```
+
+See `det/README.md` for the full op taxonomy, schedule dispatch, and
+sensitivity sweep instructions.
+
 ## File layout
 
 ```
@@ -761,6 +795,12 @@ experiments/                         Sensitivity sweeps + end-to-end configs
     mlp_onebyone.py                  MLP first-N / last-N block sensitivity sweep
     calibrate_noise_model.py         Calibrate surrogate correction factor against real SC
     qwt_sc_compensation.py           QwT-style residual compensation driver (uses QwT-SC submodule)
+det/                                 Detection extension (EVA-01 ViTDet on COCO)
+    eval_common.py                   Shared model loading (auto-discovers QwT-SC submodule)
+    fp_eval.py / sc_eval.py          FP/SC detection eval
+    sc_patch/                        Module-swap SC (matmul1/matmul2 replacement)
+    visualize.py                     Draw detection boxes on COCO images
+    experiments/                     Per-(op, block) sensitivity sweep for EVA
 third_party/QwT-SC/                  git submodule -> Allenjin123/QwT.git (QwT fork with QwT-vit-sc)
 results/                             Per-run JSON (top-1, top-5, sensitivity data, qwt_sc_*)
 TASK_REPORT.md                       Original run log on gl1804 (2×RTX PRO 6000)

@@ -1,7 +1,7 @@
 #!/bin/bash
 source ~/miniconda3/etc/profile.d/conda.sh
-conda activate qwt_d2
-cd /home/yjrcs/SC_V/vit_sc/det
+conda activate vit_sc
+cd "$(dirname "$0")"
 SD=results/sensitivity/schedules
 
 CUDA_VISIBLE_DEVICES=0 python -u fp_eval.py --n-eval 100 --out-tag fp100 > results/log_fp100.txt 2>&1 &

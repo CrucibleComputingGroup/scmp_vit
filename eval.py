@@ -148,7 +148,8 @@ def _build_linear_mp_spec(args) -> dict:
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--data_root", default="/scratch/nbleier_owned_root/nbleier_owned1/shared_data/imagenet/data")
+    p.add_argument("--data_root", default="/scratch/nbleier_owned_root/nbleier_owned1/shared_data/imagenet/data",
+                   help="Path to ImageNet-1k parquet shards.")
     p.add_argument("--mode", choices=["fp", "sc"], required=True)
     p.add_argument("--sc_prec", type=int, default=8)
     p.add_argument("--sc_qk", type=int, default=1)

@@ -163,6 +163,10 @@ def main():
                    default="bipolar")
 
     p.add_argument("--out-tag", type=str, default=None)
+    p.add_argument("--d2_datasets", type=str, default="",
+                   help="DETECTRON2_DATASETS root (default: GreatLakes shared_data).")
+    p.add_argument("--ckpt", type=str, default="",
+                   help="Path to EVA-ViTDet checkpoint (default: GreatLakes shared_data).")
     args = p.parse_args()
 
     tag = args.out_tag or f"sc_p{args.sc_prec}"
@@ -170,7 +174,8 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
 
     print("[1] Loading config + model + weights")
-    model, test_loader, evaluator, subset = load_model_and_loader(args.n_eval)
+    model, test_loader, evaluator, subset = load_model_and_loader(
+        args.n_eval, d2_datasets=args.d2_datasets, ckpt=args.ckpt)
     set_evaluator_output_dir(evaluator, out_dir)
 
     n_blocks = len(list(model.backbone.net.blocks))

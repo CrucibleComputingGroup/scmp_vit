@@ -69,7 +69,7 @@ That is a **follow-up**, not in this scaffold.
 
 ```bash
 # FP baseline on first 100 COCO val images
-cd /home/yjrcs/SC_V/vit_sc/det
+cd <repo_root>/det
 python fp_eval.py --n-eval 100
 
 # SC eval, all ops on, sc_prec=8

@@ -17,7 +17,7 @@ from eval import build_transform, load_model, seed_all
 from imagenet_parquet import ImageNetParquetVal
 from sc_attention_patch import patch_model, SC_OP_NAMES, set_noise_model
 
-DATA_ROOT = "./data/imagenet/data"
+DATA_ROOT = "/scratch/nbleier_owned_root/nbleier_owned1/shared_data/imagenet/data"
 N_BLOCKS = 24
 SENSITIVITY_JSON = "results/sensitivity_all_ops.json"
 

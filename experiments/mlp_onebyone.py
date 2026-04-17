@@ -27,7 +27,7 @@ from eval import build_transform, load_model, seed_all
 from imagenet_parquet import ImageNetParquetVal
 from sc_attention_patch import patch_model
 
-DATA_ROOT = "./data/imagenet/data"
+DATA_ROOT = "/scratch/nbleier_owned_root/nbleier_owned1/shared_data/imagenet/data"
 N_IMAGES = 100
 BATCH = 8
 SEED = 0

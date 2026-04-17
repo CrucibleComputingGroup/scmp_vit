@@ -2,7 +2,7 @@
 **Date:** 2026-04-14  **Node:** gl1804.arc-ts.umich.edu  **GPU:** 2× NVIDIA RTX PRO 6000 Blackwell (97 GB)
 
 ### Setup
-- **Task / dataset:** ImageNet-1k validation classification (parquet at `/home/yjrcs/SC_V/data/imagenet/data`, 50 000 images). Used a 100-image subset (seed 0).
+- **Task / dataset:** ImageNet-1k validation classification (parquet at `/scratch/nbleier_owned_root/nbleier_owned1/shared_data/imagenet/data`, 50 000 images). Used a 100-image subset (seed 0).
 - **Model:** `dinov2_vitl14_lc` from `facebookresearch/dinov2` torch.hub (DINOv2 ViT-L/14 backbone + published ImageNet-1k linear classifier head, 24 blocks, d=1024, 16 heads, head_dim=64).
 - **SC config:** bipolar / XNOR matmul from `scmp_llm/SC/sc_triton.py`, Sobol-sequence RNG via `make_sobol_simple_config` (`scmp_llm/SC/config_helpers.py`). `sc_prec = 8` → `stoc_len = 256`, quant_max = 127. Per-head symmetric quantization for Q and K (from `qdit.sc_integration.sc_matmul.quantize_for_sc_per_head`).
 - **Stochasticized operator:** only the Q @ Kᵀ attention-score matmul in every block. Softmax, Attn @ V, QKV/proj linears, and MLP remain FP32/FP16.

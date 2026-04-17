@@ -9,31 +9,33 @@ import os
 import sys
 from pathlib import Path
 
-os.environ.setdefault(
-    "DETECTRON2_DATASETS",
-    "/scratch/nbleier_owned_root/nbleier_owned1/shared_data",
-)
+_DEFAULT_D2_DATASETS = "/scratch/nbleier_owned_root/nbleier_owned1/shared_data"
+_DEFAULT_CKPT = "/scratch/nbleier_owned_root/nbleier_owned1/shared_data/pretrained/eva_coco_det.pth"
 
 # Point at the QwT-det fork of EVA-01's ViTDet codebase. The fork is
 # EVA-01 + (a) Pillow/mmcv compat patches, (b) a compiled detectron2 C ext,
 # (c) MatMul() wrappers in Attention so SC swap is pure module-swap. The
 # official EVA-01 source doesn't ship (b) and can't run on the current env
 # without rebuilding, so we use the fork as the de-facto D2 base.
-EVA_DET = "/home/yjrcs/SC_V/QwT/QwT-det-RepQ-ViT/eva1/eva_det"
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+EVA_DET = str(_REPO_ROOT / "third_party" / "QwT-SC" / "QwT-det-RepQ-ViT" / "eva1" / "eva_det")
 if EVA_DET not in sys.path:
     sys.path.insert(0, EVA_DET)
 
 CFG_PATH = f"{EVA_DET}/projects/ViTDet/configs/COCO/cascade_mask_rcnn_vitdet_eva.py"
-CKPT = "/scratch/nbleier_owned_root/nbleier_owned1/shared_data/pretrained/eva_coco_det.pth"
 
 
-def load_model_and_loader(n_eval: int, disable_act_checkpoint: bool = True):
+def load_model_and_loader(n_eval: int, disable_act_checkpoint: bool = True,
+                          d2_datasets: str = "", ckpt: str = ""):
     """Build FP model + weights + test loader limited to first ``n_eval`` images.
 
     Returns ``(model, test_loader, evaluator, subset)``. ``evaluator`` is a
     ``COCOEvaluator`` whose internal ``_coco_api`` has been filtered to the
     subset, so AP is computed only against those images.
     """
+    os.environ.setdefault("DETECTRON2_DATASETS", d2_datasets or _DEFAULT_D2_DATASETS)
+    _ckpt = ckpt or _DEFAULT_CKPT
+
     from detectron2.config import LazyConfig, instantiate
     from detectron2.checkpoint import DetectionCheckpointer
     from detectron2.data import DatasetCatalog, MetadataCatalog
@@ -44,7 +46,7 @@ def load_model_and_loader(n_eval: int, disable_act_checkpoint: bool = True):
         cfg.model.backbone.net.use_act_checkpoint = False
 
     model = instantiate(cfg.model).eval().cuda()
-    DetectionCheckpointer(model).load(CKPT)
+    DetectionCheckpointer(model).load(_ckpt)
 
     orig_name = cfg.dataloader.test.dataset.names
     all_items = DatasetCatalog.get(orig_name)

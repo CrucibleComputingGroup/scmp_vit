@@ -52,6 +52,10 @@ def main():
                    default="results/sensitivity/sensitivity_all_ops.json")
     p.add_argument("--resume", action="store_true",
                    help="Skip (op, block) combos already in out_json.")
+    p.add_argument("--d2_datasets", type=str, default="",
+                   help="DETECTRON2_DATASETS root.")
+    p.add_argument("--ckpt", type=str, default="",
+                   help="Path to EVA-ViTDet checkpoint.")
     args = p.parse_args()
 
     ops_to_sweep = list(SC_OP_NAMES) if args.ops is None else args.ops
@@ -75,7 +79,8 @@ def main():
 
     # --- FP baseline ---
     print(f"[1] Loading model + loader (n_eval={args.n_eval})")
-    model, test_loader, evaluator, subset = load_model_and_loader(args.n_eval)
+    model, test_loader, evaluator, subset = load_model_and_loader(
+        args.n_eval, d2_datasets=args.d2_datasets, ckpt=args.ckpt)
     n_blocks = len(list(model.backbone.net.blocks))
     blk_lo = args.block_start
     blk_hi = n_blocks if args.block_end < 0 else min(args.block_end, n_blocks)
@@ -110,7 +115,8 @@ def main():
             # Reload clean model each time
             del model
             torch.cuda.empty_cache()
-            model, test_loader, evaluator, _ = load_model_and_loader(args.n_eval)
+            model, test_loader, evaluator, _ = load_model_and_loader(
+                args.n_eval, d2_datasets=args.d2_datasets, ckpt=args.ckpt)
 
             # SC only this one (op, block)
             spec = {k: [0] * n_blocks for k in SC_OP_NAMES}

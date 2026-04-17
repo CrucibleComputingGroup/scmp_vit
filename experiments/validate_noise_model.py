@@ -17,7 +17,7 @@ from imagenet_parquet import ImageNetParquetVal
 import sc_attention_patch
 from sc_attention_patch import patch_model, set_noise_model
 
-DATA_ROOT = "./data/imagenet/data"
+DATA_ROOT = "/scratch/nbleier_owned_root/nbleier_owned1/shared_data/imagenet/data"
 N_IMAGES, BATCH, SEED = 100, 8, 0
 
 

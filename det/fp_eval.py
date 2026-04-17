@@ -22,13 +22,18 @@ def main():
                    help="Number of COCO val images (first-N).")
     p.add_argument("--out-tag", type=str, default="fp",
                    help="Subdir under results/ (e.g. fp100).")
+    p.add_argument("--d2_datasets", type=str, default="",
+                   help="DETECTRON2_DATASETS root (default: GreatLakes shared_data).")
+    p.add_argument("--ckpt", type=str, default="",
+                   help="Path to EVA-ViTDet checkpoint (default: GreatLakes shared_data).")
     args = p.parse_args()
 
     out_dir = Path(__file__).parent / "results" / args.out_tag
     out_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"[1] Loading config + model + weights")
-    model, test_loader, evaluator, subset = load_model_and_loader(args.n_eval)
+    model, test_loader, evaluator, subset = load_model_and_loader(
+        args.n_eval, d2_datasets=args.d2_datasets, ckpt=args.ckpt)
     n_params = sum(p.numel() for p in model.parameters()) / 1e6
     print(f"    params: {n_params:.1f}M   subset: {len(subset)} images")
 

@@ -33,7 +33,7 @@ from sc_attention_patch import (
 )
 from sc_integration.mp_linear import MPConfig, RangeMPConfig
 
-DATA_ROOT = "./data/imagenet/data"
+DATA_ROOT = "/scratch/nbleier_owned_root/nbleier_owned1/shared_data/imagenet/data"
 N_BLOCKS = 24
 SC_BLOCKS_N = 8  # first-N MLP-SC regime (project memory: N ≤ 8)
 

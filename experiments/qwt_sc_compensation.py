@@ -146,7 +146,7 @@ def get_blocks(model):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--data_root", default="./data/imagenet/data")
+    ap.add_argument("--data_root", default="/scratch/nbleier_owned_root/nbleier_owned1/shared_data/imagenet/data")
     ap.add_argument("--sc_prec", type=int, default=8)
     ap.add_argument("--sc_config",
                     choices=list(SC_PRESETS) + list(FINE_GRAINED_KS),

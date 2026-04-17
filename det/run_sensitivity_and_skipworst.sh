@@ -1,8 +1,8 @@
 #!/bin/bash
 # Full pipeline: sensitivity sweep (4 GPU shards) → merge → skip_worst eval (4 configs)
 source ~/miniconda3/etc/profile.d/conda.sh
-conda activate qwt_d2
-cd /home/yjrcs/SC_V/vit_sc/det
+conda activate vit_sc
+cd "$(dirname "$0")"
 
 N_EVAL=10
 SC_PREC=8

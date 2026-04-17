@@ -646,7 +646,7 @@ def main():
     ap.add_argument("--ridge", type=float, default=1e-4)
     ap.add_argument("--batch_size", type=int, default=8)
     ap.add_argument("--workers", type=int, default=4)
-    ap.add_argument("--data_root", default="./data/imagenet/data")
+    ap.add_argument("--data_root", default="/scratch/nbleier_owned_root/nbleier_owned1/shared_data/imagenet/data")
     ap.add_argument("--out_dir", default="results/mp_comparison")
     ap.add_argument("--with_comp", action="store_true",
                     help="Include QwT compensation (slower, ~8min/run)")
