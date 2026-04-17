@@ -1,0 +1,52 @@
+/home/yjrcs/SC_V/QwT/QwT-det-RepQ-ViT/eva_det/detectron2/config/lazy.py:154: UserWarning: pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html. The pkg_resources package is slated for removal as early as 2025-11-30. Refrain from using this package or pin to Setuptools<81.
+  return old_import(name, globals, locals, fromlist=fromlist, level=level)
+[1] Loading config + model + weights
+    n_blocks = 40
+[2] Schedule (tier: per-op flags)
+    mlp_fc1      24/40
+    mlp_fc2      24/40
+    qkv_proj     40/40
+    out_proj     40/40
+    qk           40/40
+    av           40/40
+[3] Patching backbone (sc_prec=8, mlp_mode=bipolar, proj_mode=bipolar)
+    swapped: {'mlp_fc1': 24, 'mlp_fc2': 24, 'qkv_proj': 40, 'out_proj': 40, 'qk': 40, 'av': 40}
+[4] Running inference on 10 images
+/home/yjrcs/miniconda3/envs/qwt_d2/lib/python3.10/site-packages/torch/functional.py:554: UserWarning: torch.meshgrid: in an upcoming release, it will be required to pass the indexing argument. (Triggered internally at /pytorch/aten/src/ATen/native/TensorShape.cpp:4314.)
+  return _VF.meshgrid(tensors, **kwargs)  # type: ignore[attr-defined]
+Loading and preparing results...
+DONE (t=0.00s)
+creating index...
+index created!
+ Average Precision  (AP) @[ IoU=0.50:0.95 | area=   all | maxDets=100 ] = 0.036
+ Average Precision  (AP) @[ IoU=0.50      | area=   all | maxDets=100 ] = 0.046
+ Average Precision  (AP) @[ IoU=0.75      | area=   all | maxDets=100 ] = 0.046
+ Average Precision  (AP) @[ IoU=0.50:0.95 | area= small | maxDets=100 ] = 0.000
+ Average Precision  (AP) @[ IoU=0.50:0.95 | area=medium | maxDets=100 ] = 0.000
+ Average Precision  (AP) @[ IoU=0.50:0.95 | area= large | maxDets=100 ] = 0.208
+ Average Recall     (AR) @[ IoU=0.50:0.95 | area=   all | maxDets=  1 ] = 0.036
+ Average Recall     (AR) @[ IoU=0.50:0.95 | area=   all | maxDets= 10 ] = 0.036
+ Average Recall     (AR) @[ IoU=0.50:0.95 | area=   all | maxDets=100 ] = 0.036
+ Average Recall     (AR) @[ IoU=0.50:0.95 | area= small | maxDets=100 ] = 0.000
+ Average Recall     (AR) @[ IoU=0.50:0.95 | area=medium | maxDets=100 ] = 0.000
+ Average Recall     (AR) @[ IoU=0.50:0.95 | area= large | maxDets=100 ] = 0.208
+Loading and preparing results...
+DONE (t=0.00s)
+creating index...
+index created!
+ Average Precision  (AP) @[ IoU=0.50:0.95 | area=   all | maxDets=100 ] = 0.036
+ Average Precision  (AP) @[ IoU=0.50      | area=   all | maxDets=100 ] = 0.046
+ Average Precision  (AP) @[ IoU=0.75      | area=   all | maxDets=100 ] = 0.044
+ Average Precision  (AP) @[ IoU=0.50:0.95 | area= small | maxDets=100 ] = 0.000
+ Average Precision  (AP) @[ IoU=0.50:0.95 | area=medium | maxDets=100 ] = 0.000
+ Average Precision  (AP) @[ IoU=0.50:0.95 | area= large | maxDets=100 ] = 0.207
+ Average Recall     (AR) @[ IoU=0.50:0.95 | area=   all | maxDets=  1 ] = 0.036
+ Average Recall     (AR) @[ IoU=0.50:0.95 | area=   all | maxDets= 10 ] = 0.036
+ Average Recall     (AR) @[ IoU=0.50:0.95 | area=   all | maxDets=100 ] = 0.036
+ Average Recall     (AR) @[ IoU=0.50:0.95 | area= small | maxDets=100 ] = 0.000
+ Average Recall     (AR) @[ IoU=0.50:0.95 | area=medium | maxDets=100 ] = 0.000
+ Average Recall     (AR) @[ IoU=0.50:0.95 | area= large | maxDets=100 ] = 0.206
+    done in 232.2s (23.22s/img)
+    [bbox] AP=3.64  AP50=4.61  AP75=4.61
+    [segm] AP=3.62  AP50=4.61  AP75=4.39
+[OK] metrics -> /home/yjrcs/SC_V/vit_sc/det/results/sc_skipworst16/metrics.json

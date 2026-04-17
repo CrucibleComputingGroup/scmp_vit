@@ -1,0 +1,16 @@
+Launched 4 evals (n=100)
+ALL DONE
+=== fp100 ===
+    [bbox] AP=68.73  AP50=87.25  AP75=73.22
+    [segm] AP=61.61  AP50=86.51  AP75=66.44
+[OK] metrics -> /home/yjrcs/SC_V/vit_sc/det/results/fp100/metrics.json
+=== sc_qk_av_proj_100 ===
+tail: cannot open 'results/log_sc_qk_av_proj_100.txt' for reading: No such file or directory
+=== skip_worst_10_100 ===
+    [bbox] AP=68.93  AP50=86.15  AP75=74.41
+    [segm] AP=60.69  AP50=86.36  AP75=64.40
+[OK] metrics -> /home/yjrcs/SC_V/vit_sc/det/results/skip_worst_10_100/metrics.json
+=== skip_worst_20_100 ===
+    [bbox] AP=68.93  AP50=86.29  AP75=74.55
+    [segm] AP=61.10  AP50=86.48  AP75=64.26
+[OK] metrics -> /home/yjrcs/SC_V/vit_sc/det/results/skip_worst_20_100/metrics.json

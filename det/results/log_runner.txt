@@ -1,0 +1,2 @@
+Launched 3 jobs on GPU 0,1,2
+ALL DONE

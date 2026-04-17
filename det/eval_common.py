@@ -19,7 +19,7 @@ os.environ.setdefault(
 # (c) MatMul() wrappers in Attention so SC swap is pure module-swap. The
 # official EVA-01 source doesn't ship (b) and can't run on the current env
 # without rebuilding, so we use the fork as the de-facto D2 base.
-EVA_DET = "/home/yjrcs/SC_V/QwT/QwT-det-RepQ-ViT/eva_det"
+EVA_DET = "/home/yjrcs/SC_V/QwT/QwT-det-RepQ-ViT/eva1/eva_det"
 if EVA_DET not in sys.path:
     sys.path.insert(0, EVA_DET)
 

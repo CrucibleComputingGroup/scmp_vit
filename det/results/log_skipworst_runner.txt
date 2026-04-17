@@ -1,0 +1,18 @@
+Launched 4 skip_worst evals
+ALL DONE
+=== skip_worst_20 ===
+    [bbox] AP=67.57  AP50=81.27  AP75=75.60
+    [segm] AP=58.49  AP50=84.23  AP75=58.89
+[OK] metrics -> /home/yjrcs/SC_V/vit_sc/det/results/skip_worst_20/metrics.json
+=== skip_worst_30 ===
+    [bbox] AP=69.62  AP50=83.41  AP75=77.77
+    [segm] AP=59.90  AP50=86.65  AP75=60.35
+[OK] metrics -> /home/yjrcs/SC_V/vit_sc/det/results/skip_worst_30/metrics.json
+=== skip_worst_40 ===
+    [bbox] AP=68.65  AP50=82.32  AP75=77.31
+    [segm] AP=61.64  AP50=85.97  AP75=62.54
+[OK] metrics -> /home/yjrcs/SC_V/vit_sc/det/results/skip_worst_40/metrics.json
+=== skip_worst_50 ===
+    [bbox] AP=68.74  AP50=81.90  AP75=76.70
+    [segm] AP=60.94  AP50=85.34  AP75=62.41
+[OK] metrics -> /home/yjrcs/SC_V/vit_sc/det/results/skip_worst_50/metrics.json
