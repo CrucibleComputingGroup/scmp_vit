@@ -16,8 +16,6 @@ data/
 # Working notes / intermediate research artifacts (kept out of git history)
 IDEA_REPORT.md
 
-# Experimental SC-compensator result dumps (research artifacts, not baselines)
-results/qwt_sc_*sccomp*.json
-results/qwt_sc_*joint*.json
-results/qwt_sc_*freshclone*.json
-results/_smoke*.json
+# Experiment results (regenerable from code)
+results/
+det/results/
