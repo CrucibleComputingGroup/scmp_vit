@@ -92,9 +92,7 @@ class HeadAlignedSCLinear(nn.Module):
         return self._weight_heads
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Lazy import to avoid circular import (sc_attention_patch imports from
-        # sc_integration too).
-        from sc_attention_patch import _sc_linear
+        from sc_integration.sc_linear import _sc_linear
 
         orig_shape = x.shape
         D_in = orig_shape[-1]

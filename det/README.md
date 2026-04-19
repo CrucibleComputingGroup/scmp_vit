@@ -25,7 +25,7 @@ det/
 
 ## Why module-swap (and not vit_sc's monkey-patch)
 
-`vit_sc/sc_attention_patch.py` rewrites the attention `forward` for DINOv2's
+`vit_sc/cls/sc_attention_patch.py` rewrites the attention `forward` for DINOv2's
 3-D `(B, N, C)` signature. EVA-ViT in ViTDet uses a 4-D `(B, H, W, C)`
 signature with window partition — the rewritten forward would not slot in.
 Instead the EVA `Attention` module already exposes `matmul1` / `matmul2` as

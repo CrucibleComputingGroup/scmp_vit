@@ -5,9 +5,11 @@ with stochastic-computing (SC) matmuls swapped into the attention path, and
 compare against the FP baseline.
 
 No training. Only inference. The SC kernels (bipolar / XNOR matmul, Sobol RNG)
-come from `sc/` and `sc_integration/`; `sc_attention_patch.py` monkey-patches
+come from `sc/` and `sc_integration/`; `cls/sc_attention_patch.py` monkey-patches
 every DINOv2 attention block to route Q@K^T, Attn@V, qkv_proj, and out_proj
-through the SC kernels at configurable precision.
+through the SC kernels at configurable precision. The shared `SCLinear` /
+`_sc_linear` primitives now live in `sc_integration/sc_linear.py` so both
+`cls/` (DINOv2) and `det/` (EVA-ViTDet) pull from one source.
 
 ## What's new
 
@@ -164,7 +166,8 @@ alone; the problem is only parallelism.
 ## Running eval
 
 `XFORMERS_DISABLED=1` is required so DINOv2 falls back to the SDPA forward path
-that `sc_attention_patch.py` can patch; `eval.py` sets it by default.
+that `cls/sc_attention_patch.py` can patch; `cls/eval.py` sets it by default.
+All classification commands below are run from `cls/`.
 
 ### FP baseline
 
@@ -236,6 +239,7 @@ entry per block, `1` = SC, `0` = FP). Missing ops default to all-FP.
 ### Python API
 
 ```python
+# run from cls/ so sc_attention_patch is importable as a top-level module
 from sc_attention_patch import patch_model
 
 # SC everything except late-block fc2 (the most sensitive linears):
@@ -783,18 +787,21 @@ sensitivity sweep instructions.
 ## File layout
 
 ```
-eval.py                              FP / SC evaluation driver
-imagenet_parquet.py                  ImageFolder-style dataset over HF parquet shards
-sc_attention_patch.py                DINOv2 patcher: per-block per-op SC schedule support
+cls/                                 Classification (DINOv2 ViT-L/14 on ImageNet-1k)
+    eval.py                          FP / SC evaluation driver
+    imagenet_parquet.py              ImageFolder-style dataset over HF parquet shards
+    sc_attention_patch.py            DINOv2 patcher: per-block per-op SC schedule support
+    experiments/                     Sensitivity sweeps + end-to-end configs
+        sensitivity_all_ops.py       24 x 5 per-(op, block) sensitivity matrix
+        e2e_fine_grained.py          Real-SC eval of sc_skip_worstK schedules
+        mlp_onebyone.py              MLP first-N / last-N block sensitivity sweep
+        calibrate_noise_model.py     Calibrate surrogate correction factor against real SC
+        qwt_sc_compensation.py       QwT-style residual compensation driver (uses QwT-SC submodule)
+    results/                         Per-run JSON (top-1, top-5, sensitivity data, qwt_sc_*)
 sc/                                  SC kernels (Triton XNOR matmul, Sobol RNG, configs)
 sc_integration/                      SC matmul wrappers + calibrated noise surrogate
+    sc_linear.py                     Shared SCLinear + _sc_linear primitives (cls + det)
     noise_matmul.py                  Closed-form Gaussian surrogate for fast sweeps
-experiments/                         Sensitivity sweeps + end-to-end configs
-    sensitivity_all_ops.py           24 x 5 per-(op, block) sensitivity matrix
-    e2e_fine_grained.py              Real-SC eval of sc_skip_worstK schedules
-    mlp_onebyone.py                  MLP first-N / last-N block sensitivity sweep
-    calibrate_noise_model.py         Calibrate surrogate correction factor against real SC
-    qwt_sc_compensation.py           QwT-style residual compensation driver (uses QwT-SC submodule)
 det/                                 Detection extension (EVA-01 ViTDet on COCO)
     eval_common.py                   Shared model loading (auto-discovers QwT-SC submodule)
     fp_eval.py / sc_eval.py          FP/SC detection eval
@@ -802,6 +809,5 @@ det/                                 Detection extension (EVA-01 ViTDet on COCO)
     visualize.py                     Draw detection boxes on COCO images
     experiments/                     Per-(op, block) sensitivity sweep for EVA
 third_party/QwT-SC/                  git submodule -> Allenjin123/QwT.git (QwT fork with QwT-vit-sc)
-results/                             Per-run JSON (top-1, top-5, sensitivity data, qwt_sc_*)
 TASK_REPORT.md                       Original run log on gl1804 (2×RTX PRO 6000)
 ```

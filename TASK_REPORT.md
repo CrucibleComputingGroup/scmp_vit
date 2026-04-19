@@ -10,16 +10,16 @@
 
 ### What Was Done
 - Created `vit_sc/` project, loaded ImageNet-1k val from HF parquet shards (`imagenet_parquet.py`).
-- Implemented SC Q@Kᵀ monkey-patch (`sc_attention_patch.py`): wraps every DINOv2 `Attention` / `MemEffAttention` module's forward to per-head-quantize Q and K, call `sc_matmul_qk_multihead` (bipolar XNOR, Sobol RNG, stoc_len=256), dequantize, then run standard softmax and Attn@V.
+- Implemented SC Q@Kᵀ monkey-patch (`cls/sc_attention_patch.py`): wraps every DINOv2 `Attention` / `MemEffAttention` module's forward to per-head-quantize Q and K, call `sc_matmul_qk_multihead` (bipolar XNOR, Sobol RNG, stoc_len=256), dequantize, then run standard softmax and Attn@V.
 - Evaluation driver `eval.py` with FP vs SC modes, subset sampling, JSON output.
 - Sanity-checked FP forward on 64 imgs first, then ran matched 100-img FP and SC evaluations with identical image subsets and seeds.
 
 ### Files Created
-- [vit_sc/imagenet_parquet.py](vit_sc/imagenet_parquet.py) — parquet-shard ImageFolder-style dataset
-- [vit_sc/sc_attention_patch.py](vit_sc/sc_attention_patch.py) — SC Q@Kᵀ attention forward + model patcher
-- [vit_sc/eval.py](vit_sc/eval.py) — FP / SC evaluation driver
-- [vit_sc/results/fp_n100.json](vit_sc/results/fp_n100.json), [vit_sc/results/sc_p8_n100.json](vit_sc/results/sc_p8_n100.json) — results
-- Logs under [vit_sc/logs/](vit_sc/logs/)
+- [vit_sc/cls/imagenet_parquet.py](vit_sc/cls/imagenet_parquet.py) — parquet-shard ImageFolder-style dataset
+- [vit_sc/cls/sc_attention_patch.py](vit_sc/cls/sc_attention_patch.py) — SC Q@Kᵀ attention forward + model patcher
+- [vit_sc/cls/eval.py](vit_sc/cls/eval.py) — FP / SC evaluation driver
+- [vit_sc/cls/results/fp_n100.json](vit_sc/cls/results/fp_n100.json), [vit_sc/cls/results/sc_p8_n100.json](vit_sc/cls/results/sc_p8_n100.json) — results
+- Logs under [vit_sc/cls/logs/](vit_sc/cls/logs/)
 
 ### Results (ImageNet-1k val subsets, seed=0, identical subset across modes at each N)
 | N | Variant | Top-1 | Top-5 | Throughput (img/s) |

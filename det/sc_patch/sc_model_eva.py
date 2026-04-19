@@ -23,14 +23,14 @@ from pathlib import Path
 
 import torch.nn as nn
 
-# Make vit_sc importable so we can reuse SCLinear.
+# Make vit_sc importable so sc_integration / sc resolve.
 _VIT_SC = Path(__file__).resolve().parents[2]  # vit_sc/
 if str(_VIT_SC) not in sys.path:
     sys.path.insert(0, str(_VIT_SC))
 if str(_VIT_SC / "sc") not in sys.path:
     sys.path.insert(0, str(_VIT_SC / "sc"))
 
-from sc_attention_patch import SCLinear  # noqa: E402
+from sc_integration.sc_linear import SCLinear  # noqa: E402
 
 from .sc_matmul import SCMatMul
 

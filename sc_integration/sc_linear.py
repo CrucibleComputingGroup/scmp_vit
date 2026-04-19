@@ -1,0 +1,240 @@
+"""SCLinear and helpers — shared between cls/ (DINOv2) and det/ (EVA-ViTDet).
+
+Lives in ``sc_integration`` so neither cls nor det has to reach across into the
+other. Backed by the Triton SC kernels in ``vit_sc/sc/`` and the noise-model
+surrogate in ``sc_integration.noise_matmul``.
+
+Public surface:
+  * ``SCLinear``                   — drop-in nn.Linear replacement.
+  * ``set_noise_model(bool)``      — toggle the calibrated Gaussian surrogate.
+  * ``USE_NOISE_MODEL``            — read at call time via this module
+                                     (``sc_linear.USE_NOISE_MODEL``); avoid
+                                     ``from … import USE_NOISE_MODEL`` because
+                                     the snapshot won't reflect later toggles.
+  * ``_sc_linear`` / ``_sc_linear_mp`` / ``_mm_one_bucket`` /
+    ``_get_config`` / ``_CFG_CACHE`` — internal helpers also used by
+    ``HeadAlignedSCLinear`` and the cls attention forward.
+"""
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+import torch
+import torch.nn as nn
+
+# Need vit_sc/sc/ on the path to find sc_triton + config_helpers.
+_VIT_SC = Path(__file__).resolve().parents[1]   # vit_sc/
+_SC_DIR = _VIT_SC / "sc"
+if str(_SC_DIR) not in sys.path:
+    sys.path.insert(0, str(_SC_DIR))
+
+from sc_triton import (  # noqa: E402
+    sc_matmul_grouped_enable_triton as sc_matmul_grouped_bipolar,
+)
+from config_helpers import make_sobol_simple_config  # noqa: E402
+
+from sc_integration.noise_matmul import noisy_sc_matmul_grouped
+from sc_integration.mp_linear import (
+    MPConfig, RangeMPConfig, DispatchEntry,
+    build_range_dispatch, classify_input_rows, sc_prec_for_stoc_len,
+)
+
+
+# Module-level toggle: when True, SC matmuls use the calibrated Gaussian-noise
+# surrogate (sc_integration/noise_matmul.py) instead of the real bitstream /
+# enable-signal kernels. Orders of magnitude faster — for sensitivity sweeps.
+USE_NOISE_MODEL = False
+
+
+def set_noise_model(enabled: bool):
+    global USE_NOISE_MODEL
+    USE_NOISE_MODEL = bool(enabled)
+
+
+_CFG_CACHE: dict = {}
+
+
+def _get_config(D, sc_prec):
+    key = (D, sc_prec)
+    if key not in _CFG_CACHE:
+        _CFG_CACHE[key] = make_sobol_simple_config(D, D, sc_prec)
+    return _CFG_CACHE[key]
+
+
+def _sym_range(t: torch.Tensor) -> tuple[float, float]:
+    m = float(t.detach().abs().max().item())
+    m = max(m, 1e-6)
+    return m, -m
+
+
+def _sc_linear(x: torch.Tensor, weight: torch.Tensor, bias, sc_prec: int,
+               mode: str = "bipolar", cfg_override: dict = None):
+    """y = x @ weight^T + bias via SC.
+
+    mode="bipolar": per-row symmetric quant (|max|), q_max = 2^(sc_prec-1)-1.
+        Good for near-zero-mean tensors (post-LN activations, weights).
+    mode="unipolar": per-row asymmetric quant (scale = range/q_max, zero-point),
+        q_max = 2^sc_prec - 1 → ~2× grid resolution. Good for heavy-tailed /
+        asymmetric tensors (post-GELU activations for fc2).
+
+    ``cfg_override``: when not None, use this SC config instead of the cached
+    default — lets the comp use an alternative Sobol scrambling per block.
+    """
+    orig_shape = x.shape
+    D_in = orig_shape[-1]
+    x2 = x.reshape(-1, D_in).float()
+    w = weight.float()  # (D_out, D_in)
+    if USE_NOISE_MODEL:
+        y = noisy_sc_matmul_grouped(x2, w, group_a=1, group_b=1,
+                                    mode=mode, sc_prec=sc_prec)
+    else:
+        cfg = cfg_override if cfg_override is not None else _get_config(D_in, sc_prec)
+        y = sc_matmul_grouped_bipolar(x2, w, group_a=1, group_b=1,
+                                      mode=mode, sc_prec=sc_prec, config=cfg)
+    if bias is not None:
+        y = y + bias.float()
+    y = y.to(x.dtype).reshape(*orig_shape[:-1], w.shape[0])
+    return y
+
+
+def _mm_one_bucket(x_sub: torch.Tensor, w_sub: torch.Tensor,
+                   stoc_len: int, sc_prec: int, mode: str) -> torch.Tensor:
+    """One SC matmul call at a chosen ``stoc_len``. Picks the noise-surrogate
+    backend when ``USE_NOISE_MODEL`` is on, otherwise the Triton kernel.
+    Both accept ``stoc_len`` as a kwarg.
+    """
+    if USE_NOISE_MODEL:
+        return noisy_sc_matmul_grouped(
+            x_sub, w_sub, group_a=1, group_b=1,
+            mode=mode, sc_prec=sc_prec, stoc_len=stoc_len,
+        )
+    cfg = _get_config(x_sub.shape[-1], sc_prec)
+    return sc_matmul_grouped_bipolar(
+        x_sub, w_sub, group_a=1, group_b=1,
+        mode=mode, sc_prec=sc_prec, config=cfg, stoc_len=stoc_len,
+    )
+
+
+def _sc_linear_mp(x: torch.Tensor, weight: torch.Tensor, bias,
+                  sc_prec: int, mode: str,
+                  range_entries: list[DispatchEntry] | None = None,
+                  mp_cfg: MPConfig | None = None) -> torch.Tensor:
+    """MP-aware SC linear: ``y = x @ weight^T + bias``.
+
+    * ``mp_cfg``       → per-input-row stoc_len buckets (dynamic each forward).
+    * ``range_entries``→ per-weight-output-group stoc_len buckets (static).
+    * Both            → per (row, group) effective stoc_len = min(row_sl, weight_sl).
+    * Neither         → uniform, equivalent to ``_sc_linear`` (sans cfg_override).
+    """
+    orig_shape = x.shape
+    D_in = orig_shape[-1]
+    x_flat = x.reshape(-1, D_in).float()
+    w = weight.float()
+    M = x_flat.shape[0]
+    D_out = w.shape[0]
+
+    if range_entries is None and mp_cfg is None:
+        y = _mm_one_bucket(x_flat, w, 2 ** sc_prec, sc_prec, mode)
+        if bias is not None:
+            y = y + bias.float()
+        return y.to(x.dtype).reshape(*orig_shape[:-1], D_out)
+
+    # Per-row stoc_len from dynamic MP (or a uniform sentinel otherwise).
+    if mp_cfg is not None:
+        assignment = classify_input_rows(x_flat, mp_cfg)
+        row_stoc_lens = torch.empty(M, dtype=torch.long, device=x.device)
+        for sl, rows in assignment.level_row_indices.items():
+            if rows.numel():
+                row_stoc_lens[rows] = int(sl)
+    else:
+        row_stoc_lens = torch.full((M,), 2 ** sc_prec,
+                                   dtype=torch.long, device=x.device)
+
+    result = torch.zeros(M, D_out, dtype=torch.float32, device=x.device)
+
+    if range_entries is None:
+        # Dynamic MP only: full-width weight, bucket by row stoc_len.
+        for sl in torch.unique(row_stoc_lens).tolist():
+            if sl <= 0:
+                continue
+            rows = torch.nonzero(row_stoc_lens == sl, as_tuple=False).squeeze(-1)
+            if rows.numel() == 0:
+                continue
+            x_sub = x_flat.index_select(0, rows).contiguous()
+            sp = sc_prec_for_stoc_len(int(sl))
+            sub = _mm_one_bucket(x_sub, w, int(sl), sp, mode)
+            result.index_copy_(0, rows, sub)
+    else:
+        # Range dispatch, optionally combined with dynamic MP.
+        for entry in range_entries:
+            if entry.stoc_len <= 0:
+                continue
+            weight_sl = torch.tensor(entry.stoc_len, dtype=torch.long,
+                                     device=x.device)
+            eff = torch.minimum(row_stoc_lens, weight_sl)
+            for sl in torch.unique(eff).tolist():
+                if sl <= 0:
+                    continue
+                rows = torch.nonzero(eff == sl, as_tuple=False).squeeze(-1)
+                if rows.numel() == 0:
+                    continue
+                x_sub = x_flat.index_select(0, rows).contiguous()
+                sp = sc_prec_for_stoc_len(int(sl))
+                sub = _mm_one_bucket(x_sub, entry.weight, int(sl), sp, mode)
+                result[rows.unsqueeze(1), entry.out_indices.unsqueeze(0)] = sub
+
+    if bias is not None:
+        result = result + bias.float()
+    return result.to(x.dtype).reshape(*orig_shape[:-1], D_out)
+
+
+class SCLinear(nn.Module):
+    """Drop-in replacement for nn.Linear that runs matmul via SC.
+
+    mode selects symmetric (bipolar) or asymmetric zero-point (unipolar) quant.
+
+    Optional mixed-precision knobs (ported from scmp_llm):
+      * ``mp_cfg`` — per-input-row MPConfig.
+      * ``range_mp_cfg`` — per-weight-row-group RangeMPConfig (static
+        dispatch built once from the wrapped weight).
+      * ``range_mp_group_size`` — rows per group (0 / >=out_features ⇒
+        per-tensor).
+      * ``operator`` — name passed to RangeMPConfig for per-op thresholds.
+    """
+
+    def __init__(self, linear: nn.Linear, sc_prec: int, mode: str = "bipolar",
+                 cfg_override: dict = None,
+                 mp_cfg: MPConfig | None = None,
+                 range_mp_cfg: RangeMPConfig | None = None,
+                 range_mp_group_size: int = 0,
+                 operator: str | None = None):
+        super().__init__()
+        self.sc_prec = sc_prec
+        self.mode = mode
+        self.weight = linear.weight
+        self.bias = linear.bias
+        self.in_features = linear.in_features
+        self.out_features = linear.out_features
+        # Stored as a plain dict (not a buffer): used to pick an alternative
+        # Sobol scrambling for the comp's SC matmul, baked at calibration time.
+        self.cfg_override = cfg_override
+        self.mp_cfg = mp_cfg
+        self.operator = operator
+        if range_mp_cfg is not None:
+            self.range_entries = build_range_dispatch(
+                self.weight.detach(), range_mp_cfg,
+                operator=operator, group_size=range_mp_group_size,
+            )
+        else:
+            self.range_entries = None
+
+    def forward(self, x):
+        if self.range_entries is None and self.mp_cfg is None:
+            # Uniform path — keep cfg_override support (residual compensator).
+            return _sc_linear(x, self.weight, self.bias, self.sc_prec,
+                              mode=self.mode, cfg_override=self.cfg_override)
+        return _sc_linear_mp(
+            x, self.weight, self.bias, self.sc_prec, self.mode,
+            range_entries=self.range_entries, mp_cfg=self.mp_cfg,
+        )
