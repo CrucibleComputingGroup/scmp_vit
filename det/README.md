@@ -82,6 +82,43 @@ python sc_eval.py --n-eval 100 --sc_config skip_last_fc2_K --skip_last_k 4
 python sc_eval.py --n-eval 100 --sc_ops_per_block_json schedule.json
 ```
 
+## Setup (env + detectron2)
+
+`det/` reuses the `qwt_d2` conda env that `cls/` uses. The detectron2 it
+imports is the EVA-vendored fork bundled here as a git submodule
+(`third_party/QwT-SC/QwT-det-RepQ-ViT/eva1/eva_det/detectron2`), installed
+editable so config edits and SC patches take effect without reinstall.
+
+Two gotchas on a fresh setup:
+
+1. **GCC ≥ 9** is required to build PyTorch's C++ extensions. The system
+   default on the GL nodes is GCC 8.5, which fails with
+   `error "You're trying to build PyTorch with a too old version of GCC.
+   We need GCC 9 or later."`. Load a newer one before installing:
+
+   ```bash
+   module load gcc/13.2.0
+   ```
+
+2. **Build isolation off.** detectron2's `setup.py` imports `torch` at
+   build time, but pip's default PEP 517 build env doesn't see the
+   active conda env's torch. Use `--no-build-isolation`:
+
+   ```bash
+   conda activate qwt_d2
+   module load gcc/13.2.0
+   pip install --no-build-isolation -e \
+       third_party/QwT-SC/QwT-det-RepQ-ViT/eva1/eva_det
+   ```
+
+After install, verify it picks up the in-tree configs through the
+relative `model_zoo/configs -> ../../configs` symlink:
+
+```bash
+python -c "from detectron2 import model_zoo; \
+  print(model_zoo.get_config_file('common/data/coco.py'))"
+```
+
 ## Known limitations
 
 - **No QwT compensation yet.** The scaffold runs bare SC. QwT-style LS
