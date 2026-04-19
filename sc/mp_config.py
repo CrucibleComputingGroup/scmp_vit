@@ -116,6 +116,10 @@ class AdaptiveMPConfig:
     beta: float = 0.05
     enable_pruning: bool = True
     operator_params: dict[str, tuple[float, float]] = field(default_factory=dict)
+    # When set, bypass the linear-threshold classifier and use these fractions
+    # as quantile targets per level (top frac[0] rows → levels[0], etc.).
+    # Length must match stoc_len_levels; sums to 1.
+    target_fractions: Optional[list[float]] = None
 
     def __post_init__(self):
         assert len(self.stoc_len_levels) >= 2, (
@@ -126,6 +130,13 @@ class AdaptiveMPConfig:
                 f"got {self.stoc_len_levels}")
         if not self.enable_pruning and 0 in self.stoc_len_levels:
             self.stoc_len_levels = [s for s in self.stoc_len_levels if s > 0]
+        if self.target_fractions is not None:
+            assert len(self.target_fractions) == len(self.stoc_len_levels), (
+                f"target_fractions length {len(self.target_fractions)} "
+                f"must match stoc_len_levels length {len(self.stoc_len_levels)}")
+            s = sum(self.target_fractions)
+            assert abs(s - 1.0) < 1e-6, (
+                f"target_fractions must sum to 1.0, got {s}")
 
     def get_params(self, operator: Optional[str] = None) -> tuple[float, float]:
         """Get (alpha, beta) for an operator, falling back to global."""
@@ -160,6 +171,26 @@ def adaptive_classify_rows(
     N = metric.shape[0]
     levels = config.stoc_len_levels
     n_levels = len(levels)
+
+    # ---------- Quantile path (target_fractions set) ----------
+    # Independent of (t, T) / α / β. Top frac[0] rows → levels[0], etc.
+    # Ties on the metric boundary are broken by sort stability.
+    if config.target_fractions is not None:
+        sorted_idx = metric.argsort(descending=True)
+        row_levels_q = torch.empty(N, dtype=torch.long, device=metric.device)
+        level_row_indices_q: dict[int, torch.Tensor] = {}
+        offset = 0
+        for i, (sl, frac) in enumerate(zip(levels, config.target_fractions)):
+            if i < n_levels - 1:
+                count = round(frac * N)
+            else:
+                count = N - offset
+            rows_q = sorted_idx[offset:offset + count]
+            row_levels_q[rows_q] = i
+            level_row_indices_q[sl] = rows_q
+            offset += count
+        return RowAssignment(row_levels=row_levels_q,
+                             level_row_indices=level_row_indices_q)
 
     # progress: 1 at noisiest (t=T-1), 0 at cleanest (t=0)
     # Early (noisy) steps → high progress → high base_threshold → aggressive

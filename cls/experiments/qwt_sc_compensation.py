@@ -202,6 +202,15 @@ def main():
     ap.add_argument("--adaptive_mp_enable_pruning", type=int, default=0)
     ap.add_argument("--adaptive_mp_ops", default="qkv_proj,out_proj",
                     help="CSV op names for adaptive MP.")
+    ap.add_argument("--adaptive_mp_op_alphas", default="",
+                    help="Per-op α overrides, 'op1=α1,op2=α2,...'. Empty ⇒ "
+                         "global α for all.")
+    ap.add_argument("--adaptive_mp_op_betas", default="",
+                    help="Per-op β overrides, same format as op_alphas.")
+    ap.add_argument("--adaptive_mp_fractions", default="",
+                    help="CSV target fractions per level (quantile mode); "
+                         "overrides linear-threshold. e.g. '0.05,0.35,0.40,0.20' "
+                         "for levels=[256,128,64,32]. Sums to 1.")
     ap.add_argument("--vit_timestep", type=int, default=9)
     ap.add_argument("--vit_total_timesteps", type=int, default=10)
     args = ap.parse_args()
@@ -251,10 +260,34 @@ def main():
         from sc_integration.mp_linear import AdaptiveMPConfig
         from sc_integration.sc_linear import set_vit_timestep
         levels = [int(x) for x in args.adaptive_mp_levels.split(",") if x.strip()]
+        # Parse per-op overrides like "qkv_proj=0.4,out_proj=0.3"
+        def _parse_kv(s):
+            out = {}
+            for pair in s.split(","):
+                pair = pair.strip()
+                if not pair: continue
+                k, v = pair.split("=")
+                out[k.strip()] = float(v)
+            return out
+        op_alphas = _parse_kv(args.adaptive_mp_op_alphas)
+        op_betas = _parse_kv(args.adaptive_mp_op_betas)
+        op_params = {}
+        for op in set(op_alphas) | set(op_betas):
+            op_params[op] = (
+                op_alphas.get(op, args.adaptive_mp_alpha),
+                op_betas.get(op, args.adaptive_mp_beta),
+            )
+        target_fractions = None
+        if args.adaptive_mp_fractions.strip():
+            target_fractions = [float(x) for x in
+                                args.adaptive_mp_fractions.split(",")
+                                if x.strip()]
         adap = AdaptiveMPConfig(
             stoc_len_levels=levels,
             alpha=args.adaptive_mp_alpha, beta=args.adaptive_mp_beta,
-            enable_pruning=bool(args.adaptive_mp_enable_pruning))
+            enable_pruning=bool(args.adaptive_mp_enable_pruning),
+            operator_params=op_params,
+            target_fractions=target_fractions)
         linear_mp_spec = {
             op.strip(): {"adaptive": adap}
             for op in args.adaptive_mp_ops.split(",") if op.strip()
