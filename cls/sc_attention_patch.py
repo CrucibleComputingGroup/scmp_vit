@@ -27,7 +27,7 @@ from sc_triton import (  # noqa: E402
 from sc_integration import sc_linear as _scl  # noqa: E402
 from sc_integration.noise_matmul import _noisy_matmul_core  # noqa: E402
 from sc_integration.mp_linear import (  # noqa: E402
-    MPConfig, RangeMPConfig, sc_prec_for_stoc_len,
+    MPConfig, RangeMPConfig, AdaptiveMPConfig, sc_prec_for_stoc_len,
 )
 from mp_config import classify_rows_by_metric  # noqa: E402  # local copy in sc/
 
@@ -42,6 +42,8 @@ _mm_one_bucket = _scl._mm_one_bucket
 _get_config = _scl._get_config
 _CFG_CACHE = _scl._CFG_CACHE
 set_noise_model = _scl.set_noise_model
+set_vit_timestep = _scl.set_vit_timestep
+get_vit_timestep = _scl.get_vit_timestep
 
 
 def _classify_per_head(q: torch.Tensor, cfg: MPConfig) -> list[int]:
@@ -309,13 +311,15 @@ LINEAR_OP_NAMES = ("mlp_fc1", "mlp_fc2", "qkv_proj", "out_proj")
 
 
 def _normalize_linear_mp_spec(spec):
-    """Normalize a linear_mp_spec dict into {op: (mp_cfg, range_cfg, gsize)}.
+    """Normalize a linear_mp_spec dict into {op: (mp_cfg, adaptive_cfg, range_cfg, gsize)}.
 
     Each key must be one of ``LINEAR_OP_NAMES`` or the alias ``"proj"``
     (which expands to both ``qkv_proj`` and ``out_proj``). Each value is
-    either an ``MPConfig``, a ``RangeMPConfig``, or a dict with any of::
+    one of ``MPConfig``, ``AdaptiveMPConfig``, ``RangeMPConfig``, or a dict
+    with any of::
 
-        {"fixed": MPConfig, "range": RangeMPConfig, "range_group_size": int}
+        {"fixed": MPConfig, "adaptive": AdaptiveMPConfig,
+         "range": RangeMPConfig, "range_group_size": int}
     """
     out: dict[str, tuple] = {}
     if not spec:
@@ -330,19 +334,22 @@ def _normalize_linear_mp_spec(spec):
                 f"unknown linear_mp_spec key: {k!r}; "
                 f"expected one of {LINEAR_OP_NAMES + ('proj',)}")
         if isinstance(v, MPConfig):
-            entry = (v, None, 0)
+            entry = (v, None, None, 0)
+        elif isinstance(v, AdaptiveMPConfig):
+            entry = (None, v, None, 0)
         elif isinstance(v, RangeMPConfig):
-            entry = (None, v, 0)
+            entry = (None, None, v, 0)
         elif isinstance(v, dict):
             entry = (
                 v.get("fixed"),
+                v.get("adaptive"),
                 v.get("range"),
                 int(v.get("range_group_size", 0)),
             )
         else:
             raise TypeError(
-                f"linear_mp_spec[{k!r}] must be MPConfig, RangeMPConfig, "
-                f"or dict; got {type(v).__name__}")
+                f"linear_mp_spec[{k!r}] must be MPConfig, AdaptiveMPConfig, "
+                f"RangeMPConfig, or dict; got {type(v).__name__}")
         for op in targets:
             out[op] = entry
     return out
@@ -352,9 +359,10 @@ def _mp_kwargs(linear_mp, op_name: str) -> dict:
     """Build the MP kwargs for SCLinear from a normalized spec dict."""
     if not linear_mp or op_name not in linear_mp:
         return {}
-    mp_cfg, range_cfg, gsize = linear_mp[op_name]
-    return dict(mp_cfg=mp_cfg, range_mp_cfg=range_cfg,
-                range_mp_group_size=gsize, operator=op_name)
+    mp_cfg, adaptive_cfg, range_cfg, gsize = linear_mp[op_name]
+    return dict(mp_cfg=mp_cfg, adaptive_mp_cfg=adaptive_cfg,
+                range_mp_cfg=range_cfg, range_mp_group_size=gsize,
+                operator=op_name)
 
 
 def patch_model(model, sc_prec: int = 8,

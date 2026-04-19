@@ -37,17 +37,21 @@ if str(SC_PATH) not in sys.path:
 from mp_config import (  # type: ignore  # noqa: E402
     MPConfig,
     RangeMPConfig,
+    AdaptiveMPConfig,
     RowAssignment,
     classify_rows_by_metric,
     classify_groups_by_range,
+    adaptive_classify_rows,
 )
 
 __all__ = [
     "MPConfig",
     "RangeMPConfig",
+    "AdaptiveMPConfig",
     "DispatchEntry",
     "build_range_dispatch",
     "classify_input_rows",
+    "classify_input_rows_adaptive",
     "sc_prec_for_stoc_len",
 ]
 
@@ -114,4 +118,24 @@ def classify_input_rows(x_flat: torch.Tensor, cfg: MPConfig) -> RowAssignment:
     metric = x_flat.float().abs().amax(dim=-1)  # (M,)
     return classify_rows_by_metric(
         metric, cfg.stoc_len_levels, cfg.level_fractions,
+    )
+
+
+def classify_input_rows_adaptive(
+    x_flat: torch.Tensor,
+    cfg: AdaptiveMPConfig,
+    timestep: int,
+    total_timesteps: int,
+    operator: Optional[str] = None,
+) -> RowAssignment:
+    """Adaptive (timestep-aware) per-row classification for SCLinear.
+
+    Same row metric (abs-max) as ``classify_input_rows`` but routes through
+    ``adaptive_classify_rows`` with per-operator (α, β) and a progress term
+    ``t / max(T-1, 1)``. ViT callers that have no native timestep can set
+    ``(timestep, total_timesteps)`` externally via ``sc_linear.set_vit_timestep``.
+    """
+    metric = x_flat.float().abs().amax(dim=-1)  # (M,)
+    return adaptive_classify_rows(
+        metric, timestep, total_timesteps, cfg, operator=operator,
     )

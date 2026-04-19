@@ -31,8 +31,66 @@ if str(_VIT_SC / "sc") not in sys.path:
     sys.path.insert(0, str(_VIT_SC / "sc"))
 
 from sc_integration.sc_linear import SCLinear  # noqa: E402
+from sc_integration.mp_linear import (  # noqa: E402
+    MPConfig, RangeMPConfig, AdaptiveMPConfig,
+)
 
 from .sc_matmul import SCMatMul
+
+
+_DET_LINEAR_OPS = ("mlp_fc1", "mlp_fc2", "qkv_proj", "out_proj")
+
+
+def _normalize_det_linear_mp_spec(spec):
+    """Mirror of cls's ``_normalize_linear_mp_spec`` for EVA-det.
+
+    Accepts ``None`` or a dict ``{op_name | "proj": MPConfig |
+    AdaptiveMPConfig | RangeMPConfig | {"fixed": ..., "adaptive": ...,
+    "range": ..., "range_group_size": ...}}``.
+
+    Returns ``{op_name: (mp_cfg, adaptive_cfg, range_cfg, gsize)}``.
+    """
+    out: dict = {}
+    if not spec:
+        return out
+    for k, v in spec.items():
+        if k == "proj":
+            targets = ("qkv_proj", "out_proj")
+        elif k in _DET_LINEAR_OPS:
+            targets = (k,)
+        else:
+            raise ValueError(
+                f"unknown linear_mp_spec key: {k!r}; "
+                f"expected one of {_DET_LINEAR_OPS + ('proj',)}")
+        if isinstance(v, MPConfig):
+            entry = (v, None, None, 0)
+        elif isinstance(v, AdaptiveMPConfig):
+            entry = (None, v, None, 0)
+        elif isinstance(v, RangeMPConfig):
+            entry = (None, None, v, 0)
+        elif isinstance(v, dict):
+            entry = (
+                v.get("fixed"),
+                v.get("adaptive"),
+                v.get("range"),
+                int(v.get("range_group_size", 0)),
+            )
+        else:
+            raise TypeError(
+                f"linear_mp_spec[{k!r}] must be MPConfig, AdaptiveMPConfig, "
+                f"RangeMPConfig, or dict; got {type(v).__name__}")
+        for op in targets:
+            out[op] = entry
+    return out
+
+
+def _det_mp_kwargs(linear_mp, op_name):
+    if not linear_mp or op_name not in linear_mp:
+        return {}
+    mp_cfg, adaptive_cfg, range_cfg, gsize = linear_mp[op_name]
+    return dict(mp_cfg=mp_cfg, adaptive_mp_cfg=adaptive_cfg,
+                range_mp_cfg=range_cfg, range_mp_group_size=gsize,
+                operator=op_name)
 
 
 SC_OP_NAMES = ("mlp_fc1", "mlp_fc2", "qkv_proj", "out_proj", "qk", "av")
@@ -119,7 +177,8 @@ def sc_patch_eva(model,
                  mlp_mode: str = "bipolar",
                  proj_mode: str = "bipolar",
                  qk_mode: str = "bipolar",
-                 av_mode: str = "bipolar"):
+                 av_mode: str = "bipolar",
+                 linear_mp_spec=None):
     """Swap EVA-ViT primitives with SC versions in place.
 
     Parameters
@@ -137,6 +196,12 @@ def sc_patch_eva(model,
         [0, 1], V is signed — unipolar mode requires BOTH operands to be
         non-negative, so bipolar is the safe default (verified: ~4.7% rel
         err vs. 69% for unipolar with signed V).
+    linear_mp_spec : dict | None
+        Mirror of cls's ``linear_mp_spec``. Applies MPConfig /
+        AdaptiveMPConfig / RangeMPConfig to the SCLinear wrappers for
+        ``mlp_fc1, mlp_fc2, qkv_proj, out_proj`` (alias ``proj`` expands to
+        both proj ops). For ViT without a native timestep, adaptive MP
+        reads (t, T) from ``sc_integration.sc_linear.set_vit_timestep``.
 
     Returns
     -------
@@ -146,6 +211,7 @@ def sc_patch_eva(model,
     blocks = _discover_blocks(model)
     sched = normalize_sc_ops_per_block(sc_ops_per_block, len(blocks))
     stats = {k: 0 for k in SC_OP_NAMES}
+    linear_mp = _normalize_det_linear_mp_spec(linear_mp_spec)
 
     for i, blk in enumerate(blocks):
         attn = getattr(blk, "attn", None)
@@ -153,10 +219,14 @@ def sc_patch_eva(model,
 
         if attn is not None:
             if sched["qkv_proj"][i] and isinstance(getattr(attn, "qkv", None), nn.Linear):
-                attn.qkv = SCLinear(attn.qkv, sc_prec=sc_prec, mode=proj_mode)
+                attn.qkv = SCLinear(
+                    attn.qkv, sc_prec=sc_prec, mode=proj_mode,
+                    **_det_mp_kwargs(linear_mp, "qkv_proj"))
                 stats["qkv_proj"] += 1
             if sched["out_proj"][i] and isinstance(getattr(attn, "proj", None), nn.Linear):
-                attn.proj = SCLinear(attn.proj, sc_prec=sc_prec, mode=proj_mode)
+                attn.proj = SCLinear(
+                    attn.proj, sc_prec=sc_prec, mode=proj_mode,
+                    **_det_mp_kwargs(linear_mp, "out_proj"))
                 stats["out_proj"] += 1
             # matmul1 / matmul2: swap only if current module is the FP MatMul
             # marker — don't double-wrap.
@@ -173,10 +243,14 @@ def sc_patch_eva(model,
 
         if mlp is not None:
             if sched["mlp_fc1"][i] and isinstance(getattr(mlp, "fc1", None), nn.Linear):
-                mlp.fc1 = SCLinear(mlp.fc1, sc_prec=sc_prec, mode=mlp_mode)
+                mlp.fc1 = SCLinear(
+                    mlp.fc1, sc_prec=sc_prec, mode=mlp_mode,
+                    **_det_mp_kwargs(linear_mp, "mlp_fc1"))
                 stats["mlp_fc1"] += 1
             if sched["mlp_fc2"][i] and isinstance(getattr(mlp, "fc2", None), nn.Linear):
-                mlp.fc2 = SCLinear(mlp.fc2, sc_prec=sc_prec, mode=mlp_mode)
+                mlp.fc2 = SCLinear(
+                    mlp.fc2, sc_prec=sc_prec, mode=mlp_mode,
+                    **_det_mp_kwargs(linear_mp, "mlp_fc2"))
                 stats["mlp_fc2"] += 1
 
     return stats

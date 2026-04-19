@@ -36,8 +36,9 @@ from config_helpers import make_sobol_simple_config  # noqa: E402
 
 from sc_integration.noise_matmul import noisy_sc_matmul_grouped
 from sc_integration.mp_linear import (
-    MPConfig, RangeMPConfig, DispatchEntry,
-    build_range_dispatch, classify_input_rows, sc_prec_for_stoc_len,
+    MPConfig, RangeMPConfig, AdaptiveMPConfig, DispatchEntry,
+    build_range_dispatch, classify_input_rows, classify_input_rows_adaptive,
+    sc_prec_for_stoc_len,
 )
 
 
@@ -50,6 +51,36 @@ USE_NOISE_MODEL = False
 def set_noise_model(enabled: bool):
     global USE_NOISE_MODEL
     USE_NOISE_MODEL = bool(enabled)
+
+
+# ---------------------------------------------------------------------------
+# External timestep state (for ViT / any non-diffusion caller).
+# ---------------------------------------------------------------------------
+# Diffusion callers already have a native (t, T) via ``SCController``. ViT cls
+# and EVA-det have no diffusion step; when they want AdaptiveMPConfig they set
+# ``(t, T)`` externally and every SCLinear with an adaptive_mp_cfg reads from
+# this module. Kept here (not on SCLinear instances) so a whole patched model
+# can be driven by one setter.
+_VIT_TIMESTEP: int = 0
+_VIT_TOTAL_TIMESTEPS: int = 1
+
+
+def set_vit_timestep(t: int, total: int | None = None):
+    """Set the current external timestep for adaptive MP in SCLinear.
+
+    ``t`` is the current timestep, ``total`` (if given) updates the total.
+    ViT has no diffusion step so the caller picks both — e.g. ``(0, 1)`` to
+    disable any timestep dependence, or sweep ``t ∈ [0, T-1]`` to emulate
+    a schedule for sensitivity studies.
+    """
+    global _VIT_TIMESTEP, _VIT_TOTAL_TIMESTEPS
+    _VIT_TIMESTEP = int(t)
+    if total is not None:
+        _VIT_TOTAL_TIMESTEPS = max(int(total), 1)
+
+
+def get_vit_timestep() -> tuple[int, int]:
+    return _VIT_TIMESTEP, _VIT_TOTAL_TIMESTEPS
 
 
 _CFG_CACHE: dict = {}
@@ -119,13 +150,19 @@ def _mm_one_bucket(x_sub: torch.Tensor, w_sub: torch.Tensor,
 def _sc_linear_mp(x: torch.Tensor, weight: torch.Tensor, bias,
                   sc_prec: int, mode: str,
                   range_entries: list[DispatchEntry] | None = None,
-                  mp_cfg: MPConfig | None = None) -> torch.Tensor:
+                  mp_cfg: MPConfig | None = None,
+                  adaptive_mp_cfg: AdaptiveMPConfig | None = None,
+                  operator: str | None = None) -> torch.Tensor:
     """MP-aware SC linear: ``y = x @ weight^T + bias``.
 
-    * ``mp_cfg``       → per-input-row stoc_len buckets (dynamic each forward).
-    * ``range_entries``→ per-weight-output-group stoc_len buckets (static).
-    * Both            → per (row, group) effective stoc_len = min(row_sl, weight_sl).
-    * Neither         → uniform, equivalent to ``_sc_linear`` (sans cfg_override).
+    * ``mp_cfg``         → per-input-row stoc_len buckets (fixed quantile).
+    * ``adaptive_mp_cfg``→ per-input-row buckets with timestep-aware thresholds
+      ``α·progress(t) + β``; the (t, T) pair is read from
+      ``sc_linear.get_vit_timestep()``. When both ``mp_cfg`` and
+      ``adaptive_mp_cfg`` are set, adaptive wins.
+    * ``range_entries``  → per-weight-output-group stoc_len buckets (static).
+    * Any row + range combo → effective stoc_len = ``min(row_sl, weight_sl)``.
+    * Neither row config → uniform, equivalent to ``_sc_linear``.
     """
     orig_shape = x.shape
     D_in = orig_shape[-1]
@@ -134,14 +171,23 @@ def _sc_linear_mp(x: torch.Tensor, weight: torch.Tensor, bias,
     M = x_flat.shape[0]
     D_out = w.shape[0]
 
-    if range_entries is None and mp_cfg is None:
+    if range_entries is None and mp_cfg is None and adaptive_mp_cfg is None:
         y = _mm_one_bucket(x_flat, w, 2 ** sc_prec, sc_prec, mode)
         if bias is not None:
             y = y + bias.float()
         return y.to(x.dtype).reshape(*orig_shape[:-1], D_out)
 
     # Per-row stoc_len from dynamic MP (or a uniform sentinel otherwise).
-    if mp_cfg is not None:
+    if adaptive_mp_cfg is not None:
+        t, T = get_vit_timestep()
+        assignment = classify_input_rows_adaptive(
+            x_flat, adaptive_mp_cfg, t, T, operator=operator,
+        )
+        row_stoc_lens = torch.empty(M, dtype=torch.long, device=x.device)
+        for sl, rows in assignment.level_row_indices.items():
+            if rows.numel():
+                row_stoc_lens[rows] = int(sl)
+    elif mp_cfg is not None:
         assignment = classify_input_rows(x_flat, mp_cfg)
         row_stoc_lens = torch.empty(M, dtype=torch.long, device=x.device)
         for sl, rows in assignment.level_row_indices.items():
@@ -195,17 +241,23 @@ class SCLinear(nn.Module):
     mode selects symmetric (bipolar) or asymmetric zero-point (unipolar) quant.
 
     Optional mixed-precision knobs (ported from scmp_llm):
-      * ``mp_cfg`` — per-input-row MPConfig.
+      * ``mp_cfg`` — per-input-row MPConfig (fixed-quantile).
+      * ``adaptive_mp_cfg`` — per-input-row AdaptiveMPConfig. Reads (t, T) at
+        forward time from ``sc_linear.get_vit_timestep()`` — callers update it
+        via ``set_vit_timestep``. When both ``mp_cfg`` and ``adaptive_mp_cfg``
+        are set, adaptive wins.
       * ``range_mp_cfg`` — per-weight-row-group RangeMPConfig (static
         dispatch built once from the wrapped weight).
       * ``range_mp_group_size`` — rows per group (0 / >=out_features ⇒
         per-tensor).
-      * ``operator`` — name passed to RangeMPConfig for per-op thresholds.
+      * ``operator`` — name passed to RangeMPConfig and AdaptiveMPConfig for
+        per-op thresholds / (α, β).
     """
 
     def __init__(self, linear: nn.Linear, sc_prec: int, mode: str = "bipolar",
                  cfg_override: dict = None,
                  mp_cfg: MPConfig | None = None,
+                 adaptive_mp_cfg: AdaptiveMPConfig | None = None,
                  range_mp_cfg: RangeMPConfig | None = None,
                  range_mp_group_size: int = 0,
                  operator: str | None = None):
@@ -220,6 +272,7 @@ class SCLinear(nn.Module):
         # Sobol scrambling for the comp's SC matmul, baked at calibration time.
         self.cfg_override = cfg_override
         self.mp_cfg = mp_cfg
+        self.adaptive_mp_cfg = adaptive_mp_cfg
         self.operator = operator
         if range_mp_cfg is not None:
             self.range_entries = build_range_dispatch(
@@ -230,11 +283,13 @@ class SCLinear(nn.Module):
             self.range_entries = None
 
     def forward(self, x):
-        if self.range_entries is None and self.mp_cfg is None:
+        if (self.range_entries is None and self.mp_cfg is None
+                and self.adaptive_mp_cfg is None):
             # Uniform path — keep cfg_override support (residual compensator).
             return _sc_linear(x, self.weight, self.bias, self.sc_prec,
                               mode=self.mode, cfg_override=self.cfg_override)
         return _sc_linear_mp(
             x, self.weight, self.bias, self.sc_prec, self.mode,
             range_entries=self.range_entries, mp_cfg=self.mp_cfg,
+            adaptive_mp_cfg=self.adaptive_mp_cfg, operator=self.operator,
         )
