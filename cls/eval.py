@@ -97,16 +97,41 @@ def _parse_csv_ops(s: str) -> list[str]:
 
 
 def _build_attn_mp_spec(args) -> dict:
-    """Assemble {"qk": MPConfig, "av": MPConfig} from --qk_mp_* / --av_mp_* flags."""
-    from sc_integration.mp_linear import MPConfig
+    """Assemble {"qk": MPConfig|AdaptiveMPConfig, "av": ...} from CLI.
+
+    Priority: if ``--adaptive_mp 1`` and ``qk`` / ``av`` listed in
+    ``--adaptive_mp_ops``, that op gets an ``AdaptiveMPConfig`` built from
+    the shared ``--adaptive_mp_*`` flags. Otherwise falls back to the
+    legacy static ``--qk_mp_*`` / ``--av_mp_*`` flags.
+    """
+    from sc_integration.mp_linear import MPConfig, AdaptiveMPConfig
     spec = {}
-    if args.qk_mp_levels:
+    adaptive_ops = (set(_parse_csv_ops(args.adaptive_mp_ops))
+                    if bool(args.adaptive_mp) else set())
+    adaptive_levels = (_parse_csv_ints(args.adaptive_mp_levels)
+                       if bool(args.adaptive_mp) and args.adaptive_mp_levels
+                       else [])
+    adaptive_cfg = (
+        AdaptiveMPConfig(
+            stoc_len_levels=adaptive_levels,
+            alpha=args.adaptive_mp_alpha,
+            beta=args.adaptive_mp_beta,
+            enable_pruning=bool(args.adaptive_mp_enable_pruning))
+        if adaptive_levels else None)
+
+    # QK
+    if "qk" in adaptive_ops and adaptive_cfg is not None:
+        spec["qk"] = adaptive_cfg
+    elif args.qk_mp_levels:
         spec["qk"] = MPConfig(
             stoc_len_levels=_parse_csv_ints(args.qk_mp_levels),
             level_fractions=(_parse_csv_floats(args.qk_mp_fractions)
                              if args.qk_mp_fractions else None),
         )
-    if args.av_mp_levels:
+    # AV
+    if "av" in adaptive_ops and adaptive_cfg is not None:
+        spec["av"] = adaptive_cfg
+    elif args.av_mp_levels:
         spec["av"] = MPConfig(
             stoc_len_levels=_parse_csv_ints(args.av_mp_levels),
             level_fractions=(_parse_csv_floats(args.av_mp_fractions)
@@ -116,10 +141,13 @@ def _build_attn_mp_spec(args) -> dict:
 
 
 def _build_linear_mp_spec(args) -> dict:
-    """Assemble {op_name: {"fixed": MPConfig, "range": RangeMPConfig, ...}}
-    from CLI flags. Returns {} if neither fixed-MP nor range-MP is requested.
+    """Assemble {op_name: {"fixed": MPConfig, "adaptive": AdaptiveMPConfig,
+    "range": RangeMPConfig, ...}} from CLI flags. Returns {} if nothing
+    is requested.
     """
-    from sc_integration.mp_linear import MPConfig, RangeMPConfig
+    from sc_integration.mp_linear import (
+        MPConfig, AdaptiveMPConfig, RangeMPConfig,
+    )
 
     fixed_levels = _parse_csv_ints(args.mp_levels) if args.mp_levels else []
     fixed_fracs = _parse_csv_floats(args.mp_fractions) if args.mp_fractions else None
@@ -127,6 +155,13 @@ def _build_linear_mp_spec(args) -> dict:
     range_on = bool(args.range_mp)
     range_levels = _parse_csv_ints(args.range_mp_levels) if range_on else []
     range_ops = _parse_csv_ops(args.range_mp_ops) or (fixed_ops if range_on else [])
+    adaptive_on = bool(args.adaptive_mp)
+    adaptive_levels = (_parse_csv_ints(args.adaptive_mp_levels)
+                       if adaptive_on else [])
+    _raw_adaptive_ops = (_parse_csv_ops(args.adaptive_mp_ops)
+                         or (fixed_ops if adaptive_on else []))
+    # qk/av are routed through _build_attn_mp_spec, not here.
+    adaptive_ops = [op for op in _raw_adaptive_ops if op not in ("qk", "av")]
 
     mp_fixed = (MPConfig(stoc_len_levels=fixed_levels,
                          level_fractions=fixed_fracs)
@@ -134,14 +169,23 @@ def _build_linear_mp_spec(args) -> dict:
     mp_range = (RangeMPConfig(stoc_len_levels=range_levels,
                               base_threshold=args.range_mp_threshold)
                 if range_on else None)
+    mp_adaptive = (AdaptiveMPConfig(
+                      stoc_len_levels=adaptive_levels,
+                      alpha=args.adaptive_mp_alpha,
+                      beta=args.adaptive_mp_beta,
+                      enable_pruning=bool(args.adaptive_mp_enable_pruning))
+                   if adaptive_levels else None)
 
-    if not mp_fixed and not mp_range:
+    if not mp_fixed and not mp_range and not mp_adaptive:
         return {}
 
     spec: dict = {}
     if mp_fixed:
         for op in fixed_ops:
             spec.setdefault(op, {})["fixed"] = mp_fixed
+    if mp_adaptive:
+        for op in adaptive_ops:
+            spec.setdefault(op, {})["adaptive"] = mp_adaptive
     if mp_range:
         for op in range_ops:
             entry = spec.setdefault(op, {})
@@ -202,6 +246,31 @@ def main():
                         "Empty ⇒ same as --mp_ops.")
     p.add_argument("--range_mp_group_size", type=int, default=0,
                    help="Output-rows per range-MP group. 0 = per-tensor.")
+    # adaptive (timestep-aware) mixed precision on linear ops
+    p.add_argument("--adaptive_mp", type=int, default=0,
+                   help="Enable adaptive per-input-row MP (α·progress + β). "
+                        "ViT has no native timestep, so (t, T) are driven via "
+                        "--vit_timestep / --vit_total_timesteps.")
+    p.add_argument("--adaptive_mp_levels", default="",
+                   help="Comma-separated stoc_len levels (descending), e.g. "
+                        "'256,64,0'. The '0' level enables pruning (requires "
+                        "--adaptive_mp_enable_pruning=1).")
+    p.add_argument("--adaptive_mp_alpha", type=float, default=0.3,
+                   help="Global α for threshold = α·progress + β.")
+    p.add_argument("--adaptive_mp_beta", type=float, default=0.05,
+                   help="Global β (base offset).")
+    p.add_argument("--adaptive_mp_enable_pruning", type=int, default=1,
+                   help="Allow stoc_len=0 (row pruning).")
+    p.add_argument("--adaptive_mp_ops", default="",
+                   help="Comma-separated linear ops that get adaptive MP. "
+                        "Empty ⇒ same as --mp_ops. Valid: "
+                        "mlp_fc1,mlp_fc2,qkv_proj,out_proj,proj.")
+    p.add_argument("--vit_timestep", type=int, default=0,
+                   help="External timestep t for adaptive MP (ViT has no "
+                        "native timestep). Reports at this (t, T) pair.")
+    p.add_argument("--vit_total_timesteps", type=int, default=1,
+                   help="External total timesteps T. (0,1) ⇒ progress=0 "
+                        "(most conservative, equivalent to threshold=β).")
     # per-head / per-row MP on QK and AV (scmp_llm-compatible)
     p.add_argument("--qk_mp_levels", default="",
                    help="Per-head fixed MP on QK (metric = per-head |Q|.amax). "
@@ -276,6 +345,18 @@ def main():
         attn_mp_spec = _build_attn_mp_spec(args)
         if attn_mp_spec:
             print(f"[sc] attn_mp_spec: {sorted(attn_mp_spec)}", flush=True)
+        if args.adaptive_mp:
+            from sc_integration.sc_linear import set_vit_timestep
+            set_vit_timestep(args.vit_timestep, args.vit_total_timesteps)
+            prog = (args.vit_timestep /
+                    max(args.vit_total_timesteps - 1, 1))
+            thr = min(args.adaptive_mp_alpha * prog + args.adaptive_mp_beta,
+                      0.95)
+            print(f"[sc] adaptive_mp t={args.vit_timestep}/T="
+                  f"{args.vit_total_timesteps} progress={prog:.3f} "
+                  f"threshold={thr:.3f} "
+                  f"(α={args.adaptive_mp_alpha}, β={args.adaptive_mp_beta})",
+                  flush=True)
 
         stats = patch_model(
             model, sc_prec=args.sc_prec,

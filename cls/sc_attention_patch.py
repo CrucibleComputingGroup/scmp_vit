@@ -29,7 +29,7 @@ from sc_integration.noise_matmul import _noisy_matmul_core  # noqa: E402
 from sc_integration.mp_linear import (  # noqa: E402
     MPConfig, RangeMPConfig, AdaptiveMPConfig, sc_prec_for_stoc_len,
 )
-from mp_config import classify_rows_by_metric  # noqa: E402  # local copy in sc/
+from mp_config import classify_rows_by_metric, adaptive_classify_rows  # noqa: E402  # local copy in sc/
 
 # Re-export the moved primitives so existing
 # ``from sc_attention_patch import SCLinear / _sc_linear / set_noise_model``
@@ -46,15 +46,23 @@ set_vit_timestep = _scl.set_vit_timestep
 get_vit_timestep = _scl.get_vit_timestep
 
 
-def _classify_per_head(q: torch.Tensor, cfg: MPConfig) -> list[int]:
-    """Per-head ``stoc_len`` assignment matching scmp_llm's ``_sc_qk``:
-    metric = per-head ``|q|.amax(dim=(0, 2, 3))`` → fixed-quantile classify.
-    Returns a length-H list of stoc_len values."""
+def _classify_per_head(q: torch.Tensor,
+                       cfg: "MPConfig | AdaptiveMPConfig") -> list[int]:
+    """Per-head ``stoc_len`` assignment. metric = per-head ``|q|.amax((0,2,3))``.
+
+    * ``MPConfig`` → fixed-quantile classifier.
+    * ``AdaptiveMPConfig`` → timestep-aware classifier, reads (t, T) from
+      ``sc_linear.get_vit_timestep()`` so ViT callers drive it externally.
+    """
     H = q.shape[1]
     metric = q.float().abs().amax(dim=(0, 2, 3))  # (H,)
-    assignment = classify_rows_by_metric(
-        metric, cfg.stoc_len_levels, cfg.level_fractions,
-    )
+    if isinstance(cfg, AdaptiveMPConfig):
+        t, T = _scl.get_vit_timestep()
+        assignment = adaptive_classify_rows(metric, t, T, cfg, operator="qk")
+    else:
+        assignment = classify_rows_by_metric(
+            metric, cfg.stoc_len_levels, cfg.level_fractions,
+        )
     head_sl = [0] * H
     for sl, heads in assignment.level_row_indices.items():
         for h in heads:
@@ -62,18 +70,24 @@ def _classify_per_head(q: torch.Tensor, cfg: MPConfig) -> list[int]:
     return head_sl
 
 
-def _classify_attn_rows(attn_row_max: torch.Tensor, cfg: MPConfig) -> "RowAssignment":
-    """Per-attn-row ``stoc_len`` assignment matching scmp_llm's AV dynamic path:
-    metric = ``attn_row.amax(-1)`` → fixed-quantile classify. Called once per head."""
+def _classify_attn_rows(attn_row_max: torch.Tensor,
+                        cfg: "MPConfig | AdaptiveMPConfig") -> "RowAssignment":
+    """Per-attn-row ``stoc_len`` assignment. metric = ``attn_row.amax(-1)``.
+
+    Static or adaptive depending on ``cfg`` type (same pattern as per-head).
+    """
+    if isinstance(cfg, AdaptiveMPConfig):
+        t, T = _scl.get_vit_timestep()
+        return adaptive_classify_rows(attn_row_max, t, T, cfg, operator="av")
     return classify_rows_by_metric(
         attn_row_max, cfg.stoc_len_levels, cfg.level_fractions,
     )
 
 
 def _sc_qk_mp(q: torch.Tensor, k: torch.Tensor, sc_prec: int,
-              mp_cfg: MPConfig) -> torch.Tensor:
+              mp_cfg: "MPConfig | AdaptiveMPConfig") -> torch.Tensor:
     """Per-head mixed-precision Q@K^T. q, k: (B, H, N, D). Returns (B, H, N, N)
-    unscaled (caller applies self.scale).
+    unscaled (caller applies self.scale). Accepts static or adaptive MP.
     """
     B, H, N, D = q.shape
     head_sl = _classify_per_head(q, mp_cfg)
@@ -119,9 +133,10 @@ def _sc_qk_mp(q: torch.Tensor, k: torch.Tensor, sc_prec: int,
 
 
 def _sc_av_mp(attn: torch.Tensor, v: torch.Tensor, sc_prec: int,
-              mp_cfg: MPConfig) -> torch.Tensor:
+              mp_cfg: "MPConfig | AdaptiveMPConfig") -> torch.Tensor:
     """Per-attn-row mixed-precision Attn@V. attn: (B, H, N, N), v: (B, H, N, D).
     Per scmp_llm: for each (b, h), classify the N rows by row-max and bucket.
+    Static or adaptive depending on ``mp_cfg`` type.
     """
     B, H, N, D = v.shape
     BH = B * H
@@ -416,10 +431,15 @@ def patch_model(model, sc_prec: int = 8,
     linear_mp = _normalize_linear_mp_spec(linear_mp_spec)
     qk_mp_cfg = (attn_mp_spec or {}).get("qk")
     av_mp_cfg = (attn_mp_spec or {}).get("av")
-    if qk_mp_cfg is not None and not isinstance(qk_mp_cfg, MPConfig):
-        raise TypeError(f"attn_mp_spec['qk'] must be MPConfig, got {type(qk_mp_cfg).__name__}")
-    if av_mp_cfg is not None and not isinstance(av_mp_cfg, MPConfig):
-        raise TypeError(f"attn_mp_spec['av'] must be MPConfig, got {type(av_mp_cfg).__name__}")
+    _attn_ok = (MPConfig, AdaptiveMPConfig)
+    if qk_mp_cfg is not None and not isinstance(qk_mp_cfg, _attn_ok):
+        raise TypeError(
+            f"attn_mp_spec['qk'] must be MPConfig or AdaptiveMPConfig, "
+            f"got {type(qk_mp_cfg).__name__}")
+    if av_mp_cfg is not None and not isinstance(av_mp_cfg, _attn_ok):
+        raise TypeError(
+            f"attn_mp_spec['av'] must be MPConfig or AdaptiveMPConfig, "
+            f"got {type(av_mp_cfg).__name__}")
 
     # ---- highest-priority path: per-block per-op vectors ----
     if sc_ops_per_block is not None:

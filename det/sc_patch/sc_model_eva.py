@@ -178,7 +178,8 @@ def sc_patch_eva(model,
                  proj_mode: str = "bipolar",
                  qk_mode: str = "bipolar",
                  av_mode: str = "bipolar",
-                 linear_mp_spec=None):
+                 linear_mp_spec=None,
+                 attn_mp_spec=None):
     """Swap EVA-ViT primitives with SC versions in place.
 
     Parameters
@@ -212,6 +213,19 @@ def sc_patch_eva(model,
     sched = normalize_sc_ops_per_block(sc_ops_per_block, len(blocks))
     stats = {k: 0 for k in SC_OP_NAMES}
     linear_mp = _normalize_det_linear_mp_spec(linear_mp_spec)
+    # Pluck QK / AV attn mp configs (MPConfig or AdaptiveMPConfig each).
+    attn_mp = attn_mp_spec or {}
+    qk_mp = attn_mp.get("qk")
+    av_mp = attn_mp.get("av")
+    _attn_ok = (MPConfig, AdaptiveMPConfig)
+    if qk_mp is not None and not isinstance(qk_mp, _attn_ok):
+        raise TypeError(
+            f"attn_mp_spec['qk'] must be MPConfig or AdaptiveMPConfig, got "
+            f"{type(qk_mp).__name__}")
+    if av_mp is not None and not isinstance(av_mp, _attn_ok):
+        raise TypeError(
+            f"attn_mp_spec['av'] must be MPConfig or AdaptiveMPConfig, got "
+            f"{type(av_mp).__name__}")
 
     for i, blk in enumerate(blocks):
         attn = getattr(blk, "attn", None)
@@ -233,12 +247,18 @@ def sc_patch_eva(model,
             if sched["qk"][i]:
                 m1 = getattr(attn, "matmul1", None)
                 if m1 is not None and not isinstance(m1, SCMatMul):
-                    attn.matmul1 = SCMatMul(sc_prec=sc_prec, mode=qk_mode)
+                    attn.matmul1 = SCMatMul(
+                        sc_prec=sc_prec, mode=qk_mode, op="qk",
+                        mp_cfg=qk_mp if isinstance(qk_mp, MPConfig) else None,
+                        adaptive_mp_cfg=qk_mp if isinstance(qk_mp, AdaptiveMPConfig) else None)
                     stats["qk"] += 1
             if sched["av"][i]:
                 m2 = getattr(attn, "matmul2", None)
                 if m2 is not None and not isinstance(m2, SCMatMul):
-                    attn.matmul2 = SCMatMul(sc_prec=sc_prec, mode=av_mode)
+                    attn.matmul2 = SCMatMul(
+                        sc_prec=sc_prec, mode=av_mode, op="av",
+                        mp_cfg=av_mp if isinstance(av_mp, MPConfig) else None,
+                        adaptive_mp_cfg=av_mp if isinstance(av_mp, AdaptiveMPConfig) else None)
                     stats["av"] += 1
 
         if mlp is not None:

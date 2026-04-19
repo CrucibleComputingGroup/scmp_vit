@@ -185,6 +185,25 @@ def main():
                          "noise correlation in our kernel, so empirical gain "
                          "is small and not strictly Pareto.")
     ap.add_argument("--out_json", default="results/qwt_sc_pilot.json")
+    # --- static uniform/quantile MP on linear ops (for head-to-head) ---
+    ap.add_argument("--mp_levels", default="",
+                    help="CSV stoc_len levels for static MPConfig. Single "
+                         "value ⇒ uniform at that sl (e.g. '128').")
+    ap.add_argument("--mp_fractions", default="",
+                    help="CSV fractions for levels. Empty ⇒ equal split.")
+    ap.add_argument("--mp_ops", default="qkv_proj,out_proj",
+                    help="CSV op names the static MP applies to.")
+    # --- per-token-row adaptive MP on linear ops (this session's extension) ---
+    ap.add_argument("--adaptive_mp", type=int, default=0)
+    ap.add_argument("--adaptive_mp_levels", default="",
+                    help="e.g. '256,128,64,32'. Empty ⇒ adaptive disabled.")
+    ap.add_argument("--adaptive_mp_alpha", type=float, default=0.3)
+    ap.add_argument("--adaptive_mp_beta", type=float, default=0.05)
+    ap.add_argument("--adaptive_mp_enable_pruning", type=int, default=0)
+    ap.add_argument("--adaptive_mp_ops", default="qkv_proj,out_proj",
+                    help="CSV op names for adaptive MP.")
+    ap.add_argument("--vit_timestep", type=int, default=9)
+    ap.add_argument("--vit_total_timesteps", type=int, default=10)
     args = ap.parse_args()
 
     os.environ.setdefault("XFORMERS_DISABLED", "1")
@@ -226,14 +245,50 @@ def main():
     print("[model] loading SC-to-be-patched model", flush=True)
     model_sc = load_model(device).eval()
 
+    # Build optional adaptive MP spec for Linear ops.
+    linear_mp_spec = None
+    if args.adaptive_mp and args.adaptive_mp_levels:
+        from sc_integration.mp_linear import AdaptiveMPConfig
+        from sc_integration.sc_linear import set_vit_timestep
+        levels = [int(x) for x in args.adaptive_mp_levels.split(",") if x.strip()]
+        adap = AdaptiveMPConfig(
+            stoc_len_levels=levels,
+            alpha=args.adaptive_mp_alpha, beta=args.adaptive_mp_beta,
+            enable_pruning=bool(args.adaptive_mp_enable_pruning))
+        linear_mp_spec = {
+            op.strip(): {"adaptive": adap}
+            for op in args.adaptive_mp_ops.split(",") if op.strip()
+        }
+        set_vit_timestep(args.vit_timestep, args.vit_total_timesteps)
+        prog = args.vit_timestep / max(args.vit_total_timesteps - 1, 1)
+        thr = min(args.adaptive_mp_alpha * prog + args.adaptive_mp_beta, 0.95)
+        print(f"[adaptive_mp] levels={levels} α={args.adaptive_mp_alpha} "
+              f"β={args.adaptive_mp_beta} t={args.vit_timestep}/"
+              f"T={args.vit_total_timesteps} progress={prog:.2f} "
+              f"threshold={thr:.3f} ops={list(linear_mp_spec)}", flush=True)
+    elif args.mp_levels:
+        from sc_integration.mp_linear import MPConfig
+        levels = [int(x) for x in args.mp_levels.split(",") if x.strip()]
+        fractions = ([float(x) for x in args.mp_fractions.split(",") if x.strip()]
+                     if args.mp_fractions else None)
+        mp = MPConfig(stoc_len_levels=levels, level_fractions=fractions)
+        linear_mp_spec = {
+            op.strip(): {"fixed": mp}
+            for op in args.mp_ops.split(",") if op.strip()
+        }
+        print(f"[static_mp] levels={levels} fractions={fractions or 'equal'} "
+              f"ops={list(linear_mp_spec)}", flush=True)
+
     if preset is not None:
         print(f"[sc] patching model_sc with preset {preset}", flush=True)
-        stats = patch_model(model_sc, sc_prec=args.sc_prec, **preset)
+        stats = patch_model(model_sc, sc_prec=args.sc_prec,
+                            linear_mp_spec=linear_mp_spec, **preset)
     else:
         print(f"[sc] patching model_sc with fine-grained schedule "
               f"({args.sc_config})", flush=True)
         stats = patch_model(model_sc, sc_prec=args.sc_prec,
-                            sc_ops_per_block=fine_schedule)
+                            sc_ops_per_block=fine_schedule,
+                            linear_mp_spec=linear_mp_spec)
     print(f"[sc] patched={stats}", flush=True)
 
     res_sc_raw = None

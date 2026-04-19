@@ -10,8 +10,14 @@ EVA's `Attention.forward` does:
 
 Shapes for both are 3-D `(BH, M, K) @ (BH, K, N) -> (BH, M, N)`. The SC
 kernel is 2-D `(M, K) @ (N, K) -> (M, N)`, so we loop over the leading batch
-dim. This is slow compared to the native `@`, but kernel-level batching can
-be plugged in later.
+dim.
+
+Mixed-precision:
+  * ``mp_cfg``          → MPConfig. ``op="qk"`` classifies per-head by
+    metric=``|A|.amax((1,2))`` (one stoc_len per attention head).
+    ``op="av"`` classifies per-attn-row by ``A.amax(-1)`` inside each head.
+  * ``adaptive_mp_cfg`` → AdaptiveMPConfig, same metric but timestep-aware
+    (reads (t, T) from ``sc_linear.get_vit_timestep``).
 """
 from __future__ import annotations
 
@@ -29,6 +35,12 @@ if str(_VIT_SC) not in sys.path:
 
 from sc_triton import sc_matmul_grouped_enable_triton  # noqa: E402
 from config_helpers import make_sobol_simple_config    # noqa: E402
+from mp_config import (  # noqa: E402
+    MPConfig, AdaptiveMPConfig,
+    classify_rows_by_metric, adaptive_classify_rows,
+)
+from sc_integration import sc_linear as _scl  # noqa: E402
+from sc_integration.mp_linear import sc_prec_for_stoc_len  # noqa: E402
 
 
 _CFG_CACHE: dict[tuple[int, int], dict] = {}
@@ -41,6 +53,17 @@ def _get_config(D: int, sc_prec: int) -> dict:
     return _CFG_CACHE[key]
 
 
+def _classify(metric: torch.Tensor,
+              cfg: "MPConfig | AdaptiveMPConfig",
+              operator: str) -> "RowAssignment":
+    if isinstance(cfg, AdaptiveMPConfig):
+        t, T = _scl.get_vit_timestep()
+        return adaptive_classify_rows(metric, t, T, cfg, operator=operator)
+    return classify_rows_by_metric(
+        metric, cfg.stoc_len_levels, cfg.level_fractions,
+    )
+
+
 class SCMatMul(nn.Module):
     """Drop-in replacement for EVA `MatMul` that runs `A @ B` via SC.
 
@@ -51,16 +74,81 @@ class SCMatMul(nn.Module):
     mode : "bipolar" | "unipolar"
         Quantization mode. `bipolar` for signed operands (Q, K), `unipolar`
         for non-negative (post-softmax attn for matmul2).
+    mp_cfg : MPConfig | None
+        Static per-head (op="qk") / per-attn-row (op="av") MP.
+    adaptive_mp_cfg : AdaptiveMPConfig | None
+        Adaptive (timestep-aware) MP with the same metric. Wins over
+        ``mp_cfg`` when both set.
+    op : "qk" | "av" | None
+        Which operator this SCMatMul is playing; drives the classifier
+        metric and per-op (α, β) lookup. ``None`` ⇒ uniform only (legacy).
     """
 
-    def __init__(self, sc_prec: int = 8, mode: str = "bipolar"):
+    def __init__(self, sc_prec: int = 8, mode: str = "bipolar",
+                 mp_cfg: "MPConfig | None" = None,
+                 adaptive_mp_cfg: "AdaptiveMPConfig | None" = None,
+                 op: "str | None" = None):
         super().__init__()
         assert mode in ("bipolar", "unipolar"), mode
         self.sc_prec = sc_prec
         self.mode = mode
+        self.mp_cfg = mp_cfg
+        self.adaptive_mp_cfg = adaptive_mp_cfg
+        self.op = op
 
     def extra_repr(self) -> str:
-        return f"sc_prec={self.sc_prec}, mode={self.mode}"
+        mp = "adaptive" if self.adaptive_mp_cfg else ("static" if self.mp_cfg else "none")
+        return f"sc_prec={self.sc_prec}, mode={self.mode}, op={self.op}, mp={mp}"
+
+    # ---- active config selection ----
+    def _mp(self):
+        return self.adaptive_mp_cfg or self.mp_cfg
+
+    # ---- QK bucketing: per-head (stoc_len per BH) ----
+    def _forward_qk_mp(self, A_flat, B_flat, M, K, N):
+        cfg = self._mp()
+        BH = A_flat.shape[0]
+        # Metric per-head: |A|.amax over (M,K)  (same as cls _classify_per_head)
+        metric = A_flat.abs().amax(dim=(1, 2))  # (BH,)
+        assignment = _classify(metric, cfg, operator="qk")
+
+        out_flat = torch.empty(BH, M, N, device=A_flat.device, dtype=torch.float32)
+        for sl, heads in assignment.level_row_indices.items():
+            if int(sl) == 0 or heads.numel() == 0:
+                continue
+            sp = sc_prec_for_stoc_len(int(sl))
+            cfg_k = _get_config(K, sp)
+            for i in heads.tolist():
+                out_flat[i] = sc_matmul_grouped_enable_triton(
+                    A_flat[i], B_flat[i].transpose(0, 1).contiguous(),
+                    group_a=1, group_b=1,
+                    mode=self.mode, sc_prec=sp, config=cfg_k,
+                    stoc_len=int(sl),
+                )
+        return out_flat
+
+    # ---- AV bucketing: per-attn-row inside each head ----
+    def _forward_av_mp(self, A_flat, B_flat, M, K, N):
+        cfg = self._mp()
+        BH = A_flat.shape[0]
+        out_flat = torch.empty(BH, M, N, device=A_flat.device, dtype=torch.float32)
+        for i in range(BH):
+            row_max = A_flat[i].amax(dim=-1)  # (M,)
+            assignment = _classify(row_max, cfg, operator="av")
+            for sl, rows in assignment.level_row_indices.items():
+                if int(sl) == 0 or rows.numel() == 0:
+                    continue
+                sp = sc_prec_for_stoc_len(int(sl))
+                cfg_k = _get_config(K, sp)
+                sub = sc_matmul_grouped_enable_triton(
+                    A_flat[i].index_select(0, rows).contiguous(),
+                    B_flat[i].transpose(0, 1).contiguous(),
+                    group_a=1, group_b=1,
+                    mode=self.mode, sc_prec=sp, config=cfg_k,
+                    stoc_len=int(sl),
+                )
+                out_flat[i, rows] = sub
+        return out_flat
 
     def forward(self, A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
         # A: (..., M, K);  B: (..., K, N) → out: (..., M, N)
@@ -74,22 +162,24 @@ class SCMatMul(nn.Module):
         N = B.shape[-1]
 
         lead = A.shape[:-2]
-        # Broadcast leading dims if mismatched (rare in EVA — keep defensive)
         if B.shape[:-2] != lead:
             B = B.expand(*lead, K, N)
 
-        A_flat = A.reshape(-1, M, K).float().contiguous()       # (B, M, K)
-        B_flat = B.reshape(-1, K, N).float().contiguous()       # (B, K, N)
+        A_flat = A.reshape(-1, M, K).float().contiguous()       # (BH, M, K)
+        B_flat = B.reshape(-1, K, N).float().contiguous()       # (BH, K, N)
 
-        cfg = _get_config(K, self.sc_prec)
-        out_flat = torch.empty(A_flat.shape[0], M, N,
-                               device=A.device, dtype=torch.float32)
-        for i in range(A_flat.shape[0]):
-            # sc_matmul_grouped_enable_triton computes a @ b.T where
-            # a: (M, K), b: (N, K). So pass b = B_flat[i].T → (N, K).
-            out_flat[i] = sc_matmul_grouped_enable_triton(
-                A_flat[i], B_flat[i].transpose(0, 1).contiguous(),
-                group_a=1, group_b=1,
-                mode=self.mode, sc_prec=self.sc_prec, config=cfg,
-            )
+        if self._mp() is not None and self.op == "qk":
+            out_flat = self._forward_qk_mp(A_flat, B_flat, M, K, N)
+        elif self._mp() is not None and self.op == "av":
+            out_flat = self._forward_av_mp(A_flat, B_flat, M, K, N)
+        else:
+            cfg = _get_config(K, self.sc_prec)
+            out_flat = torch.empty(A_flat.shape[0], M, N,
+                                   device=A.device, dtype=torch.float32)
+            for i in range(A_flat.shape[0]):
+                out_flat[i] = sc_matmul_grouped_enable_triton(
+                    A_flat[i], B_flat[i].transpose(0, 1).contiguous(),
+                    group_a=1, group_b=1,
+                    mode=self.mode, sc_prec=self.sc_prec, config=cfg,
+                )
         return out_flat.reshape(*lead, M, N).to(A.dtype)
