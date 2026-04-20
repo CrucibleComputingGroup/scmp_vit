@@ -217,6 +217,20 @@ def main():
                     help="CSV target fractions per level (quantile mode); "
                          "overrides linear-threshold. e.g. '0.05,0.35,0.40,0.20' "
                          "for levels=[256,128,64,32]. Sums to 1.")
+    # ---- Auto-MP calibration (zero-hyperparameter) ------------------------
+    ap.add_argument("--auto_mp_calibrate", type=int, default=0,
+                    help="When > 0, replace α/β/fractions with a learned "
+                         "FreeBoundaryMPConfig: per-(block, op) k-1 boundaries "
+                         "searched by oracle coord-descent on a calibration set "
+                         "of this size. Integrates with QwT comp (single pass, "
+                         "Gauss-Seidel). Ignores adaptive_mp_alpha/beta/fractions.")
+    ap.add_argument("--auto_mp_n_candidates", type=int, default=10,
+                    help="Candidates per 1D line search in oracle coord descent.")
+    ap.add_argument("--auto_mp_outer_per_op", type=int, default=2,
+                    help="Coord-descent rounds within one (block, op).")
+    ap.add_argument("--auto_mp_outer_block", type=int, default=1,
+                    help="Outer rounds over all ops in a block (handles "
+                         "inter-op coupling; 1 is usually enough).")
     ap.add_argument("--sc_mlp_mode", choices=["bipolar", "unipolar"],
                     default="bipolar",
                     help="SC quant mode for MLP fc1/fc2 when sc_mlp=True.")
@@ -302,8 +316,11 @@ def main():
     attn_mp_spec: dict = {}
     _LINEAR_OP_SET = {"qkv_proj", "out_proj", "mlp_fc1", "mlp_fc2", "proj"}
     _ATTN_OP_SET = {"qk", "av"}
+    auto_mp_on = bool(args.auto_mp_calibrate > 0)
     if args.adaptive_mp and args.adaptive_mp_levels:
-        from sc_integration.mp_linear import AdaptiveMPConfig
+        from sc_integration.mp_linear import (
+            AdaptiveMPConfig, FreeBoundaryMPConfig,
+        )
         from sc_integration.sc_linear import set_vit_timestep
         levels = [int(x) for x in args.adaptive_mp_levels.split(",") if x.strip()]
         # Parse per-op overrides like "qkv_proj=0.4,out_proj=0.3"
@@ -328,18 +345,32 @@ def main():
             target_fractions = [float(x) for x in
                                 args.adaptive_mp_fractions.split(",")
                                 if x.strip()]
-        adap = AdaptiveMPConfig(
-            stoc_len_levels=levels,
-            alpha=args.adaptive_mp_alpha, beta=args.adaptive_mp_beta,
-            enable_pruning=bool(args.adaptive_mp_enable_pruning),
-            operator_params=op_params,
-            target_fractions=target_fractions)
+        if auto_mp_on:
+            # Zero-hyperparameter path: ignore α/β/fractions; a single
+            # FreeBoundaryMPConfig is shared across all ops and all blocks,
+            # with per-(block, op) boundaries filled in by auto_calibrate_mp
+            # after patch_model installs it into SC ops.
+            if target_fractions is not None or op_params:
+                print("[auto_mp] ignoring --adaptive_mp_alpha/beta/fractions "
+                      "(auto_mp_calibrate is on)", flush=True)
+            adap = FreeBoundaryMPConfig(
+                stoc_len_levels=levels,
+                enable_pruning=bool(args.adaptive_mp_enable_pruning))
+        else:
+            adap = AdaptiveMPConfig(
+                stoc_len_levels=levels,
+                alpha=args.adaptive_mp_alpha, beta=args.adaptive_mp_beta,
+                enable_pruning=bool(args.adaptive_mp_enable_pruning),
+                operator_params=op_params,
+                target_fractions=target_fractions)
         # Attention ops: QK per-head (MPConfig quantile, H=16 is tiny so
         # static is fine) / AV per-row (AdaptiveMPConfig with target_fractions
-        # — classifies thousands of softmax rows per forward).
+        # — classifies thousands of softmax rows per forward). In auto mode
+        # we route QK through the FreeBoundaryMPConfig too (H=16 works with
+        # per-head boundaries).
         from sc_integration.mp_linear import MPConfig as _MPConfig
         qk_mp_static = None
-        if target_fractions is not None:
+        if not auto_mp_on and target_fractions is not None:
             qk_mp_static = _MPConfig(stoc_len_levels=levels,
                                      level_fractions=target_fractions)
         for op in args.adaptive_mp_ops.split(","):
@@ -347,21 +378,31 @@ def main():
             if not op:
                 continue
             if op == "qk":
-                if qk_mp_static is None:
-                    qk_mp_static = _MPConfig(stoc_len_levels=levels)
-                attn_mp_spec["qk"] = qk_mp_static
+                if auto_mp_on:
+                    attn_mp_spec["qk"] = adap
+                else:
+                    if qk_mp_static is None:
+                        qk_mp_static = _MPConfig(stoc_len_levels=levels)
+                    attn_mp_spec["qk"] = qk_mp_static
             elif op == "av":
-                attn_mp_spec["av"] = adap   # AdaptiveMPConfig (with target_fractions)
+                attn_mp_spec["av"] = adap
             else:
                 linear_mp_spec[op] = {"adaptive": adap}
         set_vit_timestep(args.vit_timestep, args.vit_total_timesteps)
-        prog = args.vit_timestep / max(args.vit_total_timesteps - 1, 1)
-        thr = min(args.adaptive_mp_alpha * prog + args.adaptive_mp_beta, 0.95)
         adap_ops = [op for op in args.adaptive_mp_ops.split(",") if op.strip()]
-        print(f"[adaptive_mp] levels={levels} α={args.adaptive_mp_alpha} "
-              f"β={args.adaptive_mp_beta} t={args.vit_timestep}/"
-              f"T={args.vit_total_timesteps} progress={prog:.2f} "
-              f"threshold={thr:.3f} ops={adap_ops}", flush=True)
+        if auto_mp_on:
+            print(f"[auto_mp] levels={levels} ops={adap_ops} "
+                  f"n_calib_search={args.auto_mp_calibrate} "
+                  f"candidates={args.auto_mp_n_candidates} "
+                  f"outer_per_op={args.auto_mp_outer_per_op} "
+                  f"outer_block={args.auto_mp_outer_block}", flush=True)
+        else:
+            prog = args.vit_timestep / max(args.vit_total_timesteps - 1, 1)
+            thr = min(args.adaptive_mp_alpha * prog + args.adaptive_mp_beta, 0.95)
+            print(f"[adaptive_mp] levels={levels} α={args.adaptive_mp_alpha} "
+                  f"β={args.adaptive_mp_beta} t={args.vit_timestep}/"
+                  f"T={args.vit_total_timesteps} progress={prog:.2f} "
+                  f"threshold={thr:.3f} ops={adap_ops}", flush=True)
     if args.mp_levels:
         from sc_integration.mp_linear import MPConfig
         s_levels = [int(x) for x in args.mp_levels.split(",") if x.strip()]
@@ -466,26 +507,53 @@ def main():
     else:
         print(f"[comp] FP compensator (baseline)", flush=True)
 
-    print("[calib] starting QwT-style sequential calibration", flush=True)
     t_cal = time.time()
     seed_all(args.calib_seed)
     blocks_fp = list(get_blocks(model_fp))
     blocks_sc_container = get_blocks(model_sc)
-    calib_report = calibrate_qwt(
-        model_fp=model_fp, model_sc=model_sc,
-        blocks_fp=blocks_fp,
-        blocks_sc_container=blocks_sc_container,
-        calib_loader=calib_loader,
-        device=device,
-        n_calib=args.n_calib,
-        ridge=args.ridge,
-        start_block=args.start_block,
-        fwd_chunk=args.fwd_chunk,
-        avg_sc_draws=args.avg_sc_draws,
-        comp_factory=comp_factory,
-        comp_factory_variants=comp_factory_variants,
-        comp_refit_iters=args.comp_refit_iters,
-    )
+    if auto_mp_on:
+        print("[calib] starting AUTO-MP calibration (oracle boundary search "
+              "+ QwT comp, Gauss-Seidel)", flush=True)
+        sys.path.insert(0, str(HERE / "sc"))
+        from mp_auto_calibrator import auto_calibrate_mp  # noqa: E402
+        auto_ops = [op.strip() for op in args.adaptive_mp_ops.split(",")
+                    if op.strip()]
+        calib_report = auto_calibrate_mp(
+            model_fp=model_fp, model_sc=model_sc,
+            blocks_fp=blocks_fp,
+            blocks_sc_container=blocks_sc_container,
+            calib_loader=calib_loader,
+            device=device,
+            n_calib=args.auto_mp_calibrate,
+            cfg=adap,                       # the FreeBoundaryMPConfig
+            ops_per_block=auto_ops,
+            ridge=args.ridge,
+            start_block=args.start_block,
+            fwd_chunk=args.fwd_chunk,
+            avg_sc_draws=args.avg_sc_draws,
+            n_candidates=args.auto_mp_n_candidates,
+            n_outer_per_op=args.auto_mp_outer_per_op,
+            n_outer_block=args.auto_mp_outer_block,
+            comp_factory=comp_factory,
+            install_compensation=True,
+        )
+    else:
+        print("[calib] starting QwT-style sequential calibration", flush=True)
+        calib_report = calibrate_qwt(
+            model_fp=model_fp, model_sc=model_sc,
+            blocks_fp=blocks_fp,
+            blocks_sc_container=blocks_sc_container,
+            calib_loader=calib_loader,
+            device=device,
+            n_calib=args.n_calib,
+            ridge=args.ridge,
+            start_block=args.start_block,
+            fwd_chunk=args.fwd_chunk,
+            avg_sc_draws=args.avg_sc_draws,
+            comp_factory=comp_factory,
+            comp_factory_variants=comp_factory_variants,
+            comp_refit_iters=args.comp_refit_iters,
+        )
     calib_s = time.time() - t_cal
     print(f"[calib] done in {calib_s:.1f}s", flush=True)
 

@@ -9,6 +9,9 @@ Includes:
 - MPConfig: Fixed-fraction quantile-based assignment (original).
 - AdaptiveMPConfig: Timestep-adaptive thresholds with per-operator and
   per-layer control, inspired by HPCA APT's APDT algorithm.
+- FreeBoundaryMPConfig: Zero-hyperparameter per-(block, op) free boundaries
+  (k-1 for k levels), filled in by an offline oracle search (see
+  mp_auto_calibrator.py).
 """
 from __future__ import annotations
 
@@ -16,6 +19,23 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 import torch
+
+
+# ---------------------------------------------------------------------
+# Per-block context: classifiers that index by (block, op) read this
+# global; the auto-calibrator and runtime pre-hooks set it per forward.
+# Parallels the ``_GLOBAL_VIT_TIMESTEP`` pattern in sc_integration/sc_linear.
+# ---------------------------------------------------------------------
+_CURRENT_BLOCK_IDX: int = 0
+
+
+def set_current_block_idx(i: int) -> None:
+    global _CURRENT_BLOCK_IDX
+    _CURRENT_BLOCK_IDX = int(i)
+
+
+def get_current_block_idx() -> int:
+    return _CURRENT_BLOCK_IDX
 
 
 @dataclass
@@ -145,6 +165,109 @@ class AdaptiveMPConfig:
         return (self.alpha, self.beta)
 
 
+# =====================================================================
+# Free-boundary MP (zero hyperparameter; offline oracle-search populated)
+# =====================================================================
+
+@dataclass
+class FreeBoundaryMPConfig(AdaptiveMPConfig):
+    """Per-(block, op) k-1 free boundaries on normalized metric in [0, 1].
+
+    Subclasses ``AdaptiveMPConfig`` so existing ``isinstance(cfg,
+    AdaptiveMPConfig)`` dispatch in the SC attention patch continues to
+    fire. The inherited ``alpha`` / ``beta`` / ``target_fractions`` fields
+    are ignored when the classifier takes the free-boundary branch.
+
+    Boundaries are keyed by ``(block_idx, op_name)``; block_idx is read
+    from the module-level ``_CURRENT_BLOCK_IDX`` at classification time
+    (set by forward pre-hooks installed by the auto-calibrator).
+
+    Missing entries fall back to ``default_boundaries`` (equal spacing).
+    """
+    # {(block_idx, op_name): tensor of k-1 boundaries, descending in (0, 1)}
+    boundaries: dict = field(default_factory=dict)
+
+    def __post_init__(self):
+        super().__post_init__()
+        # sanity-check any pre-populated entries
+        k = len(self.stoc_len_levels)
+        for key, b in self.boundaries.items():
+            assert isinstance(key, tuple) and len(key) == 2, (
+                f"boundaries key must be (block_idx, op_name), got {key!r}")
+            bt = b if isinstance(b, torch.Tensor) else torch.as_tensor(b)
+            assert bt.numel() == k - 1, (
+                f"boundaries[{key!r}] must have length {k-1}, got {bt.numel()}")
+
+    def default_boundaries(self) -> torch.Tensor:
+        """Equal-spacing boundaries in (0, 1) descending, length k-1."""
+        k = len(self.stoc_len_levels)
+        return torch.tensor(
+            [(k - 1 - i) / k for i in range(k - 1)], dtype=torch.float32)
+
+    def get_boundaries(self, operator: str,
+                       block_idx: Optional[int] = None) -> torch.Tensor:
+        if block_idx is None:
+            block_idx = _CURRENT_BLOCK_IDX
+        key = (int(block_idx), operator)
+        if key in self.boundaries:
+            b = self.boundaries[key]
+            return b if isinstance(b, torch.Tensor) else torch.as_tensor(b)
+        return self.default_boundaries()
+
+    def set_boundaries(self, operator: str, block_idx: int,
+                       boundaries: torch.Tensor) -> None:
+        bt = (boundaries.detach().cpu().float() if isinstance(boundaries, torch.Tensor)
+              else torch.as_tensor(boundaries, dtype=torch.float32))
+        k = len(self.stoc_len_levels)
+        assert bt.numel() == k - 1, (
+            f"expected {k-1} boundaries, got {bt.numel()}")
+        self.boundaries[(int(block_idx), operator)] = bt
+
+
+def _classify_with_free_boundaries(
+    metric: torch.Tensor,
+    boundaries: torch.Tensor,
+    stoc_len_levels: list[int],
+) -> "RowAssignment":
+    """Bucket rows by normalized metric against free, non-equal-spaced
+    descending boundaries. See ``adaptive_classify_rows`` for the semantics
+    (level 0 = highest stoc_len, assigned to rows above the first boundary).
+    """
+    N = metric.shape[0]
+    n_levels = len(stoc_len_levels)
+
+    m_min = metric.min()
+    m_max = metric.max()
+    if (m_max - m_min).item() < 1e-8:
+        # Degenerate distribution: default to level 0.
+        row_levels = torch.zeros(N, dtype=torch.long, device=metric.device)
+        level_row_indices: dict[int, torch.Tensor] = {}
+        for idx, sl in enumerate(stoc_len_levels):
+            if idx == 0:
+                level_row_indices[sl] = torch.arange(N, device=metric.device)
+            else:
+                level_row_indices[sl] = torch.empty(
+                    0, dtype=torch.long, device=metric.device)
+        return RowAssignment(row_levels=row_levels,
+                             level_row_indices=level_row_indices)
+
+    metric_norm = (metric - m_min) / (m_max - m_min)
+
+    # Ensure descending order for safety — boundaries may come from a
+    # coord-descent step that hasn't yet re-sorted.
+    b_sorted, _ = torch.sort(boundaries.to(metric.device).float(),
+                             descending=True)
+    row_levels = torch.zeros(N, dtype=torch.long, device=metric.device)
+    for k in range(n_levels - 1):
+        row_levels[metric_norm < b_sorted[k]] = k + 1
+
+    level_row_indices = {}
+    for i, sl in enumerate(stoc_len_levels):
+        level_row_indices[sl] = torch.where(row_levels == i)[0]
+    return RowAssignment(row_levels=row_levels,
+                         level_row_indices=level_row_indices)
+
+
 def adaptive_classify_rows(
     metric: torch.Tensor,
     timestep: int,
@@ -171,6 +294,14 @@ def adaptive_classify_rows(
     N = metric.shape[0]
     levels = config.stoc_len_levels
     n_levels = len(levels)
+
+    # ---------- Free-boundary path (FreeBoundaryMPConfig) ----------
+    # Per-(block, op) learned boundaries; no α/β/progress dependency.
+    # Check subclass first so inherited isinstance(cfg, AdaptiveMPConfig)
+    # still works elsewhere while we dispatch correctly here.
+    if isinstance(config, FreeBoundaryMPConfig):
+        boundaries = config.get_boundaries(operator or "")
+        return _classify_with_free_boundaries(metric, boundaries, levels)
 
     # ---------- Quantile path (target_fractions set) ----------
     # Independent of (t, T) / α / β. Top frac[0] rows → levels[0], etc.

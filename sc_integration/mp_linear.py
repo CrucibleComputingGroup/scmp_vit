@@ -38,21 +38,27 @@ from mp_config import (  # type: ignore  # noqa: E402
     MPConfig,
     RangeMPConfig,
     AdaptiveMPConfig,
+    FreeBoundaryMPConfig,
     RowAssignment,
     classify_rows_by_metric,
     classify_groups_by_range,
     adaptive_classify_rows,
+    set_current_block_idx,
+    get_current_block_idx,
 )
 
 __all__ = [
     "MPConfig",
     "RangeMPConfig",
     "AdaptiveMPConfig",
+    "FreeBoundaryMPConfig",
     "DispatchEntry",
     "build_range_dispatch",
     "classify_input_rows",
     "classify_input_rows_adaptive",
     "sc_prec_for_stoc_len",
+    "set_current_block_idx",
+    "get_current_block_idx",
 ]
 
 
