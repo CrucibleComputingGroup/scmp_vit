@@ -118,6 +118,12 @@ SC_PRESETS = {
                       sc_mlp=False),
     "qk_av":     dict(sc_qk=True, sc_av=True, sc_qkv_proj=False, sc_out_proj=False,
                       sc_mlp=False),
+    "full_everything": dict(sc_qk=True, sc_av=True, sc_qkv_proj=True,
+                            sc_out_proj=True, sc_mlp=True),
+    "mlp_only": dict(sc_qk=False, sc_av=False, sc_qkv_proj=False,
+                     sc_out_proj=False, sc_mlp=True),
+    "av_only":  dict(sc_qk=False, sc_av=True, sc_qkv_proj=False,
+                     sc_out_proj=False, sc_mlp=False),
 }
 
 # Fine-grained per-(op, block) schedules from the sensitivity matrix. Values
@@ -211,6 +217,29 @@ def main():
                     help="CSV target fractions per level (quantile mode); "
                          "overrides linear-threshold. e.g. '0.05,0.35,0.40,0.20' "
                          "for levels=[256,128,64,32]. Sums to 1.")
+    ap.add_argument("--sc_mlp_mode", choices=["bipolar", "unipolar"],
+                    default="bipolar",
+                    help="SC quant mode for MLP fc1/fc2 when sc_mlp=True.")
+    ap.add_argument("--sc_proj_mode", choices=["bipolar", "unipolar"],
+                    default="bipolar",
+                    help="SC quant mode for qkv/out projections.")
+    ap.add_argument("--mlp_fc_mask", choices=["both", "fc1", "fc2"],
+                    default="both",
+                    help="Which MLP linears get SC when sc_mlp=True.")
+    ap.add_argument("--av_metric_reverse", type=int, default=0,
+                    help="When 1, reverse the AV per-row metric so LOW "
+                         "softmax-amax rows get higher sl. Assumption: "
+                         "near-one-hot rows are quant-easy, near-uniform rows "
+                         "need precision.")
+    ap.add_argument("--av_metric_kind", default="amax",
+                    choices=["amax", "entropy", "ipr"],
+                    help="AV per-row peakiness metric. 'entropy' and 'ipr' "
+                         "natively encode flat→high-score; amax needs "
+                         "--av_metric_reverse 1 for the same direction.")
+    ap.add_argument("--fc2_skip_last_k", type=int, default=0,
+                    help="When >0 (requires sc_mlp=True), SC fc2 in all blocks "
+                         "EXCEPT the last K. fc1 stays governed by mlp_fc_mask. "
+                         "Bypasses preset's sc_mlp path and uses sc_ops_per_block.")
     ap.add_argument("--vit_timestep", type=int, default=9)
     ap.add_argument("--vit_total_timesteps", type=int, default=10)
     args = ap.parse_args()
@@ -219,6 +248,15 @@ def main():
     seed_all(args.calib_seed)
     device = torch.device("cuda")
     set_noise_model(False)
+    if args.av_metric_reverse:
+        from sc_attention_patch import set_av_metric_reverse
+        set_av_metric_reverse(True)
+        print("[av_metric_reverse] ON (low-amax rows get high sl)", flush=True)
+    if args.av_metric_kind != "amax":
+        from sc_attention_patch import set_av_metric_kind
+        set_av_metric_kind(args.av_metric_kind)
+        print(f"[av_metric_kind] = {args.av_metric_kind} "
+              f"(flat rows get high sl natively)", flush=True)
 
     print(f"[env] torch {torch.__version__} cuda {torch.version.cuda} "
           f"dev={torch.cuda.get_device_name(0)}", flush=True)
@@ -254,8 +292,16 @@ def main():
     print("[model] loading SC-to-be-patched model", flush=True)
     model_sc = load_model(device).eval()
 
-    # Build optional adaptive MP spec for Linear ops.
-    linear_mp_spec = None
+    # Build optional linear MP spec. adaptive and static can coexist on
+    # DIFFERENT ops (e.g., qkv_proj+out_proj adaptive, mlp_fc1 uniform).
+    # Same op in both → adaptive wins.
+    linear_mp_spec: dict = {}
+    # Attention MP spec — ops 'qk' / 'av' go here, not linear_mp_spec.
+    # QK per-head: static MPConfig (only 16 candidates, quantile is fine).
+    # AV per-row: static MPConfig with level_fractions from --adaptive_mp_fractions.
+    attn_mp_spec: dict = {}
+    _LINEAR_OP_SET = {"qkv_proj", "out_proj", "mlp_fc1", "mlp_fc2", "proj"}
+    _ATTN_OP_SET = {"qk", "av"}
     if args.adaptive_mp and args.adaptive_mp_levels:
         from sc_integration.mp_linear import AdaptiveMPConfig
         from sc_integration.sc_linear import set_vit_timestep
@@ -288,40 +334,103 @@ def main():
             enable_pruning=bool(args.adaptive_mp_enable_pruning),
             operator_params=op_params,
             target_fractions=target_fractions)
-        linear_mp_spec = {
-            op.strip(): {"adaptive": adap}
-            for op in args.adaptive_mp_ops.split(",") if op.strip()
-        }
+        # Attention ops: QK per-head (MPConfig quantile, H=16 is tiny so
+        # static is fine) / AV per-row (AdaptiveMPConfig with target_fractions
+        # — classifies thousands of softmax rows per forward).
+        from sc_integration.mp_linear import MPConfig as _MPConfig
+        qk_mp_static = None
+        if target_fractions is not None:
+            qk_mp_static = _MPConfig(stoc_len_levels=levels,
+                                     level_fractions=target_fractions)
+        for op in args.adaptive_mp_ops.split(","):
+            op = op.strip()
+            if not op:
+                continue
+            if op == "qk":
+                if qk_mp_static is None:
+                    qk_mp_static = _MPConfig(stoc_len_levels=levels)
+                attn_mp_spec["qk"] = qk_mp_static
+            elif op == "av":
+                attn_mp_spec["av"] = adap   # AdaptiveMPConfig (with target_fractions)
+            else:
+                linear_mp_spec[op] = {"adaptive": adap}
         set_vit_timestep(args.vit_timestep, args.vit_total_timesteps)
         prog = args.vit_timestep / max(args.vit_total_timesteps - 1, 1)
         thr = min(args.adaptive_mp_alpha * prog + args.adaptive_mp_beta, 0.95)
+        adap_ops = [op for op in args.adaptive_mp_ops.split(",") if op.strip()]
         print(f"[adaptive_mp] levels={levels} α={args.adaptive_mp_alpha} "
               f"β={args.adaptive_mp_beta} t={args.vit_timestep}/"
               f"T={args.vit_total_timesteps} progress={prog:.2f} "
-              f"threshold={thr:.3f} ops={list(linear_mp_spec)}", flush=True)
-    elif args.mp_levels:
+              f"threshold={thr:.3f} ops={adap_ops}", flush=True)
+    if args.mp_levels:
         from sc_integration.mp_linear import MPConfig
-        levels = [int(x) for x in args.mp_levels.split(",") if x.strip()]
-        fractions = ([float(x) for x in args.mp_fractions.split(",") if x.strip()]
-                     if args.mp_fractions else None)
-        mp = MPConfig(stoc_len_levels=levels, level_fractions=fractions)
-        linear_mp_spec = {
-            op.strip(): {"fixed": mp}
-            for op in args.mp_ops.split(",") if op.strip()
-        }
-        print(f"[static_mp] levels={levels} fractions={fractions or 'equal'} "
-              f"ops={list(linear_mp_spec)}", flush=True)
+        s_levels = [int(x) for x in args.mp_levels.split(",") if x.strip()]
+        s_fractions = ([float(x) for x in args.mp_fractions.split(",")
+                        if x.strip()]
+                       if args.mp_fractions else None)
+        mp = MPConfig(stoc_len_levels=s_levels, level_fractions=s_fractions)
+        s_ops = [op.strip() for op in args.mp_ops.split(",") if op.strip()]
+        # Don't clobber adaptive entries; user can force with disjoint op sets.
+        for op in s_ops:
+            if op in linear_mp_spec:
+                print(f"[static_mp] skip op {op!r} (already adaptive)",
+                      flush=True)
+                continue
+            linear_mp_spec[op] = {"fixed": mp}
+        print(f"[static_mp] levels={s_levels} fractions="
+              f"{s_fractions or 'equal'} ops={s_ops}", flush=True)
+    if not linear_mp_spec:
+        linear_mp_spec = None
 
-    if preset is not None:
+    # Custom per-block schedule: keep fc2 FP in last K blocks while still SC'ing
+    # everything else. Only makes sense with a preset that implies full SC.
+    custom_sched = None
+    if args.fc2_skip_last_k > 0:
+        n_blocks = 24  # DINOv2 ViT-L/14
+        K = args.fc2_skip_last_k
+        custom_sched = {
+            "mlp_fc1": [1] * n_blocks,
+            "mlp_fc2": [1] * (n_blocks - K) + [0] * K,
+            "qk":      [1] * n_blocks,
+            "av":      [1] * n_blocks,
+            "proj":    [1] * n_blocks,
+        }
+        print(f"[sc] fc2 FP in last {K} blocks; fc1/attn/proj SC in all 24",
+              flush=True)
+
+    _attn_spec_arg = attn_mp_spec or None
+    if custom_sched is not None:
+        stats = patch_model(model_sc, sc_prec=args.sc_prec,
+                            sc_mlp_mode=args.sc_mlp_mode,
+                            sc_proj_mode=args.sc_proj_mode,
+                            sc_ops_per_block=custom_sched,
+                            linear_mp_spec=linear_mp_spec,
+                            attn_mp_spec=_attn_spec_arg)
+    elif preset is not None:
         print(f"[sc] patching model_sc with preset {preset}", flush=True)
         stats = patch_model(model_sc, sc_prec=args.sc_prec,
-                            linear_mp_spec=linear_mp_spec, **preset)
+                            sc_mlp_mode=args.sc_mlp_mode,
+                            sc_proj_mode=args.sc_proj_mode,
+                            mlp_fc_mask=args.mlp_fc_mask,
+                            linear_mp_spec=linear_mp_spec,
+                            attn_mp_spec=_attn_spec_arg, **preset)
     else:
         print(f"[sc] patching model_sc with fine-grained schedule "
               f"({args.sc_config})", flush=True)
         stats = patch_model(model_sc, sc_prec=args.sc_prec,
+                            sc_mlp_mode=args.sc_mlp_mode,
+                            sc_proj_mode=args.sc_proj_mode,
+                            mlp_fc_mask=args.mlp_fc_mask,
                             sc_ops_per_block=fine_schedule,
-                            linear_mp_spec=linear_mp_spec)
+                            linear_mp_spec=linear_mp_spec,
+                            attn_mp_spec=_attn_spec_arg)
+    if attn_mp_spec:
+        first = list(attn_mp_spec.values())[0]
+        frac = getattr(first, "target_fractions",
+                       getattr(first, "level_fractions", None))
+        print(f"[attn_mp] ops={list(attn_mp_spec)} "
+              f"levels={first.stoc_len_levels} fractions={frac}",
+              flush=True)
     print(f"[sc] patched={stats}", flush=True)
 
     res_sc_raw = None

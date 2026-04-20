@@ -70,17 +70,71 @@ def _classify_per_head(q: torch.Tensor,
     return head_sl
 
 
-def _classify_attn_rows(attn_row_max: torch.Tensor,
-                        cfg: "MPConfig | AdaptiveMPConfig") -> "RowAssignment":
-    """Per-attn-row ``stoc_len`` assignment. metric = ``attn_row.amax(-1)``.
+AV_METRIC_REVERSE = False
+AV_METRIC_KIND = "amax"  # "amax" | "entropy" | "ipr"
 
-    Static or adaptive depending on ``cfg`` type (same pattern as per-head).
+
+def set_av_metric_reverse(flag: bool):
+    """When True, invert the AV row metric so LOW-amax rows get sl=256.
+
+    Rationale: softmax rows with high max are near one-hot (easy to quant);
+    rows with low max are near-uniform (needs precise sum of ~N terms).
+    Reversing aligns precision allocation with difficulty.
     """
+    global AV_METRIC_REVERSE
+    AV_METRIC_REVERSE = bool(flag)
+
+
+def set_av_metric_kind(kind: str):
+    """Select the AV row peakiness metric:
+
+    * ``amax``   — row.max() (backwards-compatible default; pair with
+                   AV_METRIC_REVERSE to get "flat → high sl" direction)
+    * ``entropy`` — Shannon entropy of the row; HIGHER entropy ⇒ flatter ⇒
+                    more precision needed (passed straight as metric, no
+                    reverse flag needed — already aligned)
+    * ``ipr``    — inverse participation ratio 1/Σp²; effective support;
+                    HIGHER IPR ⇒ flatter (same sign as entropy)
+    """
+    global AV_METRIC_KIND
+    assert kind in ("amax", "entropy", "ipr"), f"unknown AV metric: {kind}"
+    AV_METRIC_KIND = kind
+
+
+def _av_row_score(attn_row: torch.Tensor) -> torch.Tensor:
+    """Compute per-row peakiness score for AV. Higher = 'need more precision'.
+
+    For amax we return attn_row.amax(-1) and rely on AV_METRIC_REVERSE for
+    direction. For entropy / ipr, we return the raw measure where higher
+    already means flatter (already the "reversed" direction).
+
+    Input attn_row can be 1-D (amax already computed) or 2-D ((M, N)).
+    """
+    if AV_METRIC_KIND == "amax":
+        metric = attn_row.amax(-1) if attn_row.dim() > 1 else attn_row
+        return -metric if AV_METRIC_REVERSE else metric
+    if attn_row.dim() == 1:
+        raise ValueError(f"AV_METRIC_KIND={AV_METRIC_KIND} needs full "
+                         "attn row, got 1-D input")
+    if AV_METRIC_KIND == "entropy":
+        safe = attn_row.clamp(min=1e-9)
+        return -(attn_row * safe.log()).sum(-1)
+    if AV_METRIC_KIND == "ipr":
+        return 1.0 / (attn_row.pow(2).sum(-1) + 1e-9)
+    raise ValueError(f"unknown AV_METRIC_KIND: {AV_METRIC_KIND}")
+
+
+def _classify_attn_rows(attn_row: torch.Tensor,
+                        cfg: "MPConfig | AdaptiveMPConfig") -> "RowAssignment":
+    """Per-attn-row ``stoc_len`` assignment. See ``set_av_metric_kind`` for
+    the choice of peakiness metric. Accepts 1-D (amax only) or 2-D (full row).
+    """
+    metric = _av_row_score(attn_row)
     if isinstance(cfg, AdaptiveMPConfig):
         t, T = _scl.get_vit_timestep()
-        return adaptive_classify_rows(attn_row_max, t, T, cfg, operator="av")
+        return adaptive_classify_rows(metric, t, T, cfg, operator="av")
     return classify_rows_by_metric(
-        attn_row_max, cfg.stoc_len_levels, cfg.level_fractions,
+        metric, cfg.stoc_len_levels, cfg.level_fractions,
     )
 
 
@@ -145,8 +199,8 @@ def _sc_av_mp(attn: torch.Tensor, v: torch.Tensor, sc_prec: int,
     out = torch.zeros(BH, N, D, dtype=torch.float32, device=v.device)
 
     for i in range(BH):
-        row_max = attn_flat[i].amax(dim=-1)  # (N,)
-        assignment = _classify_attn_rows(row_max, mp_cfg)
+        # Pass full attn rows (N, N) so entropy / ipr metrics can be computed.
+        assignment = _classify_attn_rows(attn_flat[i], mp_cfg)
         for sl, rows in assignment.level_row_indices.items():
             if sl == 0 or rows.numel() == 0:
                 continue
