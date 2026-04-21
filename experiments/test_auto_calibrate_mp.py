@@ -172,6 +172,43 @@ def main():
 
     print("\n[Phase 3] auto_calibrate_mp smoke OK")
 
+    # ---- Raw-only / no-comp branch ----
+    cfg_raw = FreeBoundaryMPConfig(stoc_len_levels=[256, 128, 64, 32])
+    model_fp_raw, model_sc_raw, blocks_fp_raw, blocks_sc_raw = make_models(
+        n_blocks, D, cfg_raw)
+    report_raw = auto_calibrate_mp(
+        model_fp=model_fp_raw,
+        model_sc=model_sc_raw,
+        blocks_fp=list(blocks_fp_raw),
+        blocks_sc_container=blocks_sc_raw,
+        calib_loader=synthetic_loader(n_calib=48, D=D),
+        device=torch.device("cpu"),
+        n_calib=48,
+        cfg=cfg_raw,
+        ops_per_block=["mlp"],
+        ridge=1e-3,
+        start_block=0,
+        fwd_chunk=16,
+        avg_sc_draws=1,
+        n_candidates=6,
+        n_outer_per_op=1,
+        n_outer_block=1,
+        search_objective="raw_mse",
+        fit_compensation=False,
+        install_compensation=False,
+        log_fn=print,
+    )
+    assert len(report_raw) == n_blocks
+    for i, entry in enumerate(report_raw):
+        assert entry["objective"] == "raw_mse"
+        assert not entry["enabled"]
+        assert entry["raw_rmse_after"] <= entry["rmse_before"] + 1e-6, (
+            f"raw-only block {i}: rmse regressed "
+            f"{entry['rmse_before']} -> {entry['raw_rmse_after']}")
+        assert abs(entry["rmse_after"] - entry["raw_rmse_after"]) <= 1e-6, (
+            f"raw-only block {i}: rmse_after should equal raw_rmse_after")
+    print("[ok] raw-only auto_calibrate_mp smoke OK")
+
 
 if __name__ == "__main__":
     main()

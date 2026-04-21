@@ -172,7 +172,82 @@ def test_oracle_coord_descent_improves():
           f"boundaries={[round(x, 3) for x in b]}")
 
 
+def test_budget_aware_search_respects_target():
+    torch.manual_seed(0)
+    N, D = 300, 32
+
+    high = torch.rand(int(N * 0.3)) * 0.3 + 0.7
+    low = torch.rand(N - int(N * 0.3)) * 0.5
+    metric = torch.cat([high, low])[torch.randperm(N)]
+
+    X = torch.randn(N, D)
+    cfg = FreeBoundaryMPConfig(stoc_len_levels=[256, 32])
+    set_current_block_idx(0)
+    toy = ToySCBlock(X, metric, cfg)
+    fitter = RidgeFitter(X, ridge=1e-3)
+    Y_fp = toy.Y_fp()
+
+    def run_sc():
+        return toy.Y_sc()
+
+    def run_sc_with_budget():
+        y = toy.Y_sc()
+        assign = _classify_with_free_boundaries(
+            metric, cfg.get_boundaries("mlp", 0), cfg.stoc_len_levels)
+        baseline = float(N * max(cfg.stoc_len_levels))
+        actual = 0.0
+        for sl, rows in assign.level_row_indices.items():
+            actual += float(int(sl) * len(rows))
+        return y, {"baseline": baseline, "actual": actual}
+
+    cfg.set_boundaries("mlp", 0, cfg.default_boundaries())
+    b_free, _ = oracle_search_op(
+        run_block_sc=run_sc,
+        Y_fp=Y_fp,
+        fitter=fitter,
+        cfg=cfg,
+        block_idx=0,
+        op="mlp",
+        n_candidates=10,
+        n_outer=2,
+        log_fn=lambda *_args: None,
+    )
+    free_assign = _classify_with_free_boundaries(metric, b_free, cfg.stoc_len_levels)
+    free_actual = 0.0
+    for sl, rows in free_assign.level_row_indices.items():
+        free_actual += float(int(sl) * len(rows))
+
+    cfg.set_boundaries("mlp", 0, cfg.default_boundaries())
+    budget_target = 0.30 * float(N * max(cfg.stoc_len_levels))
+    b_budget, _ = oracle_search_op(
+        run_block_sc=run_sc,
+        run_block_sc_with_budget=run_sc_with_budget,
+        budget_target_actual=budget_target,
+        Y_fp=Y_fp,
+        fitter=fitter,
+        cfg=cfg,
+        block_idx=0,
+        op="mlp",
+        n_candidates=10,
+        n_outer=2,
+        log_fn=lambda *_args: None,
+    )
+    budget_assign = _classify_with_free_boundaries(
+        metric, b_budget, cfg.stoc_len_levels)
+    budget_actual = 0.0
+    for sl, rows in budget_assign.level_row_indices.items():
+        budget_actual += float(int(sl) * len(rows))
+
+    assert budget_actual <= budget_target + 1e-6, (
+        f"budgeted search exceeded target: {budget_actual} > {budget_target}")
+    assert budget_actual < free_actual - 1e-6, (
+        f"budgeted search did not reduce compute: {budget_actual} vs {free_actual}")
+    print(f"[ok] budget-aware search: free_actual={free_actual:.1f} "
+          f"budget_actual={budget_actual:.1f} target={budget_target:.1f}")
+
+
 if __name__ == "__main__":
     test_ridge_fitter()
     test_oracle_coord_descent_improves()
+    test_budget_aware_search_respects_target()
     print("\n[Phase 2] oracle_search_op smoke OK")

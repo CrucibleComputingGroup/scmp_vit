@@ -183,9 +183,14 @@ class FreeBoundaryMPConfig(AdaptiveMPConfig):
     (set by forward pre-hooks installed by the auto-calibrator).
 
     Missing entries fall back to ``default_boundaries`` (equal spacing).
+    Callers may also pin an op to a fixed level index via ``fixed_levels``;
+    this is useful when some ops should stay coarse/static while others are
+    searched by auto-MP.
     """
     # {(block_idx, op_name): tensor of k-1 boundaries, descending in (0, 1)}
     boundaries: dict = field(default_factory=dict)
+    # {(block_idx, op_name): level_idx}, where level_idx indexes stoc_len_levels
+    fixed_levels: dict = field(default_factory=dict)
 
     def __post_init__(self):
         super().__post_init__()
@@ -197,6 +202,12 @@ class FreeBoundaryMPConfig(AdaptiveMPConfig):
             bt = b if isinstance(b, torch.Tensor) else torch.as_tensor(b)
             assert bt.numel() == k - 1, (
                 f"boundaries[{key!r}] must have length {k-1}, got {bt.numel()}")
+        for key, level_idx in self.fixed_levels.items():
+            assert isinstance(key, tuple) and len(key) == 2, (
+                f"fixed_levels key must be (block_idx, op_name), got {key!r}")
+            li = int(level_idx)
+            assert 0 <= li < k, (
+                f"fixed_levels[{key!r}] must be in [0, {k}), got {li}")
 
     def default_boundaries(self) -> torch.Tensor:
         """Equal-spacing boundaries in (0, 1) descending, length k-1."""
@@ -221,7 +232,47 @@ class FreeBoundaryMPConfig(AdaptiveMPConfig):
         k = len(self.stoc_len_levels)
         assert bt.numel() == k - 1, (
             f"expected {k-1} boundaries, got {bt.numel()}")
+        self.fixed_levels.pop((int(block_idx), operator), None)
         self.boundaries[(int(block_idx), operator)] = bt
+
+    def get_fixed_level(self, operator: str,
+                        block_idx: Optional[int] = None) -> Optional[int]:
+        if block_idx is None:
+            block_idx = _CURRENT_BLOCK_IDX
+        level_idx = self.fixed_levels.get((int(block_idx), operator))
+        return None if level_idx is None else int(level_idx)
+
+    def set_fixed_level(self, operator: str, block_idx: int,
+                        level_idx: int) -> None:
+        li = int(level_idx)
+        k = len(self.stoc_len_levels)
+        assert 0 <= li < k, f"level_idx must be in [0, {k}), got {li}"
+        key = (int(block_idx), operator)
+        self.boundaries.pop(key, None)
+        self.fixed_levels[key] = li
+
+    def clear_fixed_level(self, operator: str, block_idx: int) -> None:
+        self.fixed_levels.pop((int(block_idx), operator), None)
+
+
+def _classify_all_rows_to_level(
+    metric: torch.Tensor,
+    stoc_len_levels: list[int],
+    level_idx: int,
+) -> "RowAssignment":
+    """Assign every row/head to one fixed level index."""
+    N = metric.shape[0]
+    row_levels = torch.full(
+        (N,), int(level_idx), dtype=torch.long, device=metric.device)
+    level_row_indices: dict[int, torch.Tensor] = {}
+    for idx, sl in enumerate(stoc_len_levels):
+        if idx == int(level_idx):
+            level_row_indices[sl] = torch.arange(N, device=metric.device)
+        else:
+            level_row_indices[sl] = torch.empty(
+                0, dtype=torch.long, device=metric.device)
+    return RowAssignment(row_levels=row_levels,
+                         level_row_indices=level_row_indices)
 
 
 def _classify_with_free_boundaries(
@@ -300,6 +351,9 @@ def adaptive_classify_rows(
     # Check subclass first so inherited isinstance(cfg, AdaptiveMPConfig)
     # still works elsewhere while we dispatch correctly here.
     if isinstance(config, FreeBoundaryMPConfig):
+        fixed_level = config.get_fixed_level(operator or "")
+        if fixed_level is not None:
+            return _classify_all_rows_to_level(metric, levels, fixed_level)
         boundaries = config.get_boundaries(operator or "")
         return _classify_with_free_boundaries(metric, boundaries, levels)
 
@@ -573,6 +627,66 @@ class MPDistributionLogger:
     def clear(cls):
         cls._log.clear()
         cls._compute_log.clear()
+
+
+# =====================================================================
+# Auto-MP Budget Logger
+# =====================================================================
+
+class AutoMPBudgetLogger:
+    """Lightweight per-forward compute logger for budget-aware auto-MP.
+
+    SC operators record a baseline cost (all rows/heads at max stoc_len) and
+    the actual weighted stoc_len cost induced by the current assignment. The
+    auto-MP calibrator enables this logger only while scoring candidate
+    boundaries, so it sees the true block-local compute for that candidate.
+    """
+
+    _enabled: bool = False
+    _log: list[dict] = []
+
+    @classmethod
+    def enable(cls):
+        cls._enabled = True
+
+    @classmethod
+    def disable(cls):
+        cls._enabled = False
+
+    @classmethod
+    def clear(cls):
+        cls._log.clear()
+
+    @classmethod
+    def record(cls, block_idx: int, operator: str,
+               baseline: float, actual: float):
+        if not cls._enabled:
+            return
+        cls._log.append({
+            "block": int(block_idx),
+            "operator": operator,
+            "baseline": float(baseline),
+            "actual": float(actual),
+        })
+
+    @classmethod
+    def snapshot(cls, clear: bool = False) -> list[dict]:
+        out = list(cls._log)
+        if clear:
+            cls.clear()
+        return out
+
+    @classmethod
+    def totals(cls, clear: bool = False) -> dict[str, float]:
+        total_baseline = 0.0
+        total_actual = 0.0
+        for entry in cls._log:
+            total_baseline += entry["baseline"]
+            total_actual += entry["actual"]
+        out = {"baseline": total_baseline, "actual": total_actual}
+        if clear:
+            cls.clear()
+        return out
 
 
 # =====================================================================

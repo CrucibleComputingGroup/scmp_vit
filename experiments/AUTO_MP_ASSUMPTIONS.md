@@ -31,9 +31,8 @@ Each bullet is reversible with one edit.
   Full DINOv2 ViT-L/14 smoke via `experiments/test_auto_mp_calibrate.sh`
   is the scale-up command; not run here because it requires GPU +
   ImageNet parquet data and is >> 60s.
-- **enabled flag semantics**: `enabled=True` iff `rmse_after < rmse_before`
-  on calibration (bug-safe: stays FP if comp hurts). Start_block gating
-  retained from QwT.
+- **enabled flag semantics**: aligned to QwT —
+  `enabled=True` iff `block_idx >= start_block` and `r2 > 0`.
 
 ## Scope cuts (deferred)
 
@@ -41,9 +40,10 @@ Each bullet is reversible with one edit.
   stored as a static `{(block, op): tensor}` dict in the
   `FreeBoundaryMPConfig`; MLP that predicts these from per-batch features
   is future work.
-- **Compute-budget constraint**: objective is pure
-  `||Y_fp - Y_sc - (X W + b)||^2`. No Lagrangian term for compute budget
-  — per user decision #1. Adding one is a few lines.
+- **Compute-budget constraint**: auto-MP now supports a target
+  `--auto_mp_budget_ratio` via blockwise carried budget. Candidate boundaries
+  are ranked by feasibility first (actual compute <= carried block target),
+  then by residual score within the feasible set.
 - **Caching calibrated boundaries**: config object is not yet pickled to
   disk. For repeat runs with same (sc_config, n_calib) the search runs
   again (~10-15 min). Add `--auto_mp_cache_path` when needed.
@@ -51,8 +51,9 @@ Each bullet is reversible with one edit.
   residual (fast, dense FP comp math). The *final* installed comp uses the
   user-configured `comp_factory` (which may be SC). Per-candidate SC comp
   would 10× the cost for marginal signal — skipped per plan.
-- **QwT's `comp_factory_variants` / `comp_refit_iters`**: not threaded into
-  `auto_calibrate_mp` yet. Auto mode uses a single comp_factory.
+- **QwT parity**: `comp_factory_variants` and `comp_refit_iters` are threaded
+  into `auto_calibrate_mp`, so the auto-MP path now supports per-block comp
+  variant selection and SC-comp noise-aware refit like the standard QwT path.
 
 ## Follow-up (next steps in suggested order)
 

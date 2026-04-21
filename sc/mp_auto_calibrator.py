@@ -26,6 +26,7 @@ import torch
 import torch.nn as nn
 
 from mp_config import (
+    AutoMPBudgetLogger,
     FreeBoundaryMPConfig,
     set_current_block_idx,
 )
@@ -82,6 +83,53 @@ def _candidate_values(
     return torch.linspace(lo, hi, n_candidates)
 
 
+def _pack_budget_info(
+    score: float,
+    budget_stats: Optional[dict[str, Any]],
+    budget_target_actual: Optional[float],
+) -> dict[str, Any]:
+    actual = None if budget_stats is None else float(budget_stats.get("actual", 0.0))
+    baseline = None if budget_stats is None else float(budget_stats.get("baseline", 0.0))
+    feasible = True
+    over = 0.0
+    if budget_target_actual is not None and actual is not None:
+        feasible = actual <= budget_target_actual + 1e-9
+        over = max(actual - budget_target_actual, 0.0)
+    return {
+        "score": float(score),
+        "actual": actual,
+        "baseline": baseline,
+        "feasible": feasible,
+        "over": float(over),
+    }
+
+
+def _budget_better(new_info: dict[str, Any], best_info: dict[str, Any]) -> bool:
+    """Order candidates by feasibility first, then score / budget overflow."""
+    if new_info["feasible"] and not best_info["feasible"]:
+        return True
+    if best_info["feasible"] and not new_info["feasible"]:
+        return False
+
+    if new_info["feasible"] and best_info["feasible"]:
+        if new_info["score"] < best_info["score"] - 1e-9:
+            return True
+        if best_info["score"] < new_info["score"] - 1e-9:
+            return False
+        if (new_info["actual"] is not None and best_info["actual"] is not None
+                and new_info["actual"] < best_info["actual"] - 1e-9):
+            return True
+        return False
+
+    if new_info["over"] < best_info["over"] - 1e-9:
+        return True
+    if best_info["over"] < new_info["over"] - 1e-9:
+        return False
+    if new_info["score"] < best_info["score"] - 1e-9:
+        return True
+    return False
+
+
 def oracle_search_op(
     *,
     run_block_sc: Callable[[], torch.Tensor],
@@ -94,6 +142,11 @@ def oracle_search_op(
     n_candidates: int = 10,
     n_outer: int = 2,
     eps: float = 1e-3,
+    run_block_sc_with_budget: Optional[
+        Callable[[], tuple[torch.Tensor, Optional[dict[str, Any]]]]
+    ] = None,
+    budget_target_actual: Optional[float] = None,
+    score_fn: Optional[Callable[[torch.Tensor], float]] = None,
     log_fn: Callable[[str], None] = lambda _m: None,
 ) -> tuple[torch.Tensor, float]:
     """Coord-descent search for the k-1 free boundaries of one (block, op).
@@ -123,10 +176,29 @@ def oracle_search_op(
         init_boundaries = cfg.default_boundaries()
     b = init_boundaries.detach().clone().float()
 
+    def _eval_current() -> tuple[float, dict[str, Any]]:
+        if run_block_sc_with_budget is not None:
+            Y_sc_eval, budget_stats = run_block_sc_with_budget()
+        else:
+            Y_sc_eval = run_block_sc()
+            budget_stats = None
+        if score_fn is not None:
+            score_eval = float(score_fn(Y_sc_eval))
+        else:
+            score_eval = fitter.residual_norm_sq(Y_fp - Y_sc_eval)
+        info_eval = _pack_budget_info(
+            score_eval, budget_stats, budget_target_actual)
+        return score_eval, info_eval
+
     cfg.set_boundaries(op, block_idx, b)
-    Y_sc = run_block_sc()
-    best_score = fitter.residual_norm_sq(Y_fp - Y_sc)
-    log_fn(f"    [op={op}] init score={best_score:.4e}")
+    best_score, best_info = _eval_current()
+    if budget_target_actual is None or best_info["actual"] is None:
+        log_fn(f"    [op={op}] init score={best_score:.4e}")
+    else:
+        feas = "yes" if best_info["feasible"] else "no"
+        log_fn(f"    [op={op}] init score={best_score:.4e} "
+               f"cost={best_info['actual']:.2f}/{budget_target_actual:.2f} "
+               f"feasible={feas}")
 
     for outer in range(n_outer):
         improved_this_round = False
@@ -134,25 +206,34 @@ def oracle_search_op(
             cands = _candidate_values(b, j, n_candidates, eps=eps)
             best_cand = float(b[j])
             best_cand_score = best_score
+            best_cand_info = dict(best_info)
             for c in cands.tolist():
                 b_trial = b.clone()
                 b_trial[j] = c
                 cfg.set_boundaries(op, block_idx, b_trial)
-                Y_sc_try = run_block_sc()
-                score = fitter.residual_norm_sq(Y_fp - Y_sc_try)
-                if score < best_cand_score:
+                score, cand_info = _eval_current()
+                if _budget_better(cand_info, best_cand_info):
                     best_cand_score = score
+                    best_cand_info = cand_info
                     best_cand = c
-            if best_cand_score < best_score - 1e-9:
+            chosen_info = dict(best_cand_info)
+            if best_cand != float(b[j]) or _budget_better(chosen_info, best_info):
                 b[j] = best_cand
                 best_score = best_cand_score
+                best_info = chosen_info
                 cfg.set_boundaries(op, block_idx, b)
                 improved_this_round = True
             else:
                 # restore best boundaries in cfg after sweeping candidates
                 cfg.set_boundaries(op, block_idx, b)
-        log_fn(f"    [op={op}] outer {outer}: score={best_score:.4e} "
-               f"b={b.tolist()}")
+        if budget_target_actual is None or best_info["actual"] is None:
+            log_fn(f"    [op={op}] outer {outer}: score={best_score:.4e} "
+                   f"b={b.tolist()}")
+        else:
+            feas = "yes" if best_info["feasible"] else "no"
+            log_fn(f"    [op={op}] outer {outer}: score={best_score:.4e} "
+                   f"cost={best_info['actual']:.2f}/{budget_target_actual:.2f} "
+                   f"feasible={feas} b={b.tolist()}")
         if not improved_this_round:
             break
 
@@ -237,7 +318,12 @@ def auto_calibrate_mp(
     n_candidates: int = 10,
     n_outer_per_op: int = 2,
     n_outer_block: int = 2,
+    budget_ratio: Optional[float] = None,
+    search_objective: str = "comp_residual",
     comp_factory: Optional[Callable[[torch.Tensor, torch.Tensor], nn.Module]] = None,
+    comp_factory_variants: Optional[list[tuple]] = None,
+    comp_refit_iters: int = 0,
+    fit_compensation: bool = True,
     install_compensation: bool = True,
     log_fn: Callable[[str], None] = print,
 ) -> list[dict]:
@@ -261,7 +347,10 @@ def auto_calibrate_mp(
     Returns
     -------
     per-block report dicts: {block, r2, enabled, rmse_before, rmse_after,
-                             boundaries_per_op, dt_s}
+                             raw_rmse_after, objective,
+                             block_budget_target, block_compute_baseline,
+                             block_compute_actual, boundaries_per_op, variant, variant_rmses,
+                             noise_aware_refit, dt_s}
     """
     from qwt_sc.compensation import (  # type: ignore
         CompensationBlock, closed_form_ridge,
@@ -270,6 +359,14 @@ def auto_calibrate_mp(
     assert len(blocks_fp) == len(blocks_sc_container), (
         f"fp blocks ({len(blocks_fp)}) vs sc blocks "
         f"({len(blocks_sc_container)}) length mismatch")
+    assert search_objective in ("comp_residual", "raw_mse"), (
+        f"unknown search_objective: {search_objective}")
+    if install_compensation:
+        assert fit_compensation, (
+            "install_compensation=True requires fit_compensation=True")
+    if budget_ratio is not None:
+        assert budget_ratio >= 0.0, f"budget_ratio must be >= 0, got {budget_ratio}"
+        budget_ratio = min(float(budget_ratio), 1.0)
     n_blocks = len(blocks_fp)
 
     # Install block-index pre-hooks so classifiers see the right (block,op).
@@ -306,6 +403,8 @@ def auto_calibrate_mp(
     log_fn(f"[auto_calib] X_0 shape={tuple(X_cur.shape)}")
 
     report: list[dict] = []
+    total_compute_baseline = 0.0
+    total_compute_actual = 0.0
 
     for i in range(n_blocks):
         t0 = time.time()
@@ -338,15 +437,61 @@ def auto_calibrate_mp(
                 acc = y if acc is None else acc + y
             return acc / avg_sc_draws
 
-        raw_Y_sc = _run_block_sc_avg()
+        def _run_block_sc_avg_with_budget():
+            AutoMPBudgetLogger.clear()
+            AutoMPBudgetLogger.enable()
+            try:
+                y0 = _run_block_sc()
+            finally:
+                AutoMPBudgetLogger.disable()
+            budget_entries = AutoMPBudgetLogger.snapshot(clear=True)
+            budget_stats = {
+                "baseline": sum(e["baseline"] for e in budget_entries),
+                "actual": sum(e["actual"] for e in budget_entries),
+                "entries": budget_entries,
+            }
+            if avg_sc_draws <= 1:
+                return y0, budget_stats
+            acc = y0
+            for _ in range(avg_sc_draws - 1):
+                acc = acc + _run_block_sc()
+            return acc / avg_sc_draws, budget_stats
+
+        if budget_ratio is not None:
+            raw_Y_sc, raw_budget_stats = _run_block_sc_avg_with_budget()
+        else:
+            raw_Y_sc = _run_block_sc_avg()
+            raw_budget_stats = None
         raw_rmse = float((Y_fp_flat - raw_Y_sc).pow(2).mean().sqrt().item())
-        baseline_score = fitter.residual_norm_sq(Y_fp_flat - raw_Y_sc)
+        if search_objective == "raw_mse":
+            baseline_score = float((Y_fp_flat - raw_Y_sc).pow(2).mean().item())
+        else:
+            baseline_score = fitter.residual_norm_sq(Y_fp_flat - raw_Y_sc)
+
+        block_compute_baseline = (
+            0.0 if raw_budget_stats is None else float(raw_budget_stats["baseline"]))
+        if budget_ratio is not None:
+            carryover = budget_ratio * total_compute_baseline - total_compute_actual
+            block_budget_target = budget_ratio * block_compute_baseline + carryover
+            block_budget_target = float(
+                min(max(block_budget_target, 0.0), block_compute_baseline))
+        else:
+            block_budget_target = None
 
         log_fn(f"[auto_calib] block {i:2d}: baseline raw_rmse={raw_rmse:.4e} "
                f"score={baseline_score:.4e}")
+        if block_budget_target is not None:
+            log_fn(f"[auto_calib] block {i:2d}: budget target="
+                   f"{block_budget_target:.2f}/{block_compute_baseline:.2f}",
+                   )
 
         # ---- Oracle search over ops in this block ----
         per_op: dict[str, dict[str, Any]] = {}
+        if search_objective == "raw_mse":
+            score_fn = lambda Y_sc_eval: float(  # noqa: E731
+                (Y_fp_flat - Y_sc_eval).pow(2).mean().item())
+        else:
+            score_fn = None
         for outer in range(n_outer_block):
             for op in ops_per_block:
                 b_init = cfg.get_boundaries(op, i)
@@ -360,23 +505,103 @@ def auto_calibrate_mp(
                     init_boundaries=b_init,
                     n_candidates=n_candidates,
                     n_outer=n_outer_per_op,
+                    run_block_sc_with_budget=(
+                        _run_block_sc_avg_with_budget if budget_ratio is not None else None),
+                    budget_target_actual=block_budget_target,
+                    score_fn=score_fn,
                     log_fn=log_fn,
                 )
                 per_op[op] = {"boundaries": b_new.tolist(), "score": score}
 
         # ---- Refit QwT compensation W, b with final boundaries ----
-        final_Y_sc = _run_block_sc_avg()
+        if budget_ratio is not None:
+            final_Y_sc, final_budget_stats = _run_block_sc_avg_with_budget()
+        else:
+            final_Y_sc = _run_block_sc_avg()
+            final_budget_stats = None
+        raw_after_rmse = float((Y_fp_flat - final_Y_sc).pow(2).mean().sqrt().item())
+        block_compute_actual = (
+            0.0 if final_budget_stats is None else float(final_budget_stats["actual"]))
         R_flat = Y_fp_flat - final_Y_sc
-        W, b_vec, r2 = closed_form_ridge(X_flat, R_flat, ridge=ridge)
-        after_rmse = float((R_flat - (X_flat @ W + b_vec)).pow(2).mean().sqrt().item())
+        if fit_compensation:
+            W, b_vec, r2 = closed_form_ridge(X_flat, R_flat, ridge=ridge)
+            after_rmse = float(
+                (R_flat - (X_flat @ W + b_vec)).pow(2).mean().sqrt().item())
+        else:
+            W = torch.zeros(
+                X_flat.size(-1), R_flat.size(-1), device=device, dtype=X_flat.dtype)
+            b_vec = torch.zeros(R_flat.size(-1), device=device, dtype=X_flat.dtype)
+            r2 = 0.0
+            after_rmse = raw_after_rmse
 
-        enabled = (i >= start_block) and (after_rmse < raw_rmse)
+        # Noise-aware refit copied from QwT's SC-comp path: if the
+        # compensator itself runs in SC, subtract its measured SC noise from
+        # the LS target and refit W,b for a few iterations.
+        refit_log = []
+        if fit_compensation and comp_factory is not None and comp_refit_iters > 0:
+            for it in range(comp_refit_iters):
+                tmp_comp = comp_factory(W.detach().cpu(),
+                                        b_vec.detach().cpu()).to(device)
+                with torch.no_grad():
+                    c_actual_chunks = []
+                    for s in range(0, X_flat.size(0), fwd_chunk * 257):
+                        e = min(s + fwd_chunk * 257, X_flat.size(0))
+                        c_actual_chunks.append(tmp_comp(X_flat[s:e]))
+                    c_actual = torch.cat(c_actual_chunks, dim=0)
+                fp_pred = X_flat @ W + b_vec
+                delta = c_actual - fp_pred
+                R_corr = R_flat - delta
+                W_new, b_new, r2_new = closed_form_ridge(
+                    X_flat, R_corr, ridge=ridge)
+                after_rmse_new = float(
+                    (R_flat - (X_flat @ W_new + b_new) - delta)
+                    .pow(2).mean().sqrt().item()
+                )
+                refit_log.append({
+                    "iter": it,
+                    "r2": r2_new,
+                    "after_rmse_with_delta": after_rmse_new,
+                    "delta_rmse": float(delta.pow(2).mean().sqrt().item()),
+                })
+                W, b_vec = W_new, b_new
+                r2 = r2_new
+                after_rmse = after_rmse_new
+                del tmp_comp, c_actual, c_actual_chunks, fp_pred, delta, R_corr
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+        # Align the gating semantics with QwT's calibrate_qwt.
+        enabled = fit_compensation and (i >= start_block) and (r2 > 0.0)
         W_cpu = W.detach().cpu()
         b_cpu = b_vec.detach().cpu()
 
+        chosen_variant = None
+        variant_rmses: dict[str, float] = {}
+        comp_module = None
+
+        def _measure(mod: nn.Module) -> float:
+            mod = mod.to(device)
+            with torch.no_grad():
+                chunks = []
+                for s in range(0, X_flat.size(0), fwd_chunk * 257):
+                    e = min(s + fwd_chunk * 257, X_flat.size(0))
+                    chunks.append(mod(X_flat[s:e]))
+                c_act = torch.cat(chunks, dim=0)
+            return float((R_flat - c_act).pow(2).mean().sqrt().item())
+
         if install_compensation:
-            comp_module = (comp_factory(W_cpu, b_cpu)
-                           if comp_factory is not None else None)
+            if comp_factory_variants is not None and len(comp_factory_variants) > 0:
+                best = None
+                for vname, vfac in comp_factory_variants:
+                    cand = vfac(W_cpu, b_cpu)
+                    rmse_v = _measure(cand)
+                    variant_rmses[vname] = rmse_v
+                    if best is None or rmse_v < best[0]:
+                        best = (rmse_v, vname, cand)
+                if best is not None:
+                    _, chosen_variant, comp_module = best
+            elif comp_factory is not None:
+                comp_module = comp_factory(W_cpu, b_cpu)
             new_block = CompensationBlock(
                 block=blk_sc, W=W_cpu, b=b_cpu,
                 r2=r2, enabled=enabled, comp_module=comp_module,
@@ -395,21 +620,36 @@ def auto_calibrate_mp(
             X_next = _forward_batched(blk_sc, X_cur, device, fwd_chunk)
 
         dt = time.time() - t0
-        log_fn(f"[auto_calib] block {i:2d}  r2={r2:+.4f}  "
-               f"rmse {raw_rmse:.4e} -> {after_rmse:.4e}  "
-               f"enabled={enabled}  ({dt:.1f}s)")
+        var_str = f"  var={chosen_variant}" if chosen_variant is not None else ""
+        if fit_compensation:
+            log_fn(f"[auto_calib] block {i:2d}  r2={r2:+.4f}  "
+                   f"rmse {raw_rmse:.4e} -> {after_rmse:.4e}{var_str}  "
+                   f"enabled={enabled}  ({dt:.1f}s)")
+        else:
+            log_fn(f"[auto_calib] block {i:2d}  raw_rmse "
+                   f"{raw_rmse:.4e} -> {raw_after_rmse:.4e}  ({dt:.1f}s)")
 
         report.append({
             "block": i,
             "r2": r2,
             "enabled": enabled,
+            "objective": search_objective,
             "rmse_before": raw_rmse,
             "rmse_after": after_rmse,
+            "raw_rmse_after": raw_after_rmse,
+            "block_budget_target": block_budget_target,
+            "block_compute_baseline": block_compute_baseline,
+            "block_compute_actual": block_compute_actual,
             "boundaries_per_op": per_op,
+            "variant": chosen_variant,
+            "variant_rmses": variant_rmses,
+            "noise_aware_refit": refit_log,
             "dt_s": dt,
         })
 
         X_cur = X_next
+        total_compute_baseline += block_compute_baseline
+        total_compute_actual += block_compute_actual
         del X_flat, Y_fp_flat, fitter
         if torch.cuda.is_available():
             torch.cuda.empty_cache()

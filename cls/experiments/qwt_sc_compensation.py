@@ -231,6 +231,20 @@ def main():
     ap.add_argument("--auto_mp_outer_block", type=int, default=1,
                     help="Outer rounds over all ops in a block (handles "
                          "inter-op coupling; 1 is usually enough).")
+    ap.add_argument("--auto_mp_budget_ratio", type=float, default=0.0,
+                    help="When > 0, constrain auto-MP search to a target "
+                         "weighted-stoc_len compute budget ratio relative to "
+                         "the all-max-stoc_len baseline. Example: 0.50 means "
+                         "search for the best boundaries at ~50% compute.")
+    ap.add_argument("--auto_mp_raw_only", action="store_true",
+                    help="Search auto-MP boundaries on raw SC error, do not "
+                         "fit/install compensation, and evaluate the "
+                         "post-calibration SC model directly.")
+    ap.add_argument("--auto_mp_qk_fixed_stoc_len", type=int, default=0,
+                    help="When > 0 and auto-MP is enabled, pin qk to this "
+                         "uniform stoc_len across all blocks instead of "
+                         "searching qk boundaries. Must be one of "
+                         "--adaptive_mp_levels.")
     ap.add_argument("--sc_mlp_mode", choices=["bipolar", "unipolar"],
                     default="bipolar",
                     help="SC quant mode for MLP fc1/fc2 when sc_mlp=True.")
@@ -245,11 +259,12 @@ def main():
                          "softmax-amax rows get higher sl. Assumption: "
                          "near-one-hot rows are quant-easy, near-uniform rows "
                          "need precision.")
-    ap.add_argument("--av_metric_kind", default="amax",
+    ap.add_argument("--av_metric_kind", default="entropy",
                     choices=["amax", "entropy", "ipr"],
-                    help="AV per-row peakiness metric. 'entropy' and 'ipr' "
-                         "natively encode flat→high-score; amax needs "
-                         "--av_metric_reverse 1 for the same direction.")
+                    help="AV per-row peakiness metric. Default: entropy. "
+                         "'entropy' and 'ipr' natively encode flat→high-score; "
+                         "amax needs --av_metric_reverse 1 for the same "
+                         "direction.")
     ap.add_argument("--fc2_skip_last_k", type=int, default=0,
                     help="When >0 (requires sc_mlp=True), SC fc2 in all blocks "
                          "EXCEPT the last K. fc1 stays governed by mlp_fc_mask. "
@@ -262,15 +277,11 @@ def main():
     seed_all(args.calib_seed)
     device = torch.device("cuda")
     set_noise_model(False)
-    if args.av_metric_reverse:
-        from sc_attention_patch import set_av_metric_reverse
-        set_av_metric_reverse(True)
-        print("[av_metric_reverse] ON (low-amax rows get high sl)", flush=True)
-    if args.av_metric_kind != "amax":
-        from sc_attention_patch import set_av_metric_kind
-        set_av_metric_kind(args.av_metric_kind)
-        print(f"[av_metric_kind] = {args.av_metric_kind} "
-              f"(flat rows get high sl natively)", flush=True)
+    from sc_attention_patch import set_av_metric_kind, set_av_metric_reverse
+    set_av_metric_reverse(bool(args.av_metric_reverse))
+    set_av_metric_kind(args.av_metric_kind)
+    print(f"[av_metric] kind={args.av_metric_kind} "
+          f"reverse={int(bool(args.av_metric_reverse))}", flush=True)
 
     print(f"[env] torch {torch.__version__} cuda {torch.version.cuda} "
           f"dev={torch.cuda.get_device_name(0)}", flush=True)
@@ -317,12 +328,19 @@ def main():
     _LINEAR_OP_SET = {"qkv_proj", "out_proj", "mlp_fc1", "mlp_fc2", "proj"}
     _ATTN_OP_SET = {"qk", "av"}
     auto_mp_on = bool(args.auto_mp_calibrate > 0)
+    if args.auto_mp_raw_only and not auto_mp_on:
+        raise ValueError("--auto_mp_raw_only requires --auto_mp_calibrate > 0")
     if args.adaptive_mp and args.adaptive_mp_levels:
         from sc_integration.mp_linear import (
             AdaptiveMPConfig, FreeBoundaryMPConfig,
         )
         from sc_integration.sc_linear import set_vit_timestep
         levels = [int(x) for x in args.adaptive_mp_levels.split(",") if x.strip()]
+        def _one_hot_fractions(target_stoc_len: int):
+            if int(target_stoc_len) not in levels:
+                raise ValueError(
+                    f"fixed stoc_len {target_stoc_len} not in adaptive_mp_levels={levels}")
+            return [1.0 if sl == int(target_stoc_len) else 0.0 for sl in levels]
         # Parse per-op overrides like "qkv_proj=0.4,out_proj=0.3"
         def _parse_kv(s):
             out = {}
@@ -373,13 +391,22 @@ def main():
         if not auto_mp_on and target_fractions is not None:
             qk_mp_static = _MPConfig(stoc_len_levels=levels,
                                      level_fractions=target_fractions)
+        elif auto_mp_on and args.auto_mp_qk_fixed_stoc_len > 0:
+            qk_mp_static = _MPConfig(
+                stoc_len_levels=levels,
+                level_fractions=_one_hot_fractions(
+                    args.auto_mp_qk_fixed_stoc_len),
+            )
         for op in args.adaptive_mp_ops.split(","):
             op = op.strip()
             if not op:
                 continue
             if op == "qk":
                 if auto_mp_on:
-                    attn_mp_spec["qk"] = adap
+                    if qk_mp_static is not None:
+                        attn_mp_spec["qk"] = qk_mp_static
+                    else:
+                        attn_mp_spec["qk"] = adap
                 else:
                     if qk_mp_static is None:
                         qk_mp_static = _MPConfig(stoc_len_levels=levels)
@@ -395,7 +422,11 @@ def main():
                   f"n_calib_search={args.auto_mp_calibrate} "
                   f"candidates={args.auto_mp_n_candidates} "
                   f"outer_per_op={args.auto_mp_outer_per_op} "
-                  f"outer_block={args.auto_mp_outer_block}", flush=True)
+                  f"outer_block={args.auto_mp_outer_block} "
+                  f"budget_ratio={args.auto_mp_budget_ratio:.3f} "
+                  f"raw_only={int(args.auto_mp_raw_only)} "
+                  f"qk_fixed={args.auto_mp_qk_fixed_stoc_len}",
+                  flush=True)
         else:
             prog = args.vit_timestep / max(args.vit_total_timesteps - 1, 1)
             thr = min(args.adaptive_mp_alpha * prog + args.adaptive_mp_beta, 0.95)
@@ -483,7 +514,9 @@ def main():
 
     comp_factory = None
     comp_factory_variants = None
-    if args.comp_mode == "sc":
+    if auto_mp_on and args.auto_mp_raw_only:
+        print("[comp] disabled (raw-only auto-MP)", flush=True)
+    elif args.comp_mode == "sc":
         if args.comp_variant_select:
             # The comp matmul has D_in == D_out == 1024 for ViT-L (residual
             # stream). Build both candidate Sobol scramblings at that D and
@@ -512,12 +545,23 @@ def main():
     blocks_fp = list(get_blocks(model_fp))
     blocks_sc_container = get_blocks(model_sc)
     if auto_mp_on:
-        print("[calib] starting AUTO-MP calibration (oracle boundary search "
-              "+ QwT comp, Gauss-Seidel)", flush=True)
+        if args.auto_mp_raw_only:
+            print("[calib] starting AUTO-MP calibration "
+                  "(oracle boundary search on raw SC error, no comp)",
+                  flush=True)
+        else:
+            print("[calib] starting AUTO-MP calibration (oracle boundary search "
+                  "+ QwT comp, Gauss-Seidel)", flush=True)
         sys.path.insert(0, str(HERE / "sc"))
         from mp_auto_calibrator import auto_calibrate_mp  # noqa: E402
-        auto_ops = [op.strip() for op in args.adaptive_mp_ops.split(",")
-                    if op.strip()]
+        auto_ops = []
+        for op in args.adaptive_mp_ops.split(","):
+            op = op.strip()
+            if not op:
+                continue
+            if op == "qk" and args.auto_mp_qk_fixed_stoc_len > 0:
+                continue
+            auto_ops.append(op)
         calib_report = auto_calibrate_mp(
             model_fp=model_fp, model_sc=model_sc,
             blocks_fp=blocks_fp,
@@ -534,8 +578,16 @@ def main():
             n_candidates=args.auto_mp_n_candidates,
             n_outer_per_op=args.auto_mp_outer_per_op,
             n_outer_block=args.auto_mp_outer_block,
+            budget_ratio=(
+                args.auto_mp_budget_ratio
+                if args.auto_mp_budget_ratio > 0 else None),
+            search_objective=(
+                "raw_mse" if args.auto_mp_raw_only else "comp_residual"),
             comp_factory=comp_factory,
-            install_compensation=True,
+            comp_factory_variants=comp_factory_variants,
+            comp_refit_iters=args.comp_refit_iters,
+            fit_compensation=not args.auto_mp_raw_only,
+            install_compensation=not args.auto_mp_raw_only,
         )
     else:
         print("[calib] starting QwT-style sequential calibration", flush=True)
@@ -557,10 +609,18 @@ def main():
     calib_s = time.time() - t_cal
     print(f"[calib] done in {calib_s:.1f}s", flush=True)
 
-    print("[eval] SC + QwT compensation", flush=True)
-    seed_all(args.eval_seed)
-    res_sc_comp = evaluate(model_sc, eval_loader, device)
-    print("[result:sc_comp]", res_sc_comp, flush=True)
+    res_sc_post = None
+    res_sc_comp = None
+    if auto_mp_on and args.auto_mp_raw_only:
+        print("[eval] SC after raw-only auto-MP", flush=True)
+        seed_all(args.eval_seed)
+        res_sc_post = evaluate(model_sc, eval_loader, device)
+        print("[result:sc_post]", res_sc_post, flush=True)
+    else:
+        print("[eval] SC + QwT compensation", flush=True)
+        seed_all(args.eval_seed)
+        res_sc_comp = evaluate(model_sc, eval_loader, device)
+        print("[result:sc_comp]", res_sc_comp, flush=True)
 
     print("[eval] FP reference", flush=True)
     seed_all(args.eval_seed)
@@ -580,9 +640,17 @@ def main():
             "comp_sc_mode": args.comp_sc_mode,
             "comp_refit_iters": args.comp_refit_iters,
             "comp_variant_select": args.comp_variant_select,
+            "auto_mp_budget_ratio": args.auto_mp_budget_ratio,
+            "auto_mp_raw_only": args.auto_mp_raw_only,
+            "auto_mp_qk_fixed_stoc_len": args.auto_mp_qk_fixed_stoc_len,
         },
         "calib": {"per_block": calib_report, "elapsed_s": calib_s},
-        "results": {"fp": res_fp, "sc_raw": res_sc_raw, "sc_comp": res_sc_comp},
+        "results": {
+            "fp": res_fp,
+            "sc_raw": res_sc_raw,
+            "sc_post": res_sc_post,
+            "sc_comp": res_sc_comp,
+        },
     }
     Path(args.out_json).parent.mkdir(parents=True, exist_ok=True)
     with open(args.out_json, "w") as f:
@@ -593,13 +661,22 @@ def main():
     print(f"  FP                : top1={res_fp['top1']:.4f}")
     if res_sc_raw:
         print(f"  SC ({args.sc_config})  : top1={res_sc_raw['top1']:.4f}")
-    print(f"  SC + QwT comp     : top1={res_sc_comp['top1']:.4f}")
-    if res_sc_raw:
-        delta = res_sc_comp['top1'] - res_sc_raw['top1']
-        gap = res_fp['top1'] - res_sc_raw['top1']
-        closed = (delta / gap * 100.0) if gap > 0 else float('nan')
-        print(f"  Gain over SC      : +{delta*100:.2f} pt  "
-              f"(closes {closed:.1f}% of FP-SC gap)")
+    if res_sc_post is not None:
+        print(f"  SC after auto-MP  : top1={res_sc_post['top1']:.4f}")
+        if res_sc_raw:
+            delta = res_sc_post['top1'] - res_sc_raw['top1']
+            gap = res_fp['top1'] - res_sc_raw['top1']
+            closed = (delta / gap * 100.0) if gap > 0 else float('nan')
+            print(f"  Gain over SC      : {delta:+.2f} pt  "
+                  f"(closes {closed:.1f}% of FP-SC gap)")
+    else:
+        print(f"  SC + QwT comp     : top1={res_sc_comp['top1']:.4f}")
+        if res_sc_raw:
+            delta = res_sc_comp['top1'] - res_sc_raw['top1']
+            gap = res_fp['top1'] - res_sc_raw['top1']
+            closed = (delta / gap * 100.0) if gap > 0 else float('nan')
+            print(f"  Gain over SC      : {delta:+.2f} pt  "
+                  f"(closes {closed:.1f}% of FP-SC gap)")
 
 
 if __name__ == "__main__":

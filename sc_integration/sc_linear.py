@@ -38,8 +38,9 @@ from sc_integration.noise_matmul import noisy_sc_matmul_grouped
 from sc_integration.mp_linear import (
     MPConfig, RangeMPConfig, AdaptiveMPConfig, DispatchEntry,
     build_range_dispatch, classify_input_rows, classify_input_rows_adaptive,
-    sc_prec_for_stoc_len,
+    sc_prec_for_stoc_len, get_current_block_idx,
 )
+from mp_config import AutoMPBudgetLogger
 
 
 # Module-level toggle: when True, SC matmuls use the calibrated Gaussian-noise
@@ -198,6 +199,22 @@ def _sc_linear_mp(x: torch.Tensor, weight: torch.Tensor, bias,
                                    dtype=torch.long, device=x.device)
 
     result = torch.zeros(M, D_out, dtype=torch.float32, device=x.device)
+
+    if range_entries is None and (adaptive_mp_cfg is not None or mp_cfg is not None):
+        levels = (adaptive_mp_cfg.stoc_len_levels if adaptive_mp_cfg is not None
+                  else mp_cfg.stoc_len_levels)
+        max_stoc_len = max(levels)
+        compute_baseline = M * D_out * max_stoc_len
+        compute_actual = 0.0
+        for sl, rows in assignment.level_row_indices.items():
+            if int(sl) <= 0 or rows.numel() == 0:
+                continue
+            compute_actual += int(sl) * rows.numel() * D_out
+        if operator is not None:
+            AutoMPBudgetLogger.record(
+                get_current_block_idx(), operator,
+                compute_baseline, compute_actual,
+            )
 
     if range_entries is None:
         # Dynamic MP only: full-width weight, bucket by row stoc_len.

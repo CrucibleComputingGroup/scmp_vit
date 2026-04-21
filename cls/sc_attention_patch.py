@@ -29,7 +29,12 @@ from sc_integration.noise_matmul import _noisy_matmul_core  # noqa: E402
 from sc_integration.mp_linear import (  # noqa: E402
     MPConfig, RangeMPConfig, AdaptiveMPConfig, sc_prec_for_stoc_len,
 )
-from mp_config import classify_rows_by_metric, adaptive_classify_rows  # noqa: E402  # local copy in sc/
+from mp_config import (  # noqa: E402  # local copy in sc/
+    classify_rows_by_metric,
+    adaptive_classify_rows,
+    AutoMPBudgetLogger,
+    get_current_block_idx,
+)
 
 # Re-export the moved primitives so existing
 # ``from sc_attention_patch import SCLinear / _sc_linear / set_noise_model``
@@ -71,7 +76,7 @@ def _classify_per_head(q: torch.Tensor,
 
 
 AV_METRIC_REVERSE = False
-AV_METRIC_KIND = "amax"  # "amax" | "entropy" | "ipr"
+AV_METRIC_KIND = "entropy"  # "amax" | "entropy" | "ipr"
 
 
 def set_av_metric_reverse(flag: bool):
@@ -88,11 +93,11 @@ def set_av_metric_reverse(flag: bool):
 def set_av_metric_kind(kind: str):
     """Select the AV row peakiness metric:
 
-    * ``amax``   — row.max() (backwards-compatible default; pair with
-                   AV_METRIC_REVERSE to get "flat → high sl" direction)
+    * ``amax``   — row.max() (legacy option; pair with AV_METRIC_REVERSE
+                   to get "flat → high sl" direction)
     * ``entropy`` — Shannon entropy of the row; HIGHER entropy ⇒ flatter ⇒
                     more precision needed (passed straight as metric, no
-                    reverse flag needed — already aligned)
+                    reverse flag needed — already aligned; default)
     * ``ipr``    — inverse participation ratio 1/Σp²; effective support;
                     HIGHER IPR ⇒ flatter (same sign as entropy)
     """
@@ -151,6 +156,17 @@ def _sc_qk_mp(q: torch.Tensor, k: torch.Tensor, sc_prec: int,
     for h, sl in enumerate(head_sl):
         stoc_len_to_heads.setdefault(sl, []).append(h)
 
+    max_stoc_len = max(int(sl) for sl in mp_cfg.stoc_len_levels)
+    compute_baseline = B * H * N * N * max_stoc_len
+    compute_actual = 0.0
+    for sl, heads in stoc_len_to_heads.items():
+        if sl <= 0:
+            continue
+        compute_actual += B * len(heads) * N * N * int(sl)
+    AutoMPBudgetLogger.record(
+        get_current_block_idx(), "qk", compute_baseline, compute_actual,
+    )
+
     output = torch.zeros(B, H, N, N, dtype=torch.float32, device=q.device)
     for sl, heads in stoc_len_to_heads.items():
         if sl == 0 or not heads:
@@ -197,6 +213,9 @@ def _sc_av_mp(attn: torch.Tensor, v: torch.Tensor, sc_prec: int,
     attn_flat = attn.float().reshape(BH, N, N)
     b_flat = v.float().transpose(-1, -2).reshape(BH, D, N)  # (BH, D, N)
     out = torch.zeros(BH, N, D, dtype=torch.float32, device=v.device)
+    max_stoc_len = max(int(sl) for sl in mp_cfg.stoc_len_levels)
+    compute_baseline = 0.0
+    compute_actual = 0.0
 
     for i in range(BH):
         # Pass full attn rows (N, N) so entropy / ipr metrics can be computed.
@@ -204,6 +223,8 @@ def _sc_av_mp(attn: torch.Tensor, v: torch.Tensor, sc_prec: int,
         for sl, rows in assignment.level_row_indices.items():
             if sl == 0 or rows.numel() == 0:
                 continue
+            compute_baseline += rows.numel() * D * max_stoc_len
+            compute_actual += rows.numel() * D * int(sl)
             sp = sc_prec_for_stoc_len(int(sl))
             attn_sub = attn_flat[i].index_select(0, rows).contiguous()  # (n_sel, N)
 
@@ -221,6 +242,9 @@ def _sc_av_mp(attn: torch.Tensor, v: torch.Tensor, sc_prec: int,
                 )
             out[i, rows] = sub
 
+    AutoMPBudgetLogger.record(
+        get_current_block_idx(), "av", compute_baseline, compute_actual,
+    )
     return out.reshape(B, H, N, D)
 
 
