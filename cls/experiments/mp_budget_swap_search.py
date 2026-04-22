@@ -4,17 +4,23 @@
 This script searches a per-(op, block) stoc_len map under a fixed main-budget
 constraint, without using end-to-end accuracy during search.
 
-Design choices for the first implementation:
+Design choices for the current implementation:
 
-* Search space is block-level only (no per-row/per-head bins yet).
 * Search uses only local block proxy on a small calibration set:
   - ``raw_mse``: mean block output MSE to FP
   - ``comp_residual``: residual MSE after closed-form linear compensation
+* Search can operate at two granularities:
+  - per-(op, block) scalar stoc_len
+  - per-(op, block) fraction units
+* Fraction units are an internal search discretization for each (op, block).
+  At runtime they collapse into an op-specific ``MPConfig(levels, fractions)``,
+  and the existing per-op metric decides which rows / heads get the higher
+  precision.
 * The search operates on zero-budget pairwise swaps:
-  - one searchable slot upgrades by one discrete step
-  - another searchable slot downgrades by the same step
+  - one searchable unit upgrades by one discrete step
+  - another searchable unit downgrades by the same step
   - total main budget is preserved exactly
-* ``qk`` / ``av`` can be fixed to low stoc_len and kept out of the search.
+* ``qk`` / ``av`` can be fixed and kept out of the search.
 
 Typical usage:
 
@@ -39,6 +45,7 @@ import sys
 import time
 from collections import Counter, defaultdict
 from pathlib import Path
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -144,12 +151,12 @@ def load_sensitivity() -> dict[tuple[str, int], float]:
     return {(r["op"], int(r["block"])): float(r["l2"]) for r in data["grid"]}
 
 
-def compute_main_sl(sl_map: dict[str, list[int]],
+def compute_main_sl(sl_map: dict[str, list],
                     active_ops: set[tuple[str, int]]) -> float:
     total_macs = 0.0
     total_bitops = 0.0
     for op, bi in active_ops:
-        sl = sl_map[op][bi]
+        sl = _entry_avg_sl(sl_map[op][bi])
         m = float(_OP_MACS[op])
         total_macs += m
         total_bitops += m * float(sl)
@@ -163,11 +170,13 @@ def compute_eff_sl(main_sl: float, active_ops: set[tuple[str, int]],
     return (main_sl * main_macs + comp_sl * comp_macs) / (main_macs + comp_macs)
 
 
-def summarize_allocation(sl_map: dict[str, list[int]],
+def summarize_allocation(sl_map: dict[str, list],
                          active_ops: set[tuple[str, int]]) -> dict[str, float]:
     level_macs = Counter()
     for op, bi in active_ops:
-        level_macs[sl_map[op][bi]] += _OP_MACS[op]
+        levels, fracs = _entry_levels_fractions(sl_map[op][bi])
+        for sl, frac in zip(levels, fracs):
+            level_macs[int(sl)] += float(_OP_MACS[op]) * float(frac)
     total = sum(level_macs.values())
     if total == 0:
         return {}
@@ -177,18 +186,20 @@ def summarize_allocation(sl_map: dict[str, list[int]],
     }
 
 
-def summarize_per_op(sl_map: dict[str, list[int]],
+def summarize_per_op(sl_map: dict[str, list],
                      active_ops: set[tuple[str, int]]) -> dict[str, dict[str, float]]:
     by_op: dict[str, Counter] = defaultdict(Counter)
     totals: Counter = Counter()
     for op, bi in active_ops:
-        by_op[op][sl_map[op][bi]] += 1
-        totals[op] += 1
+        levels, fracs = _entry_levels_fractions(sl_map[op][bi])
+        for sl, frac in zip(levels, fracs):
+            by_op[op][int(sl)] += float(frac)
+        totals[op] += 1.0
     out: dict[str, dict[str, float]] = {}
     for op in sorted(by_op):
-        n = totals[op]
+        n = float(totals[op])
         out[op] = {
-            str(sl): round(by_op[op][sl] / n, 4)
+            str(sl): round(float(by_op[op][sl]) / n, 4)
             for sl in sorted(by_op[op], reverse=True)
         }
     return out
@@ -224,31 +235,136 @@ def _nearest_level(target: int, levels: list[int]) -> int:
     return min(levels, key=lambda x: abs(x - target))
 
 
+def _load_sl_map_json(path: str) -> dict[str, list]:
+    with open(path) as f:
+        data = json.load(f)
+    if isinstance(data, dict) and "sl_map" in data:
+        data = data["sl_map"]
+    return {op: data[op] for op in SC_OP_NAMES}
+
+
+def _entry_bins(entry) -> list[int]:
+    if isinstance(entry, list):
+        return [int(x) for x in entry]
+    return [int(entry)]
+
+
+def _entry_avg_sl(entry) -> float:
+    bins = _entry_bins(entry)
+    return float(sum(bins)) / float(len(bins))
+
+
+def _entry_levels_fractions(entry) -> tuple[list[int], list[float]]:
+    bins = _entry_bins(entry)
+    total = len(bins)
+    counts = Counter(bins)
+    levels = sorted(counts.keys(), reverse=True)
+    fracs = [counts[sl] / total for sl in levels]
+    return levels, fracs
+
+
+def _make_entry(level: int, n_bins: int) -> int | list[int]:
+    if n_bins <= 1:
+        return int(level)
+    return [int(level)] * int(n_bins)
+
+
+def _ensure_entry(sl_map: dict[str, list], op: str, bi: int, n_bins: int) -> None:
+    if isinstance(sl_map[op][bi], list):
+        return
+    sl_map[op][bi] = _make_entry(int(sl_map[op][bi]), n_bins)
+
+
+def _unit_parent(unit: tuple) -> tuple[str, int]:
+    return (str(unit[0]), int(unit[1]))
+
+
+def _get_unit_level(sl_map: dict[str, list], unit: tuple) -> int:
+    op, bi = _unit_parent(unit)
+    entry = sl_map[op][bi]
+    bins = _entry_bins(entry)
+    if len(unit) >= 3:
+        idx = int(unit[2])
+        if len(bins) == 1:
+            return int(bins[0])
+        if idx >= len(bins):
+            return int(bins[-1])
+        return int(bins[idx])
+    return int(bins[0])
+
+
+def _set_unit_level(sl_map: dict[str, list], unit: tuple,
+                    value: int, n_bins: int) -> None:
+    op, bi = _unit_parent(unit)
+    if len(unit) >= 3:
+        _ensure_entry(sl_map, op, bi, n_bins)
+        bins = list(_entry_bins(sl_map[op][bi]))
+        bins[int(unit[2])] = int(value)
+        sl_map[op][bi] = bins
+    else:
+        sl_map[op][bi] = int(value)
+
+
+def build_search_units(
+    *,
+    active_ops: set[tuple[str, int]],
+    search_ops: set[str],
+    n_bins: int,
+    bin_ops: set[str],
+) -> list[tuple]:
+    units: list[tuple] = []
+    for op, bi in sorted(active_ops, key=lambda x: (x[1], x[0])):
+        if op not in search_ops:
+            continue
+        if n_bins > 1 and op in bin_ops:
+            for bin_idx in range(n_bins):
+                units.append((op, bi, bin_idx))
+        else:
+            units.append((op, bi))
+    return units
+
+
+def _entry_to_mpconfig(entry) -> Optional[MPConfig]:
+    levels_all, fracs_all = _entry_levels_fractions(entry)
+    kept = [(int(sl), float(frac)) for sl, frac in zip(levels_all, fracs_all)
+            if int(sl) > 0]
+    if not kept:
+        return None
+    levels = [sl for sl, _frac in kept]
+    kept_fracs = [frac for _sl, frac in kept]
+    s = sum(kept_fracs)
+    if s <= 0:
+        return None
+    kept_fracs = [x / s for x in kept_fracs]
+    return MPConfig(levels, kept_fracs)
+
+
 def build_level_spaces(
     *,
-    search_slots: list[tuple[str, int]],
+    search_units: list[tuple],
     global_levels: list[int],
     op_min_levels: dict[str, int],
     op_max_levels: dict[str, int],
-) -> dict[tuple[str, int], list[int]]:
-    spaces: dict[tuple[str, int], list[int]] = {}
-    for op, bi in search_slots:
+) -> dict[tuple, list[int]]:
+    spaces: dict[tuple, list[int]] = {}
+    for unit in search_units:
+        op, bi = _unit_parent(unit)
         lo = op_min_levels.get(op, global_levels[0])
         hi = op_max_levels.get(op, global_levels[-1])
         allowed = [sl for sl in global_levels if lo <= sl <= hi]
         if not allowed:
-            raise ValueError(f"no valid levels for {(op, bi)} in [{lo}, {hi}]")
-        spaces[(op, bi)] = allowed
+            raise ValueError(f"no valid levels for {unit!r} in [{lo}, {hi}]")
+        spaces[unit] = allowed
     return spaces
 
 
 def choose_initial_levels_exact(
     *,
-    search_slots: list[tuple[str, int]],
-    spaces: dict[tuple[str, int], list[int]],
+    search_units: list[tuple],
+    spaces: dict[tuple, list[int]],
     target_sum_sl: int,
     sens_map: dict[tuple[str, int], float],
-) -> tuple[dict[tuple[str, int], int], int, float]:
+) -> tuple[dict[tuple, int], int, float]:
     """Exact/closest DP over searchable slots.
 
     Search slots are assumed to share the same MAC, so matching main-budget
@@ -257,12 +373,12 @@ def choose_initial_levels_exact(
     states: dict[int, tuple[float, Optional[tuple[int, int]]]] = {0: (0.0, None)}
     history: list[dict[int, tuple[int, int]]] = []
 
-    for idx, slot in enumerate(search_slots):
+    for idx, unit in enumerate(search_units):
         next_states: dict[int, tuple[float, tuple[int, int]]] = {}
         choices: dict[int, tuple[int, int]] = {}
-        sens = sens_map.get(slot, 0.0)
+        sens = sens_map.get(_unit_parent(unit), 0.0)
         for cur_sum, (cur_util, _prev) in states.items():
-            for level in spaces[slot]:
+            for level in spaces[unit]:
                 new_sum = cur_sum + level
                 new_util = cur_util + sens * float(level)
                 prev_best = next_states.get(new_sum)
@@ -285,23 +401,23 @@ def choose_initial_levels_exact(
             best_util = util
     assert best_sum is not None and best_util is not None
 
-    assignment: dict[tuple[str, int], int] = {}
+    assignment: dict[tuple, int] = {}
     cur_sum = best_sum
-    for idx in range(len(search_slots) - 1, -1, -1):
+    for idx in range(len(search_units) - 1, -1, -1):
         prev_sum, level = history[idx][cur_sum]
-        assignment[search_slots[idx]] = level
+        assignment[search_units[idx]] = level
         cur_sum = prev_sum
     return assignment, int(best_sum), float(best_util)
 
 
 def choose_initial_levels_from_base(
     *,
-    search_slots: list[tuple[str, int]],
-    spaces: dict[tuple[str, int], list[int]],
+    search_units: list[tuple],
+    spaces: dict[tuple, list[int]],
     target_sum_sl: int,
-    base_levels: dict[tuple[str, int], int],
+    base_levels: dict[tuple, int],
     sens_map: dict[tuple[str, int], float],
-) -> tuple[dict[tuple[str, int], int], int, float]:
+) -> tuple[dict[tuple, int], int, float]:
     """DP around a user-provided baseline assignment.
 
     The objective is to stay close to ``base_levels`` while matching the
@@ -311,13 +427,13 @@ def choose_initial_levels_from_base(
     states: dict[int, tuple[float, Optional[tuple[int, int]]]] = {0: (0.0, None)}
     history: list[dict[int, tuple[int, int]]] = []
 
-    for slot in search_slots:
+    for unit in search_units:
         next_states: dict[int, tuple[float, tuple[int, int]]] = {}
         choices: dict[int, tuple[int, int]] = {}
-        sens = sens_map.get(slot, 0.0)
-        base = int(base_levels[slot])
+        sens = sens_map.get(_unit_parent(unit), 0.0)
+        base = int(base_levels[unit])
         for cur_sum, (cur_score, _prev) in states.items():
-            for level in spaces[slot]:
+            for level in spaces[unit]:
                 new_sum = cur_sum + level
                 delta = abs(level - base)
                 # Keep the solution close to the uniform baseline. When a
@@ -344,11 +460,11 @@ def choose_initial_levels_from_base(
             best_score = score
     assert best_sum is not None and best_score is not None
 
-    assignment: dict[tuple[str, int], int] = {}
+    assignment: dict[tuple, int] = {}
     cur_sum = best_sum
-    for idx in range(len(search_slots) - 1, -1, -1):
+    for idx in range(len(search_units) - 1, -1, -1):
         prev_sum, level = history[idx][cur_sum]
-        assignment[search_slots[idx]] = level
+        assignment[search_units[idx]] = level
         cur_sum = prev_sum
     return assignment, int(best_sum), float(best_score)
 
@@ -357,57 +473,84 @@ def build_initial_sl_map(
     *,
     active_ops: set[tuple[str, int]],
     search_ops: set[str],
+    search_units: list[tuple],
     fixed_ops: dict[str, int],
     target_main_sl: int,
-    level_spaces: dict[tuple[str, int], list[int]],
+    level_spaces: dict[tuple, list[int]],
     sens_map: dict[tuple[str, int], float],
     n_blocks: int,
     init_mode: str = "sensitivity_dp",
     init_level: Optional[int] = None,
+    init_sl_map: Optional[dict[str, list]] = None,
+    n_bins: int = 1,
 ) -> tuple[dict[str, list[int]], dict[str, object]]:
     sl_map = _empty_sl_map(n_blocks)
-    search_slots = sorted((slot for slot in active_ops if slot[0] in search_ops),
-                          key=lambda x: (x[1], x[0]))
     fixed_total = 0.0
     total_macs = 0.0
-    search_macs = {_OP_MACS[op] for op, _ in search_slots}
+    search_macs = {
+        float(_OP_MACS[_unit_parent(unit)[0]]) / (n_bins if len(unit) >= 3 else 1.0)
+        for unit in search_units
+    }
     if len(search_macs) != 1:
         raise ValueError(
-            "first implementation requires search_ops to share the same MAC; "
+            "current implementation requires search units to share the same cost; "
             f"got {sorted(search_macs)}"
         )
-    search_mac = float(next(iter(search_macs))) if search_macs else 0.0
+    search_mac = float(next(iter(search_macs))) if search_units else 0.0
 
     for op, bi in active_ops:
         total_macs += float(_OP_MACS[op])
         if op in search_ops:
+            sl_map[op][bi] = _make_entry(0, n_bins if n_bins > 1 else 1)
             continue
         sl = fixed_ops.get(op, target_main_sl)
         sl_map[op][bi] = int(sl)
         fixed_total += float(_OP_MACS[op]) * float(sl)
 
     target_total = float(target_main_sl) * total_macs
-    if search_slots:
+    if search_units:
         remaining = target_total - fixed_total
         target_sum_sl = int(round(remaining / search_mac))
-        min_sum = sum(min(level_spaces[slot]) for slot in search_slots)
-        max_sum = sum(max(level_spaces[slot]) for slot in search_slots)
+        min_sum = sum(min(level_spaces[unit]) for unit in search_units)
+        max_sum = sum(max(level_spaces[unit]) for unit in search_units)
         clipped_target = min(max(target_sum_sl, min_sum), max_sum)
         if init_mode == "uniform_repair":
             base_target = target_main_sl if init_level is None else int(init_level)
-            base_levels: dict[tuple[str, int], int] = {}
-            for slot in search_slots:
-                allowed = level_spaces[slot]
+            base_levels: dict[tuple, int] = {}
+            for unit in search_units:
+                allowed = level_spaces[unit]
                 if base_target <= min(allowed):
-                    base_levels[slot] = min(allowed)
+                    base_levels[unit] = min(allowed)
                 elif base_target >= max(allowed):
-                    base_levels[slot] = max(allowed)
+                    base_levels[unit] = max(allowed)
                 elif base_target in allowed:
-                    base_levels[slot] = base_target
+                    base_levels[unit] = base_target
                 else:
-                    base_levels[slot] = _nearest_level(base_target, allowed)
+                    base_levels[unit] = _nearest_level(base_target, allowed)
             assignment, chosen_sum, util = choose_initial_levels_from_base(
-                search_slots=search_slots,
+                search_units=search_units,
+                spaces=level_spaces,
+                target_sum_sl=clipped_target,
+                base_levels=base_levels,
+                sens_map=sens_map,
+            )
+        elif init_mode == "map_repair":
+            if init_sl_map is None:
+                raise ValueError("init_mode=map_repair requires init_sl_map")
+            base_levels = {}
+            for unit in search_units:
+                allowed = level_spaces[unit]
+                base_target = _get_unit_level(init_sl_map, unit)
+                if base_target <= min(allowed):
+                    base_levels[unit] = min(allowed)
+                elif base_target >= max(allowed):
+                    base_levels[unit] = max(allowed)
+                elif base_target in allowed:
+                    base_levels[unit] = base_target
+                else:
+                    base_levels[unit] = _nearest_level(base_target, allowed)
+            assignment, chosen_sum, util = choose_initial_levels_from_base(
+                search_units=search_units,
                 spaces=level_spaces,
                 target_sum_sl=clipped_target,
                 base_levels=base_levels,
@@ -415,15 +558,15 @@ def build_initial_sl_map(
             )
         elif init_mode == "sensitivity_dp":
             assignment, chosen_sum, util = choose_initial_levels_exact(
-                search_slots=search_slots,
+                search_units=search_units,
                 spaces=level_spaces,
                 target_sum_sl=clipped_target,
                 sens_map=sens_map,
             )
         else:
             raise ValueError(f"unknown init_mode: {init_mode}")
-        for (op, bi), sl in assignment.items():
-            sl_map[op][bi] = int(sl)
+        for unit, sl in assignment.items():
+            _set_unit_level(sl_map, unit, int(sl), n_bins)
     else:
         clipped_target = target_main_sl
         chosen_sum = 0
@@ -433,11 +576,12 @@ def build_initial_sl_map(
     meta = {
         "init_mode": init_mode,
         "init_level": init_level,
-        "search_slots": len(search_slots),
+        "init_from_map": init_sl_map is not None,
+        "search_slots": len(search_units),
         "fixed_bitops": fixed_total,
         "target_total_bitops": target_total,
-        "target_search_sum_sl": None if not search_slots else target_sum_sl,
-        "clipped_target_search_sum_sl": None if not search_slots else clipped_target,
+        "target_search_sum_sl": None if not search_units else target_sum_sl,
+        "clipped_target_search_sum_sl": None if not search_units else clipped_target,
         "chosen_search_sum_sl": chosen_sum,
         "utility": util,
         "actual_main_sl": actual_main,
@@ -465,7 +609,7 @@ def get_blocks(model: nn.Module):
 
 
 def patch_model_with_sl_map(model: nn.Module, sc_prec: int,
-                            sl_map: dict[str, list[int]]) -> dict[str, int]:
+                            sl_map: dict[str, list]) -> dict[str, int]:
     blocks = get_blocks(model)
     nb = len(blocks)
     stats = Counter()
@@ -477,24 +621,24 @@ def patch_model_with_sl_map(model: nn.Module, sc_prec: int,
                 attn_mod = m
                 break
 
-        qk_sl = sl_map.get("qk", [0] * nb)[i]
-        av_sl = sl_map.get("av", [0] * nb)[i]
-        if attn_mod and (qk_sl > 0 or av_sl > 0):
-            qk_mp = MPConfig([qk_sl], [1.0]) if qk_sl > 0 else None
-            av_mp = MPConfig([av_sl], [1.0]) if av_sl > 0 else None
+        qk_entry = sl_map.get("qk", [0] * nb)[i]
+        av_entry = sl_map.get("av", [0] * nb)[i]
+        qk_mp = _entry_to_mpconfig(qk_entry)
+        av_mp = _entry_to_mpconfig(av_entry)
+        if attn_mod and (qk_mp is not None or av_mp is not None):
             fwd = make_sc_attention_forward(
                 sc_prec=sc_prec,
-                sc_av=av_sl > 0,
-                sc_qk=qk_sl > 0,
+                sc_av=av_mp is not None,
+                sc_qk=qk_mp is not None,
                 qk_mp_cfg=qk_mp,
                 av_mp_cfg=av_mp,
             )
             attn_mod.forward = fwd.__get__(attn_mod, type(attn_mod))
             stats["attn"] += 1
 
-        proj_sl = sl_map.get("proj", [0] * nb)[i]
-        if attn_mod and proj_sl > 0:
-            mp = MPConfig([proj_sl], [1.0])
+        proj_entry = sl_map.get("proj", [0] * nb)[i]
+        mp = _entry_to_mpconfig(proj_entry)
+        if attn_mod and mp is not None:
             if isinstance(attn_mod.qkv, nn.Linear):
                 attn_mod.qkv = SCLinear(attn_mod.qkv, sc_prec, mode="bipolar",
                                         mp_cfg=mp)
@@ -507,11 +651,11 @@ def patch_model_with_sl_map(model: nn.Module, sc_prec: int,
         mlp = getattr(blk, "mlp", None)
         if mlp is not None:
             for fc_name in ("mlp_fc1", "mlp_fc2"):
-                fc_sl = sl_map.get(fc_name, [0] * nb)[i]
+                fc_entry = sl_map.get(fc_name, [0] * nb)[i]
                 attr = fc_name.replace("mlp_", "")
                 linear = getattr(mlp, attr, None)
-                if fc_sl > 0 and isinstance(linear, nn.Linear):
-                    mp = MPConfig([fc_sl], [1.0])
+                mp = _entry_to_mpconfig(fc_entry)
+                if mp is not None and isinstance(linear, nn.Linear):
                     setattr(mlp, attr,
                             SCLinear(linear, sc_prec, mode="bipolar", mp_cfg=mp))
                     stats[fc_name] += 1
@@ -520,7 +664,7 @@ def patch_model_with_sl_map(model: nn.Module, sc_prec: int,
 
 
 def patch_block_with_spec(block: nn.Module, sc_prec: int,
-                          block_spec: dict[str, int]) -> nn.Module:
+                          block_spec: dict[str, object]) -> nn.Module:
     blk = copy.deepcopy(block)
     attn_mod = None
     for m in blk.modules():
@@ -528,23 +672,20 @@ def patch_block_with_spec(block: nn.Module, sc_prec: int,
             attn_mod = m
             break
 
-    qk_sl = int(block_spec.get("qk", 0))
-    av_sl = int(block_spec.get("av", 0))
-    if attn_mod and (qk_sl > 0 or av_sl > 0):
-        qk_mp = MPConfig([qk_sl], [1.0]) if qk_sl > 0 else None
-        av_mp = MPConfig([av_sl], [1.0]) if av_sl > 0 else None
+    qk_mp = _entry_to_mpconfig(block_spec.get("qk", 0))
+    av_mp = _entry_to_mpconfig(block_spec.get("av", 0))
+    if attn_mod and (qk_mp is not None or av_mp is not None):
         fwd = make_sc_attention_forward(
             sc_prec=sc_prec,
-            sc_av=av_sl > 0,
-            sc_qk=qk_sl > 0,
+            sc_av=av_mp is not None,
+            sc_qk=qk_mp is not None,
             qk_mp_cfg=qk_mp,
             av_mp_cfg=av_mp,
         )
         attn_mod.forward = fwd.__get__(attn_mod, type(attn_mod))
 
-    proj_sl = int(block_spec.get("proj", 0))
-    if attn_mod and proj_sl > 0:
-        mp = MPConfig([proj_sl], [1.0])
+    mp = _entry_to_mpconfig(block_spec.get("proj", 0))
+    if attn_mod and mp is not None:
         if isinstance(attn_mod.qkv, nn.Linear):
             attn_mod.qkv = SCLinear(attn_mod.qkv, sc_prec, mode="bipolar",
                                     mp_cfg=mp)
@@ -555,11 +696,10 @@ def patch_block_with_spec(block: nn.Module, sc_prec: int,
     mlp = getattr(blk, "mlp", None)
     if mlp is not None:
         for fc_name in ("mlp_fc1", "mlp_fc2"):
-            fc_sl = int(block_spec.get(fc_name, 0))
             attr = fc_name.replace("mlp_", "")
             linear = getattr(mlp, attr, None)
-            if fc_sl > 0 and isinstance(linear, nn.Linear):
-                mp = MPConfig([fc_sl], [1.0])
+            mp = _entry_to_mpconfig(block_spec.get(fc_name, 0))
+            if mp is not None and isinstance(linear, nn.Linear):
                 setattr(mlp, attr,
                         SCLinear(linear, sc_prec, mode="bipolar", mp_cfg=mp))
 
@@ -636,9 +776,9 @@ def evaluate_block_moves(
     block_idx: int,
     fp_block: nn.Module,
     x_cpu: torch.Tensor,
-    current_spec: dict[str, int],
-    search_ops_in_block: list[str],
-    spaces: dict[tuple[str, int], list[int]],
+    current_spec: dict[str, object],
+    search_units_in_block: list[tuple],
+    spaces: dict[tuple, list[int]],
     sc_prec: int,
     proxy: str,
     ridge: float,
@@ -662,16 +802,25 @@ def evaluate_block_moves(
     torch.cuda.empty_cache()
 
     candidates = []
-    for op in search_ops_in_block:
-        allowed = spaces[(op, block_idx)]
-        cur_sl = int(current_spec[op])
+    for unit in search_units_in_block:
+        allowed = spaces[unit]
+        op = str(unit[0])
+        cur_sl = _entry_bins(current_spec[op])[int(unit[2])] if len(unit) >= 3 else int(_entry_bins(current_spec[op])[0])
         pos = allowed.index(cur_sl)
         for next_pos in (pos - 1, pos + 1):
             if not (0 <= next_pos < len(allowed)):
                 continue
             new_sl = int(allowed[next_pos])
-            cand_spec = dict(current_spec)
-            cand_spec[op] = new_sl
+            cand_spec = {
+                k: list(v) if isinstance(v, list) else v
+                for k, v in current_spec.items()
+            }
+            if len(unit) >= 3:
+                bins = list(_entry_bins(cand_spec[op]))
+                bins[int(unit[2])] = new_sl
+                cand_spec[op] = bins
+            else:
+                cand_spec[op] = new_sl
             cand_blk = patch_block_with_spec(fp_block_cpu, sc_prec, cand_spec).to(device).eval()
             y_new_cpu = forward_block_batched(cand_blk, x_cpu, device, fwd_chunk)
             score = compute_proxy_score(
@@ -679,9 +828,10 @@ def evaluate_block_moves(
                 device=device, ridge=ridge,
             )
             candidates.append({
-                "slot": (op, block_idx),
+                "slot": unit,
                 "op": op,
                 "block": block_idx,
+                "bin": None if len(unit) < 3 else int(unit[2]),
                 "old_sl": cur_sl,
                 "new_sl": new_sl,
                 "delta_sl": new_sl - cur_sl,
@@ -709,16 +859,21 @@ def build_block_weight(active_ops: set[tuple[str, int]],
     return dict(weights)
 
 
-def build_current_spec(sl_map: dict[str, list[int]], block_idx: int) -> dict[str, int]:
-    return {op: int(sl_map[op][block_idx]) for op in SC_OP_NAMES}
+def build_current_spec(sl_map: dict[str, list], block_idx: int) -> dict[str, object]:
+    spec: dict[str, object] = {}
+    for op in SC_OP_NAMES:
+        entry = sl_map[op][block_idx]
+        spec[op] = list(entry) if isinstance(entry, list) else int(entry)
+    return spec
 
 
 def iterative_swap_search(
     *,
     active_ops: set[tuple[str, int]],
     search_ops: set[str],
-    sl_map: dict[str, list[int]],
-    spaces: dict[tuple[str, int], list[int]],
+    search_units: list[tuple],
+    sl_map: dict[str, list],
+    spaces: dict[tuple, list[int]],
     loader: DataLoader,
     device: torch.device,
     sc_prec: int,
@@ -727,11 +882,12 @@ def iterative_swap_search(
     max_iters: int,
     fwd_chunk: int,
     cache_dtype: torch.dtype,
+    n_bins: int,
     log_fn=print,
-) -> tuple[dict[str, list[int]], list[dict[str, object]], dict[str, object]]:
+) -> tuple[dict[str, list], list[dict[str, object]], dict[str, object]]:
     sens_map = load_sensitivity()
     block_weight = build_block_weight(active_ops, sens_map)
-    search_slots = {slot for slot in active_ops if slot[0] in search_ops}
+    search_units = list(search_units)
     history: list[dict[str, object]] = []
     iteration_meta: dict[str, object] = {}
 
@@ -750,17 +906,17 @@ def iterative_swap_search(
         upgrades_by_step: dict[int, list[dict[str, object]]] = defaultdict(list)
         downgrades_by_step: dict[int, list[dict[str, object]]] = defaultdict(list)
         block_reports = []
-        search_blocks = sorted({bi for _op, bi in search_slots})
+        search_blocks = sorted({int(unit[1]) for unit in search_units})
         for bi in search_blocks:
-            ops_here = sorted(op for op, bj in search_slots if bj == bi)
-            if not ops_here:
+            units_here = [unit for unit in search_units if int(unit[1]) == bi]
+            if not units_here:
                 continue
             report = evaluate_block_moves(
                 block_idx=bi,
                 fp_block=fp_blocks[bi],
                 x_cpu=x_by_block[bi],
                 current_spec=build_current_spec(sl_map, bi),
-                search_ops_in_block=ops_here,
+                search_units_in_block=units_here,
                 spaces=spaces,
                 sc_prec=sc_prec,
                 proxy=proxy,
@@ -821,8 +977,8 @@ def iterative_swap_search(
 
         up = best_pair["upgrade"]
         down = best_pair["downgrade"]
-        sl_map[up["op"]][up["block"]] = int(up["new_sl"])
-        sl_map[down["op"]][down["block"]] = int(down["new_sl"])
+        _set_unit_level(sl_map, tuple(up["slot"]), int(up["new_sl"]), n_bins)
+        _set_unit_level(sl_map, tuple(down["slot"]), int(down["new_sl"]), n_bins)
         history.append({
             "iter": it,
             "delta_score": float(best_pair["delta_score"]),
@@ -855,16 +1011,32 @@ def main():
     ap.add_argument("--fixed_ops", default="qk=64,av=64")
     ap.add_argument("--op_min_levels", default="proj=96,mlp_fc1=96,mlp_fc2=192")
     ap.add_argument("--op_max_levels", default="")
+    ap.add_argument("--fraction_units", "--n_bins", dest="fraction_units",
+                    type=int, default=1,
+                    help="Number of equal-cost fraction units per searchable "
+                         "(op, block). When >1, fraction search is enabled for "
+                         "--fraction_ops. --n_bins is kept as a backward-"
+                         "compatible alias.")
+    ap.add_argument("--fraction_ops", "--bin_ops", dest="fraction_ops",
+                    default="",
+                    help="Comma-separated searchable ops to express as per-(op, "
+                         "block) fractions. Default: all search_ops when "
+                         "fraction_units>1. --bin_ops is kept as a backward-"
+                         "compatible alias.")
     ap.add_argument("--proxy", default="comp_residual",
                     choices=["raw_mse", "comp_residual"])
     ap.add_argument("--init_mode", default="sensitivity_dp",
-                    choices=["sensitivity_dp", "uniform_repair"],
+                    choices=["sensitivity_dp", "uniform_repair", "map_repair"],
                     help="Initial allocation strategy before iterative swaps. "
                          "'uniform_repair' starts from an all-init_level map "
                          "and only changes what is needed to satisfy the "
-                         "budget and hard per-op floors.")
+                         "budget and hard per-op floors. 'map_repair' starts "
+                         "from --init_sl_map_json.")
     ap.add_argument("--init_level", type=int, default=128,
                     help="Target per-slot stoc_len used by uniform_repair.")
+    ap.add_argument("--init_sl_map_json", default="",
+                    help="Optional JSON with a saved sl_map. Used by map_repair "
+                         "and recorded in the output config.")
     ap.add_argument("--n_search", type=int, default=32)
     ap.add_argument("--search_seed", type=int, default=1)
     ap.add_argument("--max_iters", type=int, default=8)
@@ -888,15 +1060,31 @@ def main():
     active_ops = build_active_ops(args.sc_config)
     levels = _parse_levels(args.levels)
     search_ops = {x.strip() for x in args.search_ops.split(",") if x.strip()}
+    if args.fraction_units < 1:
+        raise ValueError("--fraction_units must be >= 1")
+    if args.fraction_units > 1:
+        if args.fraction_ops.strip():
+            bin_ops = {x.strip() for x in args.fraction_ops.split(",") if x.strip()}
+        else:
+            bin_ops = set(search_ops)
+    else:
+        bin_ops = set()
     fixed_ops = _parse_int_map(args.fixed_ops)
     op_min_levels = _parse_int_map(args.op_min_levels)
     op_max_levels = _parse_int_map(args.op_max_levels)
     sens_map = load_sensitivity()
+    init_sl_map = (_load_sl_map_json(args.init_sl_map_json)
+                   if args.init_sl_map_json else None)
 
     n_blocks = 1 + max(bi for _op, bi in active_ops)
-    search_slots = sorted(slot for slot in active_ops if slot[0] in search_ops)
+    search_units = build_search_units(
+        active_ops=active_ops,
+        search_ops=search_ops,
+        n_bins=args.fraction_units,
+        bin_ops=bin_ops,
+    )
     spaces = build_level_spaces(
-        search_slots=search_slots,
+        search_units=search_units,
         global_levels=levels,
         op_min_levels=op_min_levels,
         op_max_levels=op_max_levels,
@@ -905,6 +1093,7 @@ def main():
     sl_map, init_meta = build_initial_sl_map(
         active_ops=active_ops,
         search_ops=search_ops,
+        search_units=search_units,
         fixed_ops=fixed_ops,
         target_main_sl=args.target_main_sl,
         level_spaces=spaces,
@@ -912,6 +1101,8 @@ def main():
         n_blocks=n_blocks,
         init_mode=args.init_mode,
         init_level=args.init_level,
+        init_sl_map=init_sl_map,
+        n_bins=args.fraction_units,
     )
 
     cache_dtype = torch.float16 if args.cache_dtype == "float16" else torch.float32
@@ -932,6 +1123,7 @@ def main():
     final_sl_map, history, last_iter = iterative_swap_search(
         active_ops=active_ops,
         search_ops=search_ops,
+        search_units=search_units,
         sl_map=sl_map,
         spaces=spaces,
         loader=loader,
@@ -942,6 +1134,7 @@ def main():
         max_iters=args.max_iters,
         fwd_chunk=args.fwd_chunk,
         cache_dtype=cache_dtype,
+        n_bins=args.fraction_units,
     )
 
     final_main = compute_main_sl(final_sl_map, active_ops)
@@ -952,11 +1145,14 @@ def main():
         "proxy": args.proxy,
         "levels": levels,
         "search_ops": sorted(search_ops),
+        "fraction_ops": sorted(bin_ops),
+        "fraction_units": args.fraction_units,
         "fixed_ops": fixed_ops,
         "op_min_levels": op_min_levels,
         "op_max_levels": op_max_levels,
         "n_search": args.n_search,
         "search_seed": args.search_seed,
+        "init_sl_map_json": args.init_sl_map_json,
         "init_meta": init_meta,
         "history": history,
         "last_iter": last_iter,
