@@ -1,17 +1,20 @@
-"""Preliminary per-(op, block) sensitivity sweep for EVA-ViTDet on COCO.
+"""Per-(op, block) SC sensitivity sweep for EVA-ViTDet on COCO.
 
-For each (op, block) combo, SC *only* that single op in that single block;
-everything else FP. Measure bbox AP drop vs FP baseline.
+For each (op, block) pair, SC *only* that single op in that single block at
+the given SC length; everything else stays FP. Records bbox/segm AP drop
+vs FP baseline.
 
-This is the detection analog of ``vit_sc/experiments/sensitivity_all_ops.py``
-(which targets DINOv2 classification). Uses real SC (no noise surrogate).
+Length is supplied via `--sc_prec N` (⇒ stoc_len = 2**N) or `--length L`
+(arbitrary int, passed as-is to the kernel).
 
-Output: results/sensitivity/sensitivity_all_ops.json
+Output: sensitivity/sensitivity_{tag}_n{n_eval}.json
+        tag = int{sc_prec} when stoc_len is a power of 2, else len{stoc_len}.
 """
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 import time
 from pathlib import Path
@@ -19,7 +22,7 @@ from pathlib import Path
 import torch
 
 _HERE = Path(__file__).resolve().parent
-_DET = _HERE.parent  # vit_sc/det/
+_DET = _HERE.parent
 if str(_DET) not in sys.path:
     sys.path.insert(0, str(_DET))
 
@@ -28,79 +31,107 @@ from sc_patch import sc_patch_eva, SC_OP_NAMES  # noqa: E402
 
 
 def run_eval(model, test_loader, evaluator, out_dir):
-    """Run COCO inference and return results dict."""
     from detectron2.evaluation import inference_on_dataset
     set_evaluator_output_dir(evaluator, out_dir)
     with torch.no_grad():
-        results = inference_on_dataset(model, test_loader, evaluator)
-    return results
+        return inference_on_dataset(model, test_loader, evaluator)
+
+
+def save(out_path, args, n_blocks, fp_bbox_ap, fp_segm_ap, grid):
+    out = {
+        "config": {
+            "n_eval": args.n_eval,
+            "sc_prec": args.sc_prec,
+            "stoc_len": args.stoc_len,
+            "n_blocks": n_blocks,
+            "op_names": list(SC_OP_NAMES),
+            "block_start": args.block_start,
+            "block_end": args.block_end,
+        },
+        "fp_baseline": {
+            "bbox_ap": round(fp_bbox_ap, 4),
+            "segm_ap": round(fp_segm_ap, 4),
+        },
+        "grid": grid,
+    }
+    with open(out_path, "w") as f:
+        json.dump(out, f, indent=2)
 
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--n_eval", type=int, default=50,
-                   help="Number of COCO val images (preliminary → small).")
-    p.add_argument("--sc_prec", type=int, default=8)
+    g = p.add_mutually_exclusive_group(required=True)
+    g.add_argument("--sc_prec", type=int,
+                   help="SC precision (stoc_len = 2**sc_prec).")
+    g.add_argument("--length", "--stoc_len", type=int, dest="length",
+                   help="SC stochastic length. sc_prec = ceil(log2(length)).")
+    p.add_argument("--n_eval", type=int, default=100,
+                   help="Number of COCO val images per config.")
     p.add_argument("--ops", nargs="*", default=None,
-                   help="Subset of ops to sweep (default: all 6). "
-                        f"Valid: {SC_OP_NAMES}")
-    p.add_argument("--block_start", type=int, default=0,
-                   help="First block index (inclusive).")
+                   help=f"Subset of ops (default all). Valid: {SC_OP_NAMES}")
+    p.add_argument("--block_start", type=int, default=0)
     p.add_argument("--block_end", type=int, default=-1,
-                   help="Last block index (exclusive). -1 = n_blocks.")
-    p.add_argument("--out_json",
-                   default="results/sensitivity/sensitivity_all_ops.json")
+                   help="Exclusive; -1 means n_blocks.")
+    p.add_argument("--out_json", type=str, default="",
+                   help="Default: sensitivity/sensitivity_{tag}_n{n_eval}.json")
     p.add_argument("--resume", action="store_true",
                    help="Skip (op, block) combos already in out_json.")
-    p.add_argument("--d2_datasets", type=str, default="",
-                   help="DETECTRON2_DATASETS root.")
-    p.add_argument("--ckpt", type=str, default="",
-                   help="Path to EVA-ViTDet checkpoint.")
+    p.add_argument("--d2_datasets", type=str, default="")
+    p.add_argument("--ckpt", type=str, default="")
     args = p.parse_args()
+
+    if args.sc_prec is None:
+        args.stoc_len = int(args.length)
+        args.sc_prec = max(1, int(math.ceil(math.log2(max(args.stoc_len, 2)))))
+    else:
+        args.stoc_len = 1 << args.sc_prec
+    is_pow2 = args.stoc_len == (1 << args.sc_prec)
+    print(f"[cfg] sc_prec={args.sc_prec}  stoc_len={args.stoc_len}",
+          flush=True)
 
     ops_to_sweep = list(SC_OP_NAMES) if args.ops is None else args.ops
     for op in ops_to_sweep:
         if op not in SC_OP_NAMES:
             raise SystemExit(f"unknown op: {op} (valid: {SC_OP_NAMES})")
 
-    out_path = _DET / args.out_json
+    tag = f"int{args.sc_prec}" if is_pow2 else f"len{args.stoc_len}"
+    default_name = f"sensitivity_{tag}_n{args.n_eval}.json"
+    out_path = _DET / (args.out_json or f"sensitivity/{default_name}")
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_dir = _DET / "results" / "sensitivity" / "_tmp"
+    tmp_dir = _DET / "sensitivity" / "_tmp"
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
-    # --- Resume support ---
+    # --- Resume ---
     done = {}
     if args.resume and out_path.exists():
         with open(out_path) as f:
             prev = json.load(f)
         for row in prev.get("grid", []):
             done[(row["op"], int(row["block"]))] = row
-        print(f"[resume] loaded {len(done)} existing entries from {out_path}")
+        print(f"[resume] loaded {len(done)} entries from {out_path}")
 
     # --- FP baseline ---
-    print(f"[1] Loading model + loader (n_eval={args.n_eval})")
-    model, test_loader, evaluator, subset = load_model_and_loader(
+    print(f"[1] loading model + loader (n_eval={args.n_eval})", flush=True)
+    model, test_loader, evaluator, _ = load_model_and_loader(
         args.n_eval, d2_datasets=args.d2_datasets, ckpt=args.ckpt)
     n_blocks = len(list(model.backbone.net.blocks))
     blk_lo = args.block_start
     blk_hi = n_blocks if args.block_end < 0 else min(args.block_end, n_blocks)
-    print(f"    n_blocks = {n_blocks},  sweep range [{blk_lo}, {blk_hi})")
+    print(f"    n_blocks={n_blocks}, sweep blocks [{blk_lo}, {blk_hi})",
+          flush=True)
     n_combos = len(ops_to_sweep) * (blk_hi - blk_lo) - len(done)
-    print(f"    combos to sweep: {n_combos} "
-          f"({len(ops_to_sweep)} ops × {n_blocks} blocks"
-          f"{f' - {len(done)} done' if done else ''})")
+    print(f"    combos to run: {n_combos}", flush=True)
 
-    print("[2] FP baseline")
+    print("[2] FP baseline", flush=True)
     t0 = time.time()
     fp_results = run_eval(model, test_loader, evaluator, tmp_dir)
-    fp_dt = time.time() - t0
     fp_bbox_ap = fp_results.get("bbox", {}).get("AP", 0.0)
     fp_segm_ap = fp_results.get("segm", {}).get("AP", 0.0)
     print(f"    bbox AP={fp_bbox_ap:.2f}  segm AP={fp_segm_ap:.2f}  "
-          f"({fp_dt:.1f}s)")
+          f"({time.time()-t0:.1f}s)", flush=True)
 
-    # --- Per-(op, block) sweep ---
-    grid = list(done.values())  # keep previously computed rows
+    # --- Sweep ---
+    grid = list(done.values())
     t_sweep = time.time()
     combo_i = 0
 
@@ -112,16 +143,15 @@ def main():
                 continue
             combo_i += 1
 
-            # Reload clean model each time
             del model
             torch.cuda.empty_cache()
             model, test_loader, evaluator, _ = load_model_and_loader(
                 args.n_eval, d2_datasets=args.d2_datasets, ckpt=args.ckpt)
 
-            # SC only this one (op, block)
             spec = {k: [0] * n_blocks for k in SC_OP_NAMES}
             spec[op][bi] = 1
-            sc_patch_eva(model, sc_prec=args.sc_prec, sc_ops_per_block=spec)
+            sc_patch_eva(model, sc_prec=args.sc_prec, stoc_len=args.stoc_len,
+                         sc_ops_per_block=spec)
 
             t0 = time.time()
             results = run_eval(model, test_loader, evaluator, tmp_dir)
@@ -129,64 +159,42 @@ def main():
 
             bbox_ap = results.get("bbox", {}).get("AP", 0.0)
             segm_ap = results.get("segm", {}).get("AP", 0.0)
-            bbox_drop = fp_bbox_ap - bbox_ap
-            segm_drop = fp_segm_ap - segm_ap
-
             row = {
                 "op": op,
                 "block": bi,
                 "bbox_ap": round(bbox_ap, 4),
                 "segm_ap": round(segm_ap, 4),
-                "bbox_ap_drop": round(bbox_drop, 4),
-                "segm_ap_drop": round(segm_drop, 4),
+                "bbox_ap_drop": round(fp_bbox_ap - bbox_ap, 4),
+                "segm_ap_drop": round(fp_segm_ap - segm_ap, 4),
                 "eval_s": round(dt, 1),
             }
             grid.append(row)
             op_rows.append(row)
 
-            eta_s = (time.time() - t_sweep) / combo_i * (n_combos - combo_i)
+            eta = (time.time() - t_sweep) / combo_i * (n_combos - combo_i)
             print(f"  [{combo_i}/{n_combos}] {op:>10s} blk={bi:>2d}  "
-                  f"bbox_AP={bbox_ap:.2f} (Δ={bbox_drop:+.2f})  "
-                  f"segm_AP={segm_ap:.2f} (Δ={segm_drop:+.2f})  "
-                  f"{dt:.0f}s  ETA {eta_s/60:.0f}min", flush=True)
+                  f"bbox_AP={bbox_ap:.2f} (Δ={row['bbox_ap_drop']:+.2f})  "
+                  f"segm_AP={segm_ap:.2f} (Δ={row['segm_ap_drop']:+.2f})  "
+                  f"{dt:.0f}s  ETA {eta/60:.0f}min", flush=True)
 
-            # Incremental save after each combo
-            _save(out_path, args, n_blocks, fp_bbox_ap, fp_segm_ap, grid)
+            save(out_path, args, n_blocks, fp_bbox_ap, fp_segm_ap, grid)
 
         if op_rows:
             drops = [r["bbox_ap_drop"] for r in op_rows]
-            print(f"[{op:>10s}] bbox_AP_drop min={min(drops):.2f} "
-                  f"max={max(drops):.2f}", flush=True)
+            print(f"[{op:>10s}] bbox_drop min={min(drops):+.2f} "
+                  f"max={max(drops):+.2f}", flush=True)
 
-    _save(out_path, args, n_blocks, fp_bbox_ap, fp_segm_ap, grid)
-    total_s = time.time() - t_sweep
-    print(f"\n[done] {total_s/60:.1f} min total, wrote {out_path}")
+    save(out_path, args, n_blocks, fp_bbox_ap, fp_segm_ap, grid)
+    print(f"\n[done] {(time.time()-t_sweep)/60:.1f} min total, "
+          f"wrote {out_path}", flush=True)
 
-    # --- Ranking ---
     ranked = sorted(grid, key=lambda r: r["bbox_ap_drop"], reverse=True)
     print(f"\nTop-20 most sensitive (op, block) by bbox AP drop:")
-    print(f"{'rank':>4s}  {'op':>10s}  {'blk':>3s}  {'bbox_drop':>9s}  {'segm_drop':>9s}")
+    print(f"{'rank':>4s}  {'op':>10s}  {'blk':>3s}  "
+          f"{'bbox_drop':>10s}  {'segm_drop':>10s}")
     for i, r in enumerate(ranked[:20]):
         print(f"{i+1:>4d}  {r['op']:>10s}  {r['block']:>3d}  "
-              f"{r['bbox_ap_drop']:>+9.2f}  {r['segm_ap_drop']:>+9.2f}")
-
-
-def _save(out_path, args, n_blocks, fp_bbox_ap, fp_segm_ap, grid):
-    out = {
-        "config": {
-            "n_eval": args.n_eval,
-            "sc_prec": args.sc_prec,
-            "n_blocks": n_blocks,
-            "op_names": list(SC_OP_NAMES),
-        },
-        "fp_baseline": {
-            "bbox_ap": round(fp_bbox_ap, 4),
-            "segm_ap": round(fp_segm_ap, 4),
-        },
-        "grid": grid,
-    }
-    with open(out_path, "w") as f:
-        json.dump(out, f, indent=2)
+              f"{r['bbox_ap_drop']:>+10.2f}  {r['segm_ap_drop']:>+10.2f}")
 
 
 if __name__ == "__main__":

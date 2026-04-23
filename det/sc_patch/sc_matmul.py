@@ -87,10 +87,12 @@ class SCMatMul(nn.Module):
     def __init__(self, sc_prec: int = 8, mode: str = "bipolar",
                  mp_cfg: "MPConfig | None" = None,
                  adaptive_mp_cfg: "AdaptiveMPConfig | None" = None,
-                 op: "str | None" = None):
+                 op: "str | None" = None,
+                 stoc_len: "int | None" = None):
         super().__init__()
         assert mode in ("bipolar", "unipolar"), mode
         self.sc_prec = sc_prec
+        self.stoc_len = stoc_len
         self.mode = mode
         self.mp_cfg = mp_cfg
         self.adaptive_mp_cfg = adaptive_mp_cfg
@@ -98,7 +100,9 @@ class SCMatMul(nn.Module):
 
     def extra_repr(self) -> str:
         mp = "adaptive" if self.adaptive_mp_cfg else ("static" if self.mp_cfg else "none")
-        return f"sc_prec={self.sc_prec}, mode={self.mode}, op={self.op}, mp={mp}"
+        sl = self.stoc_len if self.stoc_len is not None else (1 << self.sc_prec)
+        return (f"sc_prec={self.sc_prec}, stoc_len={sl}, "
+                f"mode={self.mode}, op={self.op}, mp={mp}")
 
     # ---- active config selection ----
     def _mp(self):
@@ -181,5 +185,6 @@ class SCMatMul(nn.Module):
                     A_flat[i], B_flat[i].transpose(0, 1).contiguous(),
                     group_a=1, group_b=1,
                     mode=self.mode, sc_prec=self.sc_prec, config=cfg,
+                    stoc_len=self.stoc_len,
                 )
         return out_flat.reshape(*lead, M, N).to(A.dtype)

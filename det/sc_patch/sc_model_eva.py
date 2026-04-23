@@ -179,7 +179,8 @@ def sc_patch_eva(model,
                  qk_mode: str = "bipolar",
                  av_mode: str = "bipolar",
                  linear_mp_spec=None,
-                 attn_mp_spec=None):
+                 attn_mp_spec=None,
+                 stoc_len: int | None = None):
     """Swap EVA-ViT primitives with SC versions in place.
 
     Parameters
@@ -235,11 +236,13 @@ def sc_patch_eva(model,
             if sched["qkv_proj"][i] and isinstance(getattr(attn, "qkv", None), nn.Linear):
                 attn.qkv = SCLinear(
                     attn.qkv, sc_prec=sc_prec, mode=proj_mode,
+                    stoc_len=stoc_len,
                     **_det_mp_kwargs(linear_mp, "qkv_proj"))
                 stats["qkv_proj"] += 1
             if sched["out_proj"][i] and isinstance(getattr(attn, "proj", None), nn.Linear):
                 attn.proj = SCLinear(
                     attn.proj, sc_prec=sc_prec, mode=proj_mode,
+                    stoc_len=stoc_len,
                     **_det_mp_kwargs(linear_mp, "out_proj"))
                 stats["out_proj"] += 1
             # matmul1 / matmul2: swap only if current module is the FP MatMul
@@ -249,6 +252,7 @@ def sc_patch_eva(model,
                 if m1 is not None and not isinstance(m1, SCMatMul):
                     attn.matmul1 = SCMatMul(
                         sc_prec=sc_prec, mode=qk_mode, op="qk",
+                        stoc_len=stoc_len,
                         mp_cfg=qk_mp if isinstance(qk_mp, MPConfig) else None,
                         adaptive_mp_cfg=qk_mp if isinstance(qk_mp, AdaptiveMPConfig) else None)
                     stats["qk"] += 1
@@ -257,6 +261,7 @@ def sc_patch_eva(model,
                 if m2 is not None and not isinstance(m2, SCMatMul):
                     attn.matmul2 = SCMatMul(
                         sc_prec=sc_prec, mode=av_mode, op="av",
+                        stoc_len=stoc_len,
                         mp_cfg=av_mp if isinstance(av_mp, MPConfig) else None,
                         adaptive_mp_cfg=av_mp if isinstance(av_mp, AdaptiveMPConfig) else None)
                     stats["av"] += 1
@@ -265,11 +270,13 @@ def sc_patch_eva(model,
             if sched["mlp_fc1"][i] and isinstance(getattr(mlp, "fc1", None), nn.Linear):
                 mlp.fc1 = SCLinear(
                     mlp.fc1, sc_prec=sc_prec, mode=mlp_mode,
+                    stoc_len=stoc_len,
                     **_det_mp_kwargs(linear_mp, "mlp_fc1"))
                 stats["mlp_fc1"] += 1
             if sched["mlp_fc2"][i] and isinstance(getattr(mlp, "fc2", None), nn.Linear):
                 mlp.fc2 = SCLinear(
                     mlp.fc2, sc_prec=sc_prec, mode=mlp_mode,
+                    stoc_len=stoc_len,
                     **_det_mp_kwargs(linear_mp, "mlp_fc2"))
                 stats["mlp_fc2"] += 1
 

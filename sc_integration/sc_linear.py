@@ -101,7 +101,8 @@ def _sym_range(t: torch.Tensor) -> tuple[float, float]:
 
 
 def _sc_linear(x: torch.Tensor, weight: torch.Tensor, bias, sc_prec: int,
-               mode: str = "bipolar", cfg_override: dict = None):
+               mode: str = "bipolar", cfg_override: dict = None,
+               stoc_len: int | None = None):
     """y = x @ weight^T + bias via SC.
 
     mode="bipolar": per-row symmetric quant (|max|), q_max = 2^(sc_prec-1)-1.
@@ -112,6 +113,8 @@ def _sc_linear(x: torch.Tensor, weight: torch.Tensor, bias, sc_prec: int,
 
     ``cfg_override``: when not None, use this SC config instead of the cached
     default — lets the comp use an alternative Sobol scrambling per block.
+    ``stoc_len``: explicit bit-stream length (arbitrary int). When None,
+    kernels fall back to ``2**sc_prec``.
     """
     orig_shape = x.shape
     D_in = orig_shape[-1]
@@ -119,11 +122,13 @@ def _sc_linear(x: torch.Tensor, weight: torch.Tensor, bias, sc_prec: int,
     w = weight.float()  # (D_out, D_in)
     if USE_NOISE_MODEL:
         y = noisy_sc_matmul_grouped(x2, w, group_a=1, group_b=1,
-                                    mode=mode, sc_prec=sc_prec)
+                                    mode=mode, sc_prec=sc_prec,
+                                    stoc_len=stoc_len)
     else:
         cfg = cfg_override if cfg_override is not None else _get_config(D_in, sc_prec)
         y = sc_matmul_grouped_bipolar(x2, w, group_a=1, group_b=1,
-                                      mode=mode, sc_prec=sc_prec, config=cfg)
+                                      mode=mode, sc_prec=sc_prec, config=cfg,
+                                      stoc_len=stoc_len)
     if bias is not None:
         y = y + bias.float()
     y = y.to(x.dtype).reshape(*orig_shape[:-1], w.shape[0])
@@ -277,9 +282,11 @@ class SCLinear(nn.Module):
                  adaptive_mp_cfg: AdaptiveMPConfig | None = None,
                  range_mp_cfg: RangeMPConfig | None = None,
                  range_mp_group_size: int = 0,
-                 operator: str | None = None):
+                 operator: str | None = None,
+                 stoc_len: int | None = None):
         super().__init__()
         self.sc_prec = sc_prec
+        self.stoc_len = stoc_len
         self.mode = mode
         self.weight = linear.weight
         self.bias = linear.bias
@@ -304,7 +311,8 @@ class SCLinear(nn.Module):
                 and self.adaptive_mp_cfg is None):
             # Uniform path — keep cfg_override support (residual compensator).
             return _sc_linear(x, self.weight, self.bias, self.sc_prec,
-                              mode=self.mode, cfg_override=self.cfg_override)
+                              mode=self.mode, cfg_override=self.cfg_override,
+                              stoc_len=self.stoc_len)
         return _sc_linear_mp(
             x, self.weight, self.bias, self.sc_prec, self.mode,
             range_entries=self.range_entries, mp_cfg=self.mp_cfg,
