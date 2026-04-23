@@ -241,6 +241,10 @@ def main():
     ap.add_argument("--sc_config",
                     choices=list(SC_PRESETS) + list(FINE_GRAINED_KS),
                     default="qk_only")
+    ap.add_argument("--sc_ops_per_block_json", default="",
+                    help="Path to a pre-built 5-op sc_ops_per_block JSON "
+                         "(e.g. from build_skip_worst20_json.py). When set, "
+                         "overrides --sc_config's fine-grained lookup.")
     ap.add_argument("--n_calib", type=int, default=256)
     ap.add_argument("--n_eval", type=int, default=500)
     ap.add_argument("--calib_seed", type=int, default=1)
@@ -248,6 +252,9 @@ def main():
     ap.add_argument("--batch_size", type=int, default=8)
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--ridge", type=float, default=1e-4)
+    ap.add_argument("--r2_threshold", type=float, default=0.0,
+                    help="Skip QwT compensation in a block if its fit r2 is "
+                         "<= this threshold. Default 0.0 = original behavior.")
     ap.add_argument("--start_block", type=int, default=0)
     ap.add_argument("--avg_sc_draws", type=int, default=1)
     ap.add_argument("--fwd_chunk", type=int, default=32)
@@ -286,6 +293,14 @@ def main():
     ap.add_argument("--qk_mp_fractions", default="")
     ap.add_argument("--av_mp_levels", default="")
     ap.add_argument("--av_mp_fractions", default="")
+    # adaptive MP (shared with eval.py; unused here, but _build_*_mp_spec
+    # reads these fields unconditionally via args.* attribute access)
+    ap.add_argument("--adaptive_mp", type=int, default=0)
+    ap.add_argument("--adaptive_mp_levels", default="")
+    ap.add_argument("--adaptive_mp_alpha", type=float, default=0.3)
+    ap.add_argument("--adaptive_mp_beta", type=float, default=0.05)
+    ap.add_argument("--adaptive_mp_enable_pruning", type=int, default=1)
+    ap.add_argument("--adaptive_mp_ops", default="")
     args = ap.parse_args()
 
     os.environ.setdefault("XFORMERS_DISABLED", "1")
@@ -298,7 +313,13 @@ def main():
 
     fine_schedule = None
     preset = None
-    if args.sc_config in SC_PRESETS:
+    if args.sc_ops_per_block_json:
+        with open(args.sc_ops_per_block_json) as f:
+            fine_schedule = json.load(f)
+        total_on = sum(sum(v) for v in fine_schedule.values())
+        cfg_desc = (f"external schedule from {args.sc_ops_per_block_json} "
+                    f"({total_on}/120)")
+    elif args.sc_config in SC_PRESETS:
         preset = SC_PRESETS[args.sc_config]
         cfg_desc = f"preset {preset}"
     else:
@@ -417,6 +438,7 @@ def main():
         comp_factory=comp_factory,
         comp_factory_variants=comp_factory_variants,
         comp_refit_iters=0,
+        r2_threshold=args.r2_threshold,
     )
     calib_s = time.time() - t_cal
     print(f"[calib] done in {calib_s:.1f}s", flush=True)
@@ -425,7 +447,37 @@ def main():
     chosen = [r.get("variant") for r in calib_report]
     n_fp_comp = sum(1 for c in chosen if c is not None and c.startswith("fp/"))
     n_sc_comp = len(chosen) - n_fp_comp
-    print(f"[comp] per-block choices: SC={n_sc_comp}  FP={n_fp_comp}", flush=True)
+    n_enabled = sum(1 for r in calib_report if r.get("enabled", True))
+    n_blocks_total = len(calib_report)
+    print(f"[comp] per-block choices: SC={n_sc_comp}  FP={n_fp_comp}  "
+          f"enabled={n_enabled}/{n_blocks_total} (r2_threshold={args.r2_threshold})",
+          flush=True)
+
+    # Corrected eff_sl: scale comp_macs by the fraction of blocks that actually
+    # run compensation after r2-threshold gating. compute_stoc_len_stats above
+    # assumed all blocks get comp; this recomputes the real per-MAC SL average.
+    if args.comp_mode == "sc" and n_blocks_total > 0:
+        _SEQ_C = 257
+        _OP_MACS_C = {
+            "qk":      16 * _SEQ_C * 64 * _SEQ_C,
+            "av":      16 * _SEQ_C * _SEQ_C * 64,
+            "proj":    _SEQ_C * 1024 * 3072 + _SEQ_C * 1024 * 1024,
+            "mlp_fc1": _SEQ_C * 1024 * 4096,
+            "mlp_fc2": _SEQ_C * 4096 * 1024,
+        }
+        _COMP_MACS_C = _SEQ_C * 1024 * 1024
+        main_macs_full = sl_stats["main_macs_B"] * 1e9
+        main_bitops_full = main_macs_full * sl_stats["main_sl"]
+        comp_macs_real = n_enabled * _COMP_MACS_C
+        comp_bitops_real = comp_macs_real * (2 ** args.comp_sc_prec)
+        total_real = main_macs_full + comp_macs_real
+        eff_sl_real = ((main_bitops_full + comp_bitops_real) / total_real
+                       if total_real > 0 else 0)
+        sl_stats["eff_sl_r2corrected"] = round(eff_sl_real, 2)
+        sl_stats["n_enabled_blocks"] = n_enabled
+        sl_stats["comp_macs_real_B"] = round(comp_macs_real / 1e9, 3)
+        print(f"[sl] corrected eff_sl (only {n_enabled} enabled blocks run comp) "
+              f"= {eff_sl_real:.2f}  vs nominal {sl_stats['eff_sl']}", flush=True)
     from collections import Counter
     cnt = Counter([c for c in chosen if c is not None])
     for k, v in cnt.most_common():

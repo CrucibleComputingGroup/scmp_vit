@@ -168,6 +168,9 @@ def main():
     ap.add_argument("--batch_size", type=int, default=8)
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--ridge", type=float, default=1e-2)
+    ap.add_argument("--r2_threshold", type=float, default=0.0,
+                    help="Skip QwT compensation in a block if its fit r2 is "
+                         "<= this threshold. Default 0.0 = original behavior.")
     ap.add_argument("--start_block", type=int, default=0)
     ap.add_argument("--avg_sc_draws", type=int, default=1)
     ap.add_argument("--fwd_chunk", type=int, default=32)
@@ -605,6 +608,7 @@ def main():
             comp_factory=comp_factory,
             comp_factory_variants=comp_factory_variants,
             comp_refit_iters=args.comp_refit_iters,
+            r2_threshold=args.r2_threshold,
         )
     calib_s = time.time() - t_cal
     print(f"[calib] done in {calib_s:.1f}s", flush=True)
@@ -640,6 +644,7 @@ def main():
             "comp_sc_mode": args.comp_sc_mode,
             "comp_refit_iters": args.comp_refit_iters,
             "comp_variant_select": args.comp_variant_select,
+            "r2_threshold": args.r2_threshold,
             "auto_mp_budget_ratio": args.auto_mp_budget_ratio,
             "auto_mp_raw_only": args.auto_mp_raw_only,
             "auto_mp_qk_fixed_stoc_len": args.auto_mp_qk_fixed_stoc_len,
