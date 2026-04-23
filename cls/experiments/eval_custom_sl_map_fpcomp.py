@@ -29,6 +29,15 @@ from sc_integration.mp_linear import MPConfig
 from mp_budget_swap_search import (
     build_active_ops,
 )
+# Reuse the comp factories from qwt_sc_overnight so the QwT compensation block
+# matches the uniform-path behavior bit-for-bit (SC-kernel comp with the same
+# Sobol seed bank, scales, and optional head-aligned per-head routing).
+from qwt_sc_overnight import (
+    make_sc_factory,
+    make_fp_factory,
+    make_head_aligned_factory,
+    build_seed_bank,
+)
 
 _SEQ = 257
 _MACS = {
@@ -228,6 +237,34 @@ def main():
     ap.add_argument("--fwd_chunk", type=int, default=32)
     ap.add_argument("--avg_sc_draws", type=int, default=1)
     ap.add_argument("--start_block", type=int, default=0)
+    ap.add_argument("--r2_threshold", type=float, default=0.0,
+                    help="Skip QwT compensation in a block if its fit r2 is "
+                         "<= this threshold. Matches qwt_sc_overnight semantics.")
+    ap.add_argument("--max_block_for_qwt", type=int, default=10**9,
+                    help="Hard cap: never compensate blocks with index >= this. "
+                         "Matches qwt_sc_overnight semantics.")
+    ap.add_argument("--last_block_r2_threshold", type=float, default=-1.0,
+                    help="Stricter r2 gate for the LAST block only (negative = "
+                         "use --r2_threshold). Matches qwt_sc_overnight semantics.")
+    ap.add_argument("--lookahead_veto", action="store_true",
+                    help="Per-block 1-step binary lookahead. For each block that "
+                         "passes the r2 gate, compare downstream FP propagation "
+                         "with vs without comp and veto apply if skip is better. "
+                         "Matches qwt_sc_overnight semantics.")
+    ap.add_argument("--skip_qwt", action="store_true",
+                    help="Skip QwT calibration; evaluate raw SC model only (sc_raw).")
+    # Comp-block knobs (mirror qwt_sc_overnight.py). Default is SC comp so the
+    # QwT residual runs through the same Sobol/XNOR kernels as the block ops,
+    # matching uniform-path behavior. Pass --comp_mode fp to restore the
+    # historical FP-comp behavior implied by this script's filename.
+    ap.add_argument("--comp_mode", choices=["fp", "sc"], default="sc")
+    ap.add_argument("--comp_sc_prec", type=int, default=8)
+    ap.add_argument("--comp_sc_mode", choices=["bipolar", "unipolar"], default="bipolar")
+    ap.add_argument("--head_aligned", action="store_true",
+                    help="Use HeadAlignedSCLinear (per-head D=64, reuses block QK pool) "
+                         "for SC comp. No effect when --comp_mode fp.")
+    ap.add_argument("--n_heads", type=int, default=16,
+                    help="Head count for HeadAlignedSCLinear; must divide D=1024.")
     ap.add_argument("--out_json", default="results/eval_custom_sl_map_fpcomp.json")
     args = ap.parse_args()
 
@@ -262,35 +299,78 @@ def main():
     model_sc = load_model(device).eval()
     patch_stats = patch_model_with_custom_sl_map(model_sc, args.sc_prec, sl_map)
 
-    t0 = time.time()
-    seed_all(args.calib_seed)
-    calib_report = calibrate_qwt(
-        model_fp=model_fp, model_sc=model_sc,
-        blocks_fp=list(get_blocks(model_fp)),
-        blocks_sc_container=get_blocks(model_sc),
-        calib_loader=calib_loader,
-        device=device,
-        n_calib=args.n_calib,
-        ridge=args.ridge,
-        start_block=args.start_block,
-        fwd_chunk=args.fwd_chunk,
-        avg_sc_draws=args.avg_sc_draws,
-        comp_factory=None,
-        comp_factory_variants=None,
-        comp_refit_iters=0,
-    )
-    calib_s = time.time() - t0
-    print(f"[calib] done in {calib_s:.1f}s", flush=True)
+    results_block: dict = {}
+    calib_report = None
+    calib_s = 0.0
 
-    print("[eval] SC + FP-comp", flush=True)
-    seed_all(args.eval_seed)
-    res_sc_comp = evaluate(model_sc, eval_loader, device)
-    print("[result:sc_comp]", res_sc_comp, flush=True)
+    if args.skip_qwt:
+        print("[eval] SC raw (QwT skipped)", flush=True)
+        seed_all(args.eval_seed)
+        res_sc_raw = evaluate(model_sc, eval_loader, device)
+        print("[result:sc_raw]", res_sc_raw, flush=True)
+        results_block["sc_raw"] = res_sc_raw
+    else:
+        # Build comp factory: single-variant SC (default) or FP fallback. Mirrors
+        # qwt_sc_overnight's single-variant fast path — scale=1.0, polarity=+1.
+        D_resid = 1024
+        if args.comp_mode == "sc":
+            if args.head_aligned:
+                comp_factory = make_head_aligned_factory(
+                    args.comp_sc_prec, args.comp_sc_mode,
+                    n_heads=args.n_heads, cfg_override=None,
+                    scale=1.0, polarity=1,
+                )
+                comp_desc = f"sc/head_aligned/h{args.n_heads}/prec{args.comp_sc_prec}"
+            else:
+                seed_bank = build_seed_bank(D_resid, args.comp_sc_prec, 1)
+                cfg0 = seed_bank[0][1]
+                comp_factory = make_sc_factory(
+                    args.comp_sc_prec, args.comp_sc_mode,
+                    cfg_override=cfg0, scale=1.0, polarity=1,
+                )
+                comp_desc = f"sc/default/prec{args.comp_sc_prec}/{args.comp_sc_mode}"
+        else:
+            comp_factory = make_fp_factory(scale=1.0, polarity=1)
+            comp_desc = "fp"
+        print(f"[comp] factory={comp_desc}", flush=True)
+
+        t0 = time.time()
+        seed_all(args.calib_seed)
+        calib_report = calibrate_qwt(
+            model_fp=model_fp, model_sc=model_sc,
+            blocks_fp=list(get_blocks(model_fp)),
+            blocks_sc_container=get_blocks(model_sc),
+            calib_loader=calib_loader,
+            device=device,
+            n_calib=args.n_calib,
+            ridge=args.ridge,
+            start_block=args.start_block,
+            fwd_chunk=args.fwd_chunk,
+            avg_sc_draws=args.avg_sc_draws,
+            comp_factory=comp_factory,
+            comp_factory_variants=None,
+            comp_refit_iters=0,
+            r2_threshold=args.r2_threshold,
+            max_block_for_qwt=args.max_block_for_qwt,
+            last_block_r2_threshold=(args.last_block_r2_threshold
+                                     if args.last_block_r2_threshold >= 0.0
+                                     else None),
+            lookahead_veto=args.lookahead_veto,
+        )
+        calib_s = time.time() - t0
+        print(f"[calib] done in {calib_s:.1f}s", flush=True)
+
+        print("[eval] SC + FP-comp", flush=True)
+        seed_all(args.eval_seed)
+        res_sc_comp = evaluate(model_sc, eval_loader, device)
+        print("[result:sc_comp]", res_sc_comp, flush=True)
+        results_block["sc_comp"] = res_sc_comp
 
     print("[eval] FP reference", flush=True)
     seed_all(args.eval_seed)
     res_fp = evaluate(model_fp, eval_loader, device)
     print("[result:fp]", res_fp, flush=True)
+    results_block["fp"] = res_fp
 
     out = {
         "config": {
@@ -306,21 +386,33 @@ def main():
             "ridge": args.ridge,
             "start_block": args.start_block,
             "avg_sc_draws": args.avg_sc_draws,
+            "r2_threshold": args.r2_threshold,
+            "max_block_for_qwt": args.max_block_for_qwt,
+            "last_block_r2_threshold": args.last_block_r2_threshold,
+            "lookahead_veto": bool(args.lookahead_veto),
+            "skip_qwt": bool(args.skip_qwt),
+            "comp_mode": args.comp_mode,
+            "comp_sc_prec": args.comp_sc_prec,
+            "comp_sc_mode": args.comp_sc_mode,
+            "head_aligned": bool(args.head_aligned),
+            "n_heads": args.n_heads if args.head_aligned else None,
         },
         "main_sl": main_sl,
         "allocation": summarize_allocation_custom(sl_map, active_ops),
         "per_op_allocation": summarize_per_op_custom(sl_map, active_ops),
         "patch_stats": patch_stats,
-        "calib": {
+        "calib": None if args.skip_qwt else {
             "elapsed_s": calib_s,
             "per_block": calib_report,
         },
-        "results": {
-            "fp": res_fp,
-            "sc_comp": res_sc_comp,
-        },
+        "results": results_block,
         "sl_map": sl_map,
     }
+    if args.skip_qwt:
+        # Mirror raw SC top-1/top-5 at top level so the sweep summarizer
+        # (which treats eval.py-style outputs as "top-level top1") picks it up.
+        out["top1"] = results_block["sc_raw"].get("top1")
+        out["top5"] = results_block["sc_raw"].get("top5")
 
     out_path = Path(args.out_json)
     out_path.parent.mkdir(parents=True, exist_ok=True)

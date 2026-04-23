@@ -255,6 +255,23 @@ def main():
     ap.add_argument("--r2_threshold", type=float, default=0.0,
                     help="Skip QwT compensation in a block if its fit r2 is "
                          "<= this threshold. Default 0.0 = original behavior.")
+    ap.add_argument("--max_block_for_qwt", type=int, default=10**9,
+                    help="Hard cap: never compensate blocks with index >= this. "
+                         "Protects against catastrophic late-block noise injection "
+                         "when a borderline r2 fit is applied to a high-norm output "
+                         "(e.g. pre-norm ViT block 23 at r2~0.5).")
+    ap.add_argument("--last_block_r2_threshold", type=float, default=-1.0,
+                    help="Stricter r2 gate for the LAST block only (negative = "
+                         "use --r2_threshold). Block 23's residual-stream norm is "
+                         "~20x mid-block, so a borderline r2 fit there can inject "
+                         "catastrophic noise into the pre-head embedding. Tighten "
+                         "to 0.7 or 0.9 to let only well-fit comps apply.")
+    ap.add_argument("--lookahead_veto", action="store_true",
+                    help="Per-block 1-step binary lookahead. For each block that "
+                         "passes the r2 gate, propagate both (apply comp) and "
+                         "(skip comp) through block_fp[i+1] and veto apply when "
+                         "skip is closer to the FP reference. Principled "
+                         "replacement for max_block_for_qwt — no magic numbers.")
     ap.add_argument("--start_block", type=int, default=0)
     ap.add_argument("--avg_sc_draws", type=int, default=1)
     ap.add_argument("--fwd_chunk", type=int, default=32)
@@ -439,6 +456,11 @@ def main():
         comp_factory_variants=comp_factory_variants,
         comp_refit_iters=0,
         r2_threshold=args.r2_threshold,
+        max_block_for_qwt=args.max_block_for_qwt,
+        last_block_r2_threshold=(args.last_block_r2_threshold
+                                 if args.last_block_r2_threshold >= 0.0
+                                 else None),
+        lookahead_veto=args.lookahead_veto,
     )
     calib_s = time.time() - t_cal
     print(f"[calib] done in {calib_s:.1f}s", flush=True)
