@@ -730,6 +730,102 @@ wait
 The driver now also reports `main_sl` (main ops only) and `eff_sl`
 (including comp) in both the log summary and JSON (`"stoc_len"` key).
 
+### skip_worst30 sweep across int 6/7/8 + avg192 (`sweep_int678_skip30.sh`)
+
+Full 14-config matrix at `K=30` (drop the 30 worst `(op, block)` cells
+from the SC schedule): **`{p6=SL64, p7=SL128, p8=SL256, avg192=mean-192} ×
+{uniform, MP} × {QwT off, QwT on at r²=0.5}`**. Runs 4-way parallel with
+pool-based scheduling (handles per-GPU exclusive-mode contention via <60 s
+death detection). `N_EVAL=1000`, `N_CALIB=1024`.
+
+**Config matrix**
+
+| tag    | mode    | sc_prec | levels              | fractions                 |
+|--------|---------|:-:|---------------------|---------------------------|
+| p6     | uniform | 6 | — (uniform SL=64)   | —                         |
+| p6     | mp      | 7 | `128,64,32,16`      | `0.15,0.575,0.225,0.05`   |
+| p7     | uniform | 7 | — (uniform SL=128)  | —                         |
+| p7     | mp      | 8 | `256,128,64,32`     | `0.15,0.575,0.225,0.05`   |
+| p8     | uniform | 8 | — (uniform SL=256)  | —                         |
+| avg192 | mp      | 8 | `256,128,64,32`     | `0.575,0.3,0.075,0.05`    |
+| avg192 | uniform | 8 | `192` (every block) | `1.0`                     |
+
+MP applies to all 6 ops: `mlp_fc1, mlp_fc2, qkv_proj, out_proj` via
+`--mp_*`, plus `qk, av` via `--qk_mp_* / --av_mp_*`. `avg192 uniform` uses
+SC early termination to put SL=192 on every block — implemented via the MP
+path with a single level `[192]` because `--sc_prec` only accepts pow2
+ints. All QwT runs use `--r2_threshold 0.5 --comp_sc_prec 8 --skip_baseline`.
+
+**Prereqs.** Build schedule JSONs from the raw per-operator sensitivity
+data (`cls/sensitivity/sensitivity_per_operator_real_sc_p{6,7,8}.json`):
+
+```bash
+python cls/experiments/build_skip_worst20_json.py \
+    --k 30 \
+    --sens_dir cls/sensitivity \
+    --out_dir cls/sensitivity/skip_worst30
+```
+
+Produces `skip_worst30_p{6,7,8}.json` (5-op × 24-block 0/1 schedules).
+Change `--k` for other drop counts (20, 40, …).
+
+**Launch.** From the repo root, detached on a 4-GPU node:
+
+```bash
+ssh -f <gpu-node> "cd $(pwd)/cls && \
+    mkdir -p logs/sweep_int678_k30 results/sweep_int678_k30 && \
+    nohup bash experiments/sweep_int678_skip30.sh \
+    </dev/null >logs/sweep_int678_k30/driver.log 2>&1"
+```
+
+ETA ~1.5–2 h. Output: `cls/results/sweep_int678_k30/{tag}_{mode}_qwt{off,on}.json`
+(14 files). Per-run logs in `cls/logs/sweep_int678_k30/`.
+
+**One-off launcher for missing configs (`run_avg192u_k30.sh`).** If the
+main sweep finishes before the two `avg192 uniform` configs were added to
+`RUNS`, this launches just those two in parallel on GPUs 0+1 (qwtoff, qwton)
+without touching the main driver:
+
+```bash
+ssh -f <gpu-node> "cd $(pwd)/cls && \
+    nohup bash experiments/run_avg192u_k30.sh \
+    </dev/null >logs/sweep_int678_k30/avg192u_driver.log 2>&1"
+```
+
+**Scheduling note.** `RUNS` launches in fixed order; when long MP+QwT jobs
+(~60 min) end up at the tail, 3 GPUs can sit idle for ~20 min while the
+last job finishes. For ~25 % less wall-clock, reorder longest-first (LPT):
+put the MP+QwT entries at the head of `RUNS`, then MP+no-QwT, then
+uniform+QwT, then uniform+no-QwT (optimal = `sum(task_times) / 4 ≈ 72 min`
+vs observed ~105 min in fixed order).
+
+**Known failure mode at r²=0.5 + MP + QwT.** Some MP+QwT configs collapse
+to `top1 ≈ 0`. The r² gate (`r² > 0.5`) can spuriously fire on block 23,
+whose residual-stream magnitude is ~20× larger than mid-block, injecting
+a ~0.8-magnitude wrong-direction correction that destroys classification.
+**Not a bug** — raise `--r2_threshold 0.7` to reject borderline blocks, or
+add `--max_block_for_qwt 20` (needs arg plumbing in
+`qwt_sc_overnight.py`), or implement a 1-step lookahead gate in the
+QwT-SC fork's `compensation.py`.
+
+**Headline numbers** (N=1000, K=30, skip_worst30_p{6,7,8}):
+
+| Config              | SL     | Raw SC  | + QwT (r²=0.5) |
+|---------------------|:-:|---:|---:|
+| p6 uniform          | 64    |  0.00% |  0.10% (SL=64 below SC accuracy floor) |
+| p7 uniform          | 128   | 78.80% | 80.90% |
+| p8 uniform          | 256   | 84.60% | 84.90% |
+| **avg192 uniform**  | **192** | **85.40%** | _(add-on run)_ |
+| p6 mp               | 64ish | 0.00%  |  0.10% |
+| p7 mp               | 128ish | 75.70% |  0.10% (block-23 collapse) |
+| avg192 mp           | 192 avg | 76.20% | 76.20% |
+
+Scaling takeaway at K=30: `avg192_uniform` (SL=192 everywhere, ~7.58-bit
+precision via SC early termination) hits **85.40%**, edging out `p8_uniform`
+(SL=256, 84.60%) at ~25 % fewer bit-ops per op. Uniform SL=192 also beats
+all avg-192 MP mixtures by ~9 pts — uniformity at the precision floor is
+preferable to an MP distribution with the same mean on this model.
+
 ### Hardware framing
 
 For an SC accelerator, the relevant cost is **SC ops removed from the FP
@@ -797,6 +893,11 @@ cls/                                 Classification (DINOv2 ViT-L/14 on ImageNet
         mlp_onebyone.py              MLP first-N / last-N block sensitivity sweep
         calibrate_noise_model.py     Calibrate surrogate correction factor against real SC
         qwt_sc_compensation.py       QwT-style residual compensation driver (uses QwT-SC submodule)
+        qwt_sc_overnight.py          Overnight QwT driver with MP + fine-grained schedule + eff_sl
+        build_skip_worst20_json.py   Build skip_worst{K} per-precision schedule JSONs
+        sweep_int678_skip30.sh       14-config sweep: int6/7/8 + avg192 × {uniform,mp} × {QwT off,on}
+        run_avg192u_k30.sh           One-off launcher for avg192_uniform qwt{off,on} on GPUs 0+1
+    sensitivity/skip_worst{K}/       Generated per-K schedule JSONs (build via build_skip_worst20_json.py --k K)
     results/                         Per-run JSON (top-1, top-5, sensitivity data, qwt_sc_*)
 sc/                                  SC kernels (Triton XNOR matmul, Sobol RNG, configs)
 sc_integration/                      SC matmul wrappers + calibrated noise surrogate
