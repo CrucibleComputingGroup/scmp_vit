@@ -730,6 +730,94 @@ wait
 The driver now also reports `main_sl` (main ops only) and `eff_sl`
 (including comp) in both the log summary and JSON (`"stoc_len"` key).
 
+### Per-(op, block) coarse-grained runs
+
+For the coarse-grained experiments, each active `(op, block)` gets a
+single scalar `stoc_len`. This is the `fraction_units=1` / `n_bins=1`
+case in [cls/experiments/mp_budget_swap_search.py](cls/experiments/mp_budget_swap_search.py).
+Search uses only a calibration-time local proxy; end-to-end top-1 is
+used only for the final evaluation.
+
+Current `skip_worst30` scalar recipe under `post-drop main_sl = 128`:
+
+- `qk = 128`
+- `av = 128`
+- `fc2 >= 192`
+- search only `proj, mlp_fc1, mlp_fc2`
+- levels: `64,96,128,192,256`
+- proxy: `comp_residual`
+
+Run the coarse search:
+
+```bash
+python cls/experiments/mp_budget_swap_search.py \
+    --sc_config skip_worst30 \
+    --target_main_sl 128 \
+    --levels 64,96,128,192,256 \
+    --search_ops proj,mlp_fc1,mlp_fc2 \
+    --fixed_ops qk=128,av=128 \
+    --op_min_levels mlp_fc2=192 \
+    --proxy comp_residual \
+    --init_mode uniform_repair \
+    --init_level 128 \
+    --n_search 32 \
+    --search_seed 1 \
+    --max_iters 4 \
+    --out_json results/best_skip_worst30_mainsl128_alloc_seed1_i4.json
+```
+
+Evaluate a searched map with the official FP compensator:
+
+```bash
+python cls/experiments/eval_custom_sl_map_fpcomp.py \
+    --sc_config skip_worst30 \
+    --sl_map_json results/best_skip_worst30_mainsl128_alloc_seed1_i4.json \
+    --n_calib 128 \
+    --n_eval 500 \
+    --out_json results/best_skip_worst30_mainsl128_alloc_fpcomp500.json
+```
+
+Uniform baseline under the same `post-drop main_sl = 128` budget:
+
+```bash
+python cls/experiments/eval_custom_sl_map_fpcomp.py \
+    --sc_config skip_worst30 \
+    --uniform_sl 128 \
+    --n_calib 128 \
+    --n_eval 500 \
+    --out_json results/skip_worst30_uniform128_fpcomp500.json
+```
+
+Notes:
+
+- `post-drop main_sl` means the MAC-weighted average `stoc_len` over the
+  active SC `(op, block)` pairs after `skip_worst30`. Dropped pairs stay
+  FP and are not included in this average.
+- Coarse-grained search is the default because `--fraction_units`
+  defaults to `1`. To stay in the coarse regime, do not set
+  `--fraction_units > 1`.
+
+Optional split-`proj` heuristic from FP profiling:
+
+```bash
+python cls/experiments/build_profiled_split_proj_map.py \
+    --profile_json results/e2e/amax_row_block_table_fp_500.json \
+    --base_map_json results/best_skip_worst30_mainsl128_alloc_seed1_i4.json \
+    --out_json results/profiled_split_proj_map_main128.json
+
+python cls/experiments/eval_custom_sl_map_fpcomp.py \
+    --sc_config skip_worst30 \
+    --sl_map_json results/profiled_split_proj_map_main128.json \
+    --n_calib 128 \
+    --n_eval 500 \
+    --out_json results/profiled_split_proj_map_main128_fpcomp500.json
+```
+
+The builder keeps the validated scalar `qk / av / fc1 / fc2` settings,
+splits `proj` into `qkv_proj` and `out_proj`, keeps `out_proj` at
+uniform `128`, and assigns `qkv_proj` levels from FP `amax`
+heterogeneity.
+
 ### skip_worst30 sweep across int 6/7/8 + avg192 (`sweep_int678_skip30.sh`)
 
 Full 14-config matrix at `K=30` (drop the 30 worst `(op, block)` cells
