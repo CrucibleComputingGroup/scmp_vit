@@ -12,14 +12,17 @@ Design choices for the current implementation:
 * Search can operate at two granularities:
   - per-(op, block) scalar stoc_len
   - per-(op, block) fraction units
-* Fraction units are an internal search discretization for each (op, block).
-  At runtime they collapse into an op-specific ``MPConfig(levels, fractions)``,
-  and the existing per-op metric decides which rows / heads get the higher
-  precision.
+* When ``fraction_units > 1``, each searchable ``(op, block)`` carries its own
+  per-op / per-block fraction vector. At runtime this becomes an
+  op-specific ``MPConfig(levels, fractions)``, and the existing per-op metric
+  decides which rows / heads get the higher precision.
 * The search operates on zero-budget pairwise swaps:
   - one searchable unit upgrades by one discrete step
   - another searchable unit downgrades by the same step
   - total main budget is preserved exactly
+* Fraction search can optionally re-score top candidate pairs jointly, with a
+  short downstream lookahead, instead of relying only on the sum of two
+  single-move local scores.
 * ``qk`` / ``av`` can be fixed and kept out of the search.
 
 Typical usage:
@@ -867,6 +870,156 @@ def build_current_spec(sl_map: dict[str, list], block_idx: int) -> dict[str, obj
     return spec
 
 
+def _apply_unit_to_spec(spec: dict[str, object], unit: tuple, new_sl: int) -> None:
+    op = str(unit[0])
+    if len(unit) >= 3:
+        bins = list(_entry_bins(spec[op]))
+        bins[int(unit[2])] = int(new_sl)
+        spec[op] = bins
+    else:
+        spec[op] = int(new_sl)
+
+
+def score_block_range(
+    *,
+    start_block: int,
+    end_block: int,
+    fp_blocks: list[nn.Module],
+    x_start_cpu: torch.Tensor,
+    block_specs: dict[int, dict[str, object]],
+    sc_prec: int,
+    proxy: str,
+    ridge: float,
+    device: torch.device,
+    fwd_chunk: int,
+    block_weight: dict[int, float],
+) -> float:
+    total = 0.0
+    x_fp_cpu = x_start_cpu
+    x_sc_cpu = x_start_cpu
+
+    for bi in range(start_block, end_block + 1):
+        fp_blk_dev = copy.deepcopy(fp_blocks[bi]).to(device).eval()
+        y_fp_cpu = forward_block_batched(fp_blk_dev, x_fp_cpu, device, fwd_chunk)
+        del fp_blk_dev
+        torch.cuda.empty_cache()
+
+        sc_blk = patch_block_with_spec(fp_blocks[bi], sc_prec, block_specs[bi]).to(device).eval()
+        y_sc_cpu = forward_block_batched(sc_blk, x_sc_cpu, device, fwd_chunk)
+        score = compute_proxy_score(
+            proxy=proxy,
+            x_cpu=x_sc_cpu,
+            y_fp_cpu=y_fp_cpu,
+            y_sc_cpu=y_sc_cpu,
+            device=device,
+            ridge=ridge,
+        )
+        total += float(block_weight.get(bi, 1.0)) * float(score)
+        del sc_blk
+        torch.cuda.empty_cache()
+
+        x_fp_cpu = y_fp_cpu
+        x_sc_cpu = y_sc_cpu
+
+    return float(total)
+
+
+def refine_pair_candidates(
+    *,
+    sl_map: dict[str, list],
+    fp_blocks: list[nn.Module],
+    x_by_block: list[torch.Tensor],
+    upgrades_by_step: dict[int, list[dict[str, object]]],
+    downgrades_by_step: dict[int, list[dict[str, object]]],
+    block_weight: dict[int, float],
+    sc_prec: int,
+    proxy: str,
+    ridge: float,
+    device: torch.device,
+    fwd_chunk: int,
+    pair_eval_topk: int,
+    lookahead_blocks: int,
+) -> Optional[dict[str, object]]:
+    if pair_eval_topk <= 0:
+        return None
+
+    nb = len(fp_blocks)
+    base_specs = {bi: build_current_spec(sl_map, bi) for bi in range(nb)}
+    current_cache: dict[tuple[int, int], float] = {}
+    best_pair = None
+    best_delta = 0.0
+
+    for step, upgrades in upgrades_by_step.items():
+        downgrades = downgrades_by_step.get(step, [])
+        if not downgrades:
+            continue
+
+        top_upgrades = sorted(upgrades, key=lambda x: float(x["delta_score"]))[:pair_eval_topk]
+        top_downgrades = sorted(downgrades, key=lambda x: float(x["delta_score"]))[:pair_eval_topk]
+
+        for up in top_upgrades:
+            for down in top_downgrades:
+                if up["slot"] == down["slot"]:
+                    continue
+
+                start_block = min(int(up["block"]), int(down["block"]))
+                end_block = min(
+                    nb - 1,
+                    max(int(up["block"]), int(down["block"])) + int(lookahead_blocks),
+                )
+                key = (start_block, end_block)
+                if key not in current_cache:
+                    current_cache[key] = score_block_range(
+                        start_block=start_block,
+                        end_block=end_block,
+                        fp_blocks=fp_blocks,
+                        x_start_cpu=x_by_block[start_block],
+                        block_specs=base_specs,
+                        sc_prec=sc_prec,
+                        proxy=proxy,
+                        ridge=ridge,
+                        device=device,
+                        fwd_chunk=fwd_chunk,
+                        block_weight=block_weight,
+                    )
+
+                pair_specs = {
+                    bi: {
+                        k: (list(v) if isinstance(v, list) else int(v))
+                        for k, v in spec.items()
+                    }
+                    for bi, spec in base_specs.items()
+                }
+                _apply_unit_to_spec(pair_specs[int(up["block"])], tuple(up["slot"]), int(up["new_sl"]))
+                _apply_unit_to_spec(pair_specs[int(down["block"])], tuple(down["slot"]), int(down["new_sl"]))
+
+                pair_score = score_block_range(
+                    start_block=start_block,
+                    end_block=end_block,
+                    fp_blocks=fp_blocks,
+                    x_start_cpu=x_by_block[start_block],
+                    block_specs=pair_specs,
+                    sc_prec=sc_prec,
+                    proxy=proxy,
+                    ridge=ridge,
+                    device=device,
+                    fwd_chunk=fwd_chunk,
+                    block_weight=block_weight,
+                )
+                pair_delta = float(pair_score - current_cache[key])
+                if best_pair is None or pair_delta < best_delta:
+                    best_delta = pair_delta
+                    best_pair = {
+                        "step": step,
+                        "upgrade": up,
+                        "downgrade": down,
+                        "delta_score": pair_delta,
+                        "pair_scope": [start_block, end_block],
+                    }
+
+    return best_pair
+
+
 def iterative_swap_search(
     *,
     active_ops: set[tuple[str, int]],
@@ -883,6 +1036,8 @@ def iterative_swap_search(
     fwd_chunk: int,
     cache_dtype: torch.dtype,
     n_bins: int,
+    pair_eval_topk: int,
+    lookahead_blocks: int,
     log_fn=print,
 ) -> tuple[dict[str, list], list[dict[str, object]], dict[str, object]]:
     sens_map = load_sensitivity()
@@ -937,11 +1092,9 @@ def iterative_swap_search(
                 elif cand["delta_sl"] < 0:
                     downgrades_by_step[step].append(cand)
 
-        del model_fp, fp_blocks, x_by_block
-        torch.cuda.empty_cache()
-
         best_pair = None
         best_delta = 0.0
+        used_pair_refine = False
         for step, upgrades in upgrades_by_step.items():
             downgrades = downgrades_by_step.get(step, [])
             if not downgrades:
@@ -958,7 +1111,33 @@ def iterative_swap_search(
                             "upgrade": up,
                             "downgrade": down,
                             "delta_score": pair_delta,
+                            "pair_scope": [min(int(up["block"]), int(down["block"])),
+                                           max(int(up["block"]), int(down["block"]))],
                         }
+
+        if pair_eval_topk > 0:
+            refined_pair = refine_pair_candidates(
+                sl_map=sl_map,
+                fp_blocks=fp_blocks,
+                x_by_block=x_by_block,
+                upgrades_by_step=upgrades_by_step,
+                downgrades_by_step=downgrades_by_step,
+                block_weight=block_weight,
+                sc_prec=sc_prec,
+                proxy=proxy,
+                ridge=ridge,
+                device=device,
+                fwd_chunk=fwd_chunk,
+                pair_eval_topk=pair_eval_topk,
+                lookahead_blocks=lookahead_blocks,
+            )
+            if refined_pair is not None:
+                best_pair = refined_pair
+                best_delta = float(refined_pair["delta_score"])
+                used_pair_refine = True
+
+        del model_fp, fp_blocks, x_by_block
+        torch.cuda.empty_cache()
 
         actual_main = compute_main_sl(sl_map, active_ops)
         iteration_meta = {
@@ -966,6 +1145,9 @@ def iterative_swap_search(
             "actual_main_sl": actual_main,
             "patch_stats": patch_stats,
             "block_reports": block_reports,
+            "pair_eval_topk": int(pair_eval_topk),
+            "lookahead_blocks": int(lookahead_blocks),
+            "used_pair_refine": bool(used_pair_refine),
             "elapsed_s": round(time.time() - t0, 2),
         }
         log_fn(f"[swap_search] iter={it} main_sl={actual_main:.2f} "
@@ -983,6 +1165,8 @@ def iterative_swap_search(
             "iter": it,
             "delta_score": float(best_pair["delta_score"]),
             "step": int(best_pair["step"]),
+            "pair_scope": list(best_pair.get("pair_scope", [])),
+            "used_pair_refine": bool(used_pair_refine),
             "upgrade": {
                 "slot": list(up["slot"]),
                 "old_sl": int(up["old_sl"]),
@@ -1040,6 +1224,15 @@ def main():
     ap.add_argument("--n_search", type=int, default=32)
     ap.add_argument("--search_seed", type=int, default=1)
     ap.add_argument("--max_iters", type=int, default=8)
+    ap.add_argument("--pair_eval_topk", type=int, default=-1,
+                    help="Jointly re-score the top-K upgrade and downgrade "
+                         "candidates instead of relying only on the sum of "
+                         "single-move scores. Default: 0 for scalar search, "
+                         "8 for fraction search.")
+    ap.add_argument("--lookahead_blocks", type=int, default=-1,
+                    help="When joint pair refinement is enabled, include this "
+                         "many downstream blocks in the proxy score. Default: "
+                         "0 for scalar search, 1 for fraction search.")
     ap.add_argument("--ridge", type=float, default=1e-2)
     ap.add_argument("--fwd_chunk", type=int, default=16)
     ap.add_argument("--cache_dtype", default="float16",
@@ -1069,6 +1262,14 @@ def main():
             bin_ops = set(search_ops)
     else:
         bin_ops = set()
+    if args.pair_eval_topk >= 0:
+        pair_eval_topk = int(args.pair_eval_topk)
+    else:
+        pair_eval_topk = 8 if args.fraction_units > 1 else 0
+    if args.lookahead_blocks >= 0:
+        lookahead_blocks = int(args.lookahead_blocks)
+    else:
+        lookahead_blocks = 1 if args.fraction_units > 1 else 0
     fixed_ops = _parse_int_map(args.fixed_ops)
     op_min_levels = _parse_int_map(args.op_min_levels)
     op_max_levels = _parse_int_map(args.op_max_levels)
@@ -1135,6 +1336,8 @@ def main():
         fwd_chunk=args.fwd_chunk,
         cache_dtype=cache_dtype,
         n_bins=args.fraction_units,
+        pair_eval_topk=pair_eval_topk,
+        lookahead_blocks=lookahead_blocks,
     )
 
     final_main = compute_main_sl(final_sl_map, active_ops)
@@ -1152,6 +1355,8 @@ def main():
         "op_max_levels": op_max_levels,
         "n_search": args.n_search,
         "search_seed": args.search_seed,
+        "pair_eval_topk": pair_eval_topk,
+        "lookahead_blocks": lookahead_blocks,
         "init_sl_map_json": args.init_sl_map_json,
         "init_meta": init_meta,
         "history": history,
