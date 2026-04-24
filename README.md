@@ -316,8 +316,8 @@ python eval.py --mode sc --sc_ops mlp_fc1,mlp_fc2,proj ...
 `experiments/sensitivity_all_ops.py` builds a 24×5 per-(op, block) sensitivity
 matrix using a calibrated Sobol-SC noise surrogate (closed-form Gaussian
 approximation, ~100× faster than real SC — see `sc_integration/noise_matmul.py`).
-`experiments/e2e_fine_grained.py` takes that matrix, ranks all 120 (op, block)
-pairs by logit-L2 drift, and runs real SC schedules that skip the top-K worst.
+That matrix ranks all 120 (op, block) pairs by logit-L2 drift; real SC
+schedules below skip the top-K worst.
 
 Real SC, bipolar, `sc_prec=8`, DINOv2 ViT-L/14 + linear head, 500 val images:
 
@@ -639,9 +639,6 @@ python experiments/qwt_sc_overnight.py \
     --comp_mode sc --n_variants 4 --w_scales 0.5,0.75,1.0 \
     --head_aligned --n_heads 16 --skip_baseline \
     --out_json results/pure_sc_qk_only_combined_pureSC.json
-
-# Batch all four sc_configs + ablations (≈2 hours on a 4080):
-bash experiments/run_overnight_pure_sc.sh
 ```
 
 **Driver flags (head-aligned):**
@@ -906,17 +903,6 @@ ssh -f <gpu-node> "cd $(pwd)/cls && \
 ETA ~1.5–2 h. Output: `cls/results/sweep_int678_k30/{tag}_{mode}_qwt{off,on}.json`
 (14 files). Per-run logs in `cls/logs/sweep_int678_k30/`.
 
-**One-off launcher for missing configs (`run_avg192u_k30.sh`).** If the
-main sweep finishes before the two `avg192 uniform` configs were added to
-`RUNS`, this launches just those two in parallel on GPUs 0+1 (qwtoff, qwton)
-without touching the main driver:
-
-```bash
-ssh -f <gpu-node> "cd $(pwd)/cls && \
-    nohup bash experiments/run_avg192u_k30.sh \
-    </dev/null >logs/sweep_int678_k30/avg192u_driver.log 2>&1"
-```
-
 **Scheduling note.** `RUNS` launches in fixed order; when long MP+QwT jobs
 (~60 min) end up at the tail, 3 GPUs can sit idle for ~20 min while the
 last job finishes. For ~25 % less wall-clock, reorder longest-first (LPT):
@@ -1064,15 +1050,18 @@ cls/                                 Classification (DINOv2 ViT-L/14 on ImageNet
     imagenet_parquet.py              ImageFolder-style dataset over HF parquet shards
     sc_attention_patch.py            DINOv2 patcher: per-block per-op SC schedule support
     experiments/                     Sensitivity sweeps + end-to-end configs
-        sensitivity_all_ops.py       24 x 5 per-(op, block) sensitivity matrix
-        e2e_fine_grained.py          Real-SC eval of sc_skip_worstK schedules
-        mlp_onebyone.py              MLP first-N / last-N block sensitivity sweep
-        calibrate_noise_model.py     Calibrate surrogate correction factor against real SC
+        sensitivity_all_ops.py       24 x 5 per-(op, block) sensitivity matrix (noise surrogate)
+        sensitivity_per_operator_real_sc.py  6 x 24 per-(op, block) sensitivity matrix (real SC)
         qwt_sc_compensation.py       QwT-style residual compensation driver (uses QwT-SC submodule)
         qwt_sc_overnight.py          Overnight QwT driver with MP + fine-grained schedule + eff_sl
+        eval_custom_sl_map_fpcomp.py Evaluate a custom sl_map with QwT compensation
+        mp_budget_swap_search.py     Budget-preserving MP sl_map search (local proxy, no E2E eval)
         build_skip_worst20_json.py   Build skip_worst{K} per-precision schedule JSONs
+        build_profiled_split_proj_map.py  FP-amax heuristic split-proj sl_map builder
+        mp_uniform_vs_fine.py        Uniform vs sensitivity-aware per-(op,block) MP comparison
         sweep_int678_skip30.sh       14-config sweep: int6/7/8 + avg192 × {uniform,mp} × {QwT off,on}
-        run_avg192u_k30.sh           One-off launcher for avg192_uniform qwt{off,on} on GPUs 0+1
+        gate_mp_sweep.sh             Gate × MP-map sweep (r2 × rmse_margin × comp_mode × map)
+        opt1_cap20_mini.sh, opt2_lookahead_mini.sh  QwT gating ablations over prod sl_maps
     sensitivity/skip_worst{K}/       Generated per-K schedule JSONs (build via build_skip_worst20_json.py --k K)
     results/                         Per-run JSON (top-1, top-5, sensitivity data, qwt_sc_*)
 sc/                                  SC kernels (Triton XNOR matmul, Sobol RNG, configs)
