@@ -887,32 +887,83 @@ put the MP+QwT entries at the head of `RUNS`, then MP+no-QwT, then
 uniform+QwT, then uniform+no-QwT (optimal = `sum(task_times) / 4 ≈ 72 min`
 vs observed ~105 min in fixed order).
 
-**Known failure mode at r²=0.5 + MP + QwT.** Some MP+QwT configs collapse
-to `top1 ≈ 0`. The r² gate (`r² > 0.5`) can spuriously fire on block 23,
-whose residual-stream magnitude is ~20× larger than mid-block, injecting
-a ~0.8-magnitude wrong-direction correction that destroys classification.
-**Not a bug** — raise `--r2_threshold 0.7` to reject borderline blocks, or
-add `--max_block_for_qwt 20` (needs arg plumbing in
-`qwt_sc_overnight.py`), or implement a 1-step lookahead gate in the
-QwT-SC fork's `compensation.py`.
+#### QwT compensation gate — the block-23 collapse and how to avoid it
 
-**Headline numbers** (N=1000, K=30, skip_worst30_p{6,7,8}):
+Early runs at `--r2_threshold 0.5` exposed a catastrophic failure where
+some MP+QwT configs collapsed to `top1 ≈ 0`. Root cause: block 23's
+residual-stream magnitude is ~20× larger than mid-block (pre-norm
+transformer compound effect), so a **borderline-r² comp at block 23**
+injects a ~0.8-magnitude wrong-direction correction into the pre-head
+embedding and destroys classification. The same mechanism can also
+manifest as compounded noise across multiple late blocks at aggressive
+thresholds (r²=0.0 / 0.3).
 
-| Config              | SL     | Raw SC  | + QwT (r²=0.5) |
-|---------------------|:-:|---:|---:|
-| p6 uniform          | 64    |  0.00% |  0.10% (SL=64 below SC accuracy floor) |
-| p7 uniform          | 128   | 78.80% | 80.90% |
-| p8 uniform          | 256   | 84.60% | 84.90% |
-| **avg192 uniform**  | **192** | **85.40%** | _(add-on run)_ |
-| p6 mp               | 64ish | 0.00%  |  0.10% |
-| p7 mp               | 128ish | 75.70% |  0.10% (block-23 collapse) |
-| avg192 mp           | 192 avg | 76.20% | 76.20% |
+Three gating knobs now exist in `qwt_sc_overnight.py` and
+`eval_custom_sl_map_fpcomp.py` to handle it:
 
-Scaling takeaway at K=30: `avg192_uniform` (SL=192 everywhere, ~7.58-bit
-precision via SC early termination) hits **85.40%**, edging out `p8_uniform`
-(SL=256, 84.60%) at ~25 % fewer bit-ops per op. Uniform SL=192 also beats
-all avg-192 MP mixtures by ~9 pts — uniformity at the precision floor is
-preferable to an MP distribution with the same mean on this model.
+| flag | what it does | when to use |
+|---|---|---|
+| `--r2_threshold T` | Enable comp only for blocks with fit r² > T. | Primary knob. `0.5` is the safe universal default. |
+| `--last_block_r2_threshold T_last` | Stricter gate *only for the last block*. Protects the pre-head embedding without sweeping all blocks under one conservative bar. | Pair with any aggressive `r2_threshold`. `0.9` is our default. |
+| `--lookahead_veto` | 1-step binary lookahead: for every block that passes the r² gate, propagate `sc_out` vs `sc_out + comp` through `block_fp[i+1]` and veto apply when skip is closer to FP. Last block is exempt (no downstream block) — use `last_block_r2_threshold` there. | Cheap (~1 min extra per QwT calibration). Catches borderline-fit comps whose injected noise amplifies into block i+1. |
+| `--max_block_for_qwt N` | Hard cap: never compensate blocks ≥ N. Blunt but trivial. | Fallback for very aggressive gates. Superseded by `last_block_r2_threshold` in most cases. |
+
+**Recommended production recipe (and what the sweep now uses):**
+
+```
+--r2_threshold 0.5
+--last_block_r2_threshold 0.9
+--lookahead_veto
+--comp_mode sc --comp_sc_prec 8 --ridge 1e-4
+```
+
+**Headline numbers at N=50,000 (ImageNet val), K=30:**
+
+| Config | Raw SC | + QwT (prod r²=0.7) | + QwT (opt3 r²=0.5 + last=0.9 + lookahead) | Δ (opt3 vs raw) |
+|---|---:|---:|---:|---:|
+| p7 uniform (SL=128)     | 78.94 % | 78.94 %            | **81.10 %** (N=1k)¹ | **+2.16** ⭐ |
+| p7 mp (search-driven)   | 79.89 % | 79.89 %            | **79.90 %** (N=1k)¹ | +0.01 |
+| p8 uniform (SL=256)     | 85.57 % | 85.73 %            | **84.90 %** (N=1k)¹ | −0.67 |
+| avg192 uniform (SL=192) | 84.67 % | 84.67 %            | **85.10 %** (N=1k)¹ | +0.43 |
+| avg192 mp (SL≈192)      | 84.62 % | 84.62 %            | **84.00 %** (N=1k)¹ | −0.62 |
+
+¹ opt3 column is from the N=1,000 mini-sweep; prod N=50k rerun at opt3
+is still the natural next step if this recipe is committed.
+
+**Ablation at more aggressive thresholds** (N=1000, mini-sweep):
+
+| Config | opt2 la r²=0.5 | opt2 la r²=0.3 | opt3 la+last0.9 r²=0.3 |
+|---|---:|---:|---:|
+| p7 uniform    | 81.10 % | **83.30 %** ⭐ +4.36 | **83.30 %** (same) |
+| p8 uniform    | 84.90 % | 0.10 % ❌ | 0.10 % ❌ (collapse not block-23-only) |
+| avg192 uniform| 85.10 % | 0.00 % ❌ | 0.00 % ❌ (same) |
+| p7 mp         | 79.90 % | 82.00 %  | (did not rerun) |
+| avg192 mp     | (n/a)   | 84.60 %  | (did not rerun) |
+
+**Interpretation.**
+
+- At **r²=0.5**, block 23's fit r² is empirically below 0.5 in every
+  K=30 config we measured (0.28–0.35), so the primary gate already
+  skips block 23. `last_block_r2_threshold=0.9` is a cheap safety net
+  for configs where block 23 might sneak through at lower thresholds.
+- At **r²=0.3**, block 23 can clear the gate in some configs. The
+  last-block threshold **successfully saves p7_uniform (+4.36 pt)** but
+  does **not save p8_uniform / avg192_uniform** — their collapse is
+  compounded noise across many mid-network comps, not a single-block
+  pathology. Confirmed empirically: block 23 correctly shows
+  `enabled=False` yet the classifier still outputs ~1/1000.
+- The r²=0.5 recipe therefore trades the ~+4 pt p7_uniform opportunity
+  (available at r²=0.3) for universal stability. Tighter MP+QwT wins
+  at aggressive thresholds would require either full-chain lookahead
+  (expensive, see commit history) or a magnitude-aware multi-block
+  veto (open problem — see `docs/qwt_gate_investigation.md`).
+
+Scaling takeaway at K=30 (on raw-SC numbers, from the prod sweep):
+`avg192_uniform` (SL=192 everywhere, ~7.58-bit precision via SC early
+termination) hits **84.67 %** raw, trading ~25 % fewer bit-ops per op
+vs `p8_uniform` (85.57 %). `avg192_mp` is ~indistinguishable from
+`avg192_uniform` on raw SC, so a well-chosen uniform-at-192 is a
+strong default for the ~192-SL budget.
 
 ### Hardware framing
 

@@ -17,8 +17,8 @@ source /sw/pkgs/arc/python3.9-anaconda/2021.11/etc/profile.d/conda.sh
 conda activate vit_sc
 export XFORMERS_DISABLED=1
 
-RES_DIR=results/sweep_int678_k30_opt3_lastblock_r2p9_n1000
-LOG_DIR=logs/sweep_int678_k30_opt3_lastblock_r2p9_n1000
+RES_DIR=results/sweep_int678_k30_opt3_r2p5_lastblock_r2p9_n1000
+LOG_DIR=logs/sweep_int678_k30_opt3_r2p5_lastblock_r2p9_n1000
 mkdir -p "$RES_DIR" "$LOG_DIR"
 
 MAP_P7=$PROJ_ROOT/cls/results/sweep_int678_k30/sl_maps/p7_mp_main128_sl_map.json
@@ -99,9 +99,9 @@ cmd_avg192_mp_qwton() {
     --out_json "$RES_DIR/avg192_mp_qwton_r2p${1//./}.json"
 }
 
-# 10 tasks: 5 configs × {r2=0.0, r2=0.3}
+# 5 tasks: 5 configs × {r2=0.5} only — safer regime; last_block=0.9 still active.
 TASKS=()
-for r2 in 0.0 0.3; do
+for r2 in 0.5; do
   tag="r2p${r2//./}"
   for fn in cmd_p7_uniform_qwton cmd_p8_uniform_qwton cmd_avg192_uniform_qwton cmd_p7_mp_qwton cmd_avg192_mp_qwton; do
     # name = the out_json stem without _r2px suffix plus _r2pX
