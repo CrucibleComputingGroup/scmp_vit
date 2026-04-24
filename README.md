@@ -163,6 +163,43 @@ pipelines like `python ... 2>&1 | tee log` mask the kill as "exit 0" because
 keep every run on GPU 0. Memory footprint per job is fine under 32 GB
 alone; the problem is only parallelism.
 
+### Launching long sweeps from the login node via ssh
+
+For sweeps that take longer than your `salloc` window (multi-hour driver
+scripts, gate/MP grids, overnight jobs), you want to fire-and-forget from
+the login node onto a compute node that already holds the GPUs. The
+compute node has GPUs; the login node doesn't; `/tmp` is not shared
+between them but `/home/$USER/...` is. Use **this exact invocation** —
+every piece is load-bearing:
+
+```bash
+ssh -n -f <gpu-node> "bash -c 'nohup bash \
+    /abs/path/to/cls/experiments/<sweep>.sh \
+    >/abs/path/to/cls/logs/<sweep>_driver.log 2>&1 &'"
+```
+
+Gotchas that will silently burn an hour if you skip them:
+
+1. **`ssh host 'cmd'` lands in `$HOME`, not in the repo.** Pass scripts
+   as absolute paths (the sweep's own `cd "$(dirname "$0")/.."` handles
+   cwd from there). Do *not* rely on the remote shell being in `cls/`.
+2. **Write logs to `/home/$USER/...`, never `/tmp`.** Login and compute
+   nodes have separate local `/tmp`. If your driver log goes to `/tmp`
+   on the compute node, you can't tail it from the login node.
+3. **`-n -f` is mandatory.** `-f` forks ssh into the background after
+   authentication so your login shell returns immediately; `-n`
+   redirects stdin from `/dev/null`. Without both, ssh may stay attached
+   to the remote process's stdio, and if you re-issue the launch
+   (thinking it hung) you'll *stack multiple copies* of the sweep on
+   top of each other. Verify a singleton with
+   `ssh <gpu-node> 'pgrep -fc <sweep>.sh'` — should be O(1), not O(10).
+4. **Redirect stdio *inside* the remote shell, not outside.**
+   `ssh host 'cmd' >log` captures ssh's stdout, not the backgrounded
+   process's. Put `>driver.log 2>&1` inside the quoted command.
+5. **If you ever see 10+ duplicate workers**, kill everything and restart:
+   `ssh <gpu-node> "pkill -9 -f <sweep>.sh; pkill -9 -f 'python experiments'"`,
+   delete any partial JSON outputs, then relaunch with the template above.
+
 ## Running eval
 
 `XFORMERS_DISABLED=1` is required so DINOv2 falls back to the SDPA forward path

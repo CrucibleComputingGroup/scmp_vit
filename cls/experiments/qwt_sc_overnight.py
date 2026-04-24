@@ -272,6 +272,12 @@ def main():
                          "(skip comp) through block_fp[i+1] and veto apply when "
                          "skip is closer to the FP reference. Principled "
                          "replacement for max_block_for_qwt — no magic numbers.")
+    ap.add_argument("--rmse_margin", type=float, default=0.0,
+                    help="Require raw_rmse/after_rmse > this margin as an extra "
+                         "gate on top of --r2_threshold. 0 = disabled. 1.5 asks "
+                         "for at least 1.5x RMSE improvement from the comp; "
+                         "protects against knife-edge r² cases where the LS fit "
+                         "barely explains variance.")
     ap.add_argument("--start_block", type=int, default=0)
     ap.add_argument("--avg_sc_draws", type=int, default=1)
     ap.add_argument("--fwd_chunk", type=int, default=32)
@@ -460,6 +466,7 @@ def main():
         last_block_r2_threshold=(args.last_block_r2_threshold
                                  if args.last_block_r2_threshold >= 0.0
                                  else None),
+        rmse_margin=args.rmse_margin,
         lookahead_veto=args.lookahead_veto,
     )
     calib_s = time.time() - t_cal

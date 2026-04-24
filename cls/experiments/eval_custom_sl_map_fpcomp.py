@@ -251,6 +251,10 @@ def main():
                          "passes the r2 gate, compare downstream FP propagation "
                          "with vs without comp and veto apply if skip is better. "
                          "Matches qwt_sc_overnight semantics.")
+    ap.add_argument("--rmse_margin", type=float, default=0.0,
+                    help="Require raw_rmse/after_rmse > this margin as an extra "
+                         "gate on top of --r2_threshold. 0 = disabled. Matches "
+                         "qwt_sc_overnight semantics.")
     ap.add_argument("--skip_qwt", action="store_true",
                     help="Skip QwT calibration; evaluate raw SC model only (sc_raw).")
     # Comp-block knobs (mirror qwt_sc_overnight.py). Default is SC comp so the
@@ -355,6 +359,7 @@ def main():
             last_block_r2_threshold=(args.last_block_r2_threshold
                                      if args.last_block_r2_threshold >= 0.0
                                      else None),
+            rmse_margin=args.rmse_margin,
             lookahead_veto=args.lookahead_veto,
         )
         calib_s = time.time() - t0
@@ -389,6 +394,7 @@ def main():
             "r2_threshold": args.r2_threshold,
             "max_block_for_qwt": args.max_block_for_qwt,
             "last_block_r2_threshold": args.last_block_r2_threshold,
+            "rmse_margin": args.rmse_margin,
             "lookahead_veto": bool(args.lookahead_veto),
             "skip_qwt": bool(args.skip_qwt),
             "comp_mode": args.comp_mode,
