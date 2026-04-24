@@ -108,6 +108,10 @@ def main():
     p.add_argument("--comp_sc_mode", choices=["bipolar", "unipolar"], default="bipolar")
     p.add_argument("--out_tag", default="qwt_det")
     p.add_argument("--out_json", default="results/qwt_det/run.json")
+    p.add_argument("--d2_datasets", type=str, default="",
+                   help="DETECTRON2_DATASETS root (default: GreatLakes shared_data).")
+    p.add_argument("--ckpt", type=str, default="",
+                   help="Path to EVA-ViTDet checkpoint (default: GreatLakes shared_data).")
     args = p.parse_args()
 
     device = torch.device("cuda")
@@ -126,12 +130,13 @@ def main():
           f"n_calib={args.n_calib}  n_eval={args.n_eval}", flush=True)
 
     # --- Load both models. Use same n_eval loader, we'll slice first n_calib for calib. ---
+    _load_kw = dict(d2_datasets=args.d2_datasets, ckpt=args.ckpt)
     print("[model] loading FP reference", flush=True)
-    model_fp, test_loader_fp, evaluator_fp, _ = load_model_and_loader(args.n_eval)
+    model_fp, test_loader_fp, evaluator_fp, _ = load_model_and_loader(args.n_eval, **_load_kw)
     model_fp.eval()
 
     print("[model] loading SC model (fresh copy)", flush=True)
-    model_sc, test_loader_sc, evaluator_sc, _ = load_model_and_loader(args.n_eval)
+    model_sc, test_loader_sc, evaluator_sc, _ = load_model_and_loader(args.n_eval, **_load_kw)
     model_sc.eval()
 
     print(f"[sc] patching model_sc (sc_prec={args.sc_prec})", flush=True)
@@ -153,7 +158,7 @@ def main():
 
     # --- Calibration ---
     # Use a fresh loader (not the test_loader_sc we just consumed) via reload.
-    calib_model, calib_loader_d2, _, _ = load_model_and_loader(args.n_calib)
+    calib_model, calib_loader_d2, _, _ = load_model_and_loader(args.n_calib, **_load_kw)
     del calib_model  # only need the loader
     calib_loader = BackboneCalibLoader(calib_loader_d2, model_sc, device,
                                         max_items=args.n_calib)
@@ -192,7 +197,7 @@ def main():
     # --- Evaluate compensated model ---
     print("[eval] SC + QwT compensation", flush=True)
     # reload evaluator (it has state from previous run)
-    _, _, evaluator_sc2, _ = load_model_and_loader(args.n_eval)
+    _, _, evaluator_sc2, _ = load_model_and_loader(args.n_eval, **_load_kw)
     t0 = time.time()
     res_sc_comp = run_coco_eval(model_sc, test_loader_sc, evaluator_sc2,
                                  out_dir_base / "sc_comp")
