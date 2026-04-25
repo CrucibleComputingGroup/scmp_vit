@@ -358,31 +358,30 @@ def build_eval_loader(data_root, n_eval, seed, batch_size, workers=4):
 
 # ─── comp support (optional) ─────────────────────────────────────────────
 
-def calibrate_and_attach_comp(model_fp, model_sc, calib_loader, device,
-                              n_calib=256, ridge=1e-4, sc_prec=8,
-                              head_aligned=True, n_heads=16):
-    """Calibrate QwT-style SC comp and attach to model_sc in-place."""
+def calibrate_and_attach_comp(model_fp, model_sc, calib_loader_a, calib_loader_b, device,
+                              n_calib=256, ridge=1e-4,
+                              cos_threshold=0.5, norm_floor=0.0,
+                              last_block_cos_threshold=0.8,
+                              lookahead_veto=False):
+    """Calibrate the QwT cross-seed cosine-gated compensator and attach to
+    ``model_sc`` in-place. Requires two disjoint calib loaders (the
+    algorithm's core — see ``qwt_sc.compensation``)."""
     from qwt_sc import calibrate_qwt
-    from experiments.qwt_sc_overnight import (
-        make_head_aligned_factory, get_blocks,
-    )
+    from experiments.qwt_sc_overnight import get_blocks
 
-    factory = make_head_aligned_factory(
-        sc_prec, "bipolar", n_heads=n_heads, cfg_override=None,
-        scale=1.0, polarity=1,
-    )
     blocks_fp = list(get_blocks(model_fp))
     blocks_sc_container = get_blocks(model_sc)
+    last_tau = last_block_cos_threshold if last_block_cos_threshold > cos_threshold else None
 
     report = calibrate_qwt(
         model_fp=model_fp, model_sc=model_sc,
         blocks_fp=blocks_fp, blocks_sc_container=blocks_sc_container,
-        calib_loader=calib_loader, device=device,
-        n_calib=n_calib, ridge=ridge,
-        start_block=0, fwd_chunk=32, avg_sc_draws=1,
-        comp_factory=factory,
-        comp_factory_variants=None,
-        comp_refit_iters=0,
+        calib_loader_a=calib_loader_a, calib_loader_b=calib_loader_b,
+        device=device, n_calib=n_calib, ridge=ridge,
+        start_block=0, fwd_chunk=32,
+        cos_threshold=cos_threshold, norm_floor=norm_floor,
+        last_block_cos_threshold=last_tau,
+        lookahead_veto=lookahead_veto,
     )
     return report
 

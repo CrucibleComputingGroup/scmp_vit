@@ -1,18 +1,19 @@
-"""Extended QwT-SC compensator with K-seed bank, polarity flip, and W-scale
-search. Also records per-block correlation diagnostics so we can tell *why*
-a variant was selected.
+"""QwT-SC uniform-path driver. Installs the cross-seed cosine-gated
+compensator on a ViT-L/14 with SC matmuls patched in, evaluates on
+ImageNet-1k.
 
-The hardware framing is unchanged from the parent driver: each chosen
-non-default option is at most O(log K) config bits per block (a tiny LUT in
-the SC accelerator's per-block scheduler).
+The single-recipe admission rule lives in ``qwt_sc/compensation.py``
+(``calibrate_qwt``); see that module's docstring for the physical
+derivation and pilot evidence. This driver only handles data/model setup
+and CLI plumbing.
 
 Usage::
 
     python experiments/qwt_sc_overnight.py --sc_config qk_only \\
-        --n_calib 256 --n_eval 500 --batch_size 8 \\
-        --comp_mode sc --n_variants 8 --polarity_flip \\
-        --w_scales 0.5,0.75,1.0 \\
-        --out_json results/qwt_sc_qk_only_overnight.json
+        --n_calib 1024 --n_eval 50000 --batch_size 64 \\
+        --cos_threshold 0.5 --last_block_cos_threshold 0.8 \\
+        --lookahead_veto \\
+        --out_json results/qwt_sc_qk_only_n50k.json
 """
 import argparse
 import json
@@ -33,21 +34,14 @@ sys.path.insert(0, str(QWT_SC_LIB))
 sys.path.insert(0, str(HERE / "sc"))
 
 import torch
-import torch.nn as nn
 from torch.utils.data import DataLoader, Subset
 
 from eval import (build_transform, load_model, seed_all,
                   _build_attn_mp_spec, _build_linear_mp_spec)
 from imagenet_parquet import ImageNetParquetVal
-from sc_attention_patch import patch_model, set_noise_model, SC_OP_NAMES, SCLinear
+from sc_attention_patch import patch_model, set_noise_model, SC_OP_NAMES
 
 from qwt_sc import calibrate_qwt
-from config_helpers import (
-    make_sobol_simple_config,
-    make_sobol_antithetic_config,
-    make_sobol_altseed_config,
-)
-from sc_integration.head_aligned_comp import HeadAlignedSCLinear
 
 
 SENSITIVITY_JSON = HERE / "results" / "sensitivity_all_ops.json"
@@ -101,17 +95,13 @@ def compute_stoc_len_stats(args, fine_schedule, preset, n_blocks=24):
     main_macs = sum(_OP_MACS[op] * active[op] for op in _OP_MACS)
     main_bitops = sum(_OP_MACS[op] * active[op] * op_sl[op] for op in _OP_MACS)
     main_sl = main_bitops / main_macs if main_macs > 0 else 0
-    comp_sl = 2 ** args.comp_sc_prec if args.comp_mode == "sc" else 0
-    comp_macs = n_blocks * _COMP_MACS if args.comp_mode == "sc" else 0
-    comp_bitops = comp_macs * comp_sl
-    total_macs = main_macs + comp_macs
-    eff_sl = (main_bitops + comp_bitops) / total_macs if total_macs > 0 else 0
+    # Comp runs as an FP nn.Linear (no SC bitops contribution).
     return {
         "main_sl": round(main_sl, 1),
-        "eff_sl": round(eff_sl, 1),
-        "eff_reduction_pct": round((1 - eff_sl / base_sl) * 100, 1),
+        "eff_sl": round(main_sl, 1),
+        "eff_reduction_pct": 0.0,
         "main_macs_B": round(main_macs / 1e9, 2),
-        "comp_macs_B": round(comp_macs / 1e9, 2),
+        "comp_macs_B": 0.0,
     }
 
 
@@ -175,65 +165,6 @@ def evaluate(model, loader, device, log_every=20):
             "elapsed_s": dt, "img_per_s": n / dt if dt > 0 else 0.0}
 
 
-def build_seed_bank(D, sc_prec, n_variants, rng_seed=42):
-    """Build n_variants Sobol configs at dim D. Always includes default + antithetic;
-    pads with random K-side seeds."""
-    rnd = random.Random(rng_seed)
-    configs = [
-        ("default",    make_sobol_simple_config(D, D, sc_prec)),
-        ("antithetic", make_sobol_antithetic_config(D, D, sc_prec)),
-    ]
-    n_extra = max(0, n_variants - len(configs))
-    for i in range(n_extra):
-        seed = [1]
-        for j in range(1, sc_prec):
-            mx = 1 << (j + 1)
-            v = rnd.randint(0, mx // 2 - 1) * 2 + 1
-            seed.append(v)
-        cfg = make_sobol_altseed_config(D, D, sc_prec, k_seed=seed)
-        configs.append((f"alt{i}_{','.join(str(s) for s in seed[:4])}..", cfg))
-    return configs[:n_variants]
-
-
-def make_sc_factory(sc_prec, mode, cfg_override=None, scale=1.0, polarity=1):
-    """Factory closing over (cfg, scale, polarity). polarity ∈ {+1, -1} flips W sign."""
-    def factory(W, b):
-        D_in, D_out = W.shape
-        layer = nn.Linear(D_in, D_out, bias=True)
-        with torch.no_grad():
-            layer.weight.copy_((W.t().contiguous()) * (scale * polarity))
-            layer.bias.copy_(b * polarity if polarity == -1 else b)
-        return SCLinear(layer, sc_prec=sc_prec, mode=mode, cfg_override=cfg_override)
-    return factory
-
-
-def make_fp_factory(scale=1.0, polarity=1):
-    """Factory returning an nn.Linear (FP comp) for --comp_mode fp."""
-    def factory(W, b):
-        D_in, D_out = W.shape
-        layer = nn.Linear(D_in, D_out, bias=True)
-        with torch.no_grad():
-            layer.weight.copy_((W.t().contiguous()) * (scale * polarity))
-            layer.bias.copy_(b * polarity if polarity == -1 else b)
-        return layer
-    return factory
-
-
-def make_head_aligned_factory(sc_prec, mode, n_heads=16, cfg_override=None,
-                              scale=1.0, polarity=1):
-    """Factory: HeadAlignedSCLinear with per-head SC matmul reusing
-    _CFG_CACHE[(D_in/n_heads, sc_prec)] — same pool as block per-head QK."""
-    def factory(W, b):
-        D_in, D_out = W.shape
-        layer = nn.Linear(D_in, D_out, bias=True)
-        with torch.no_grad():
-            layer.weight.copy_((W.t().contiguous()) * (scale * polarity))
-            layer.bias.copy_(b * polarity if polarity == -1 else b)
-        return HeadAlignedSCLinear(layer, sc_prec=sc_prec, mode=mode,
-                                    n_heads=n_heads, cfg_override=cfg_override)
-    return factory
-
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data_root", default="/scratch/nbleier_owned_root/nbleier_owned1/shared_data/imagenet/data")
@@ -252,56 +183,39 @@ def main():
     ap.add_argument("--batch_size", type=int, default=8)
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--ridge", type=float, default=1e-4)
-    ap.add_argument("--r2_threshold", type=float, default=0.0,
-                    help="Skip QwT compensation in a block if its fit r2 is "
-                         "<= this threshold. Default 0.0 = original behavior.")
-    ap.add_argument("--max_block_for_qwt", type=int, default=10**9,
-                    help="Hard cap: never compensate blocks with index >= this. "
-                         "Protects against catastrophic late-block noise injection "
-                         "when a borderline r2 fit is applied to a high-norm output "
-                         "(e.g. pre-norm ViT block 23 at r2~0.5).")
-    ap.add_argument("--last_block_r2_threshold", type=float, default=-1.0,
-                    help="Stricter r2 gate for the LAST block only (negative = "
-                         "use --r2_threshold). Block 23's residual-stream norm is "
-                         "~20x mid-block, so a borderline r2 fit there can inject "
-                         "catastrophic noise into the pre-head embedding. Tighten "
-                         "to 0.7 or 0.9 to let only well-fit comps apply.")
+    ap.add_argument("--start_block", type=int, default=0,
+                    help="Indices below this are never admitted (pass-through). "
+                         "Useful if early-block calib is unreliable for a model.")
+    # ---- Cross-seed gate (the single-recipe admission rule) ----
+    ap.add_argument("--cos_threshold", type=float, default=0.5,
+                    help="Admission threshold τ. A block is admitted iff "
+                         "cos(W_A, W_B) > τ, where W_A and W_B are the ridge "
+                         "fits on two disjoint calibration batches. Pilot on "
+                         "5 regimes shows a bimodal cos distribution (noise "
+                         "≈ 0, signal ≥ 0.68) — any τ in [0.2, 0.65] gives "
+                         "the same admission decisions. Default 0.5.")
+    ap.add_argument("--calib_seed_b", type=int, default=2,
+                    help="Seed for the second calibration loader. Must differ "
+                         "from --calib_seed to draw disjoint images.")
+    ap.add_argument("--norm_floor", type=float, default=0.0,
+                    help="Additionally require min(||W_A||,||W_B||) > this. "
+                         "0 = disabled. Filters out near-zero-bias blocks "
+                         "where cosine is numerically noisy.")
+    ap.add_argument("--last_block_cos_threshold", type=float, default=0.8,
+                    help="Stricter τ for the last block (block 23 feeds the "
+                         "pre-head embedding directly; demand tighter W "
+                         "agreement). Default 0.8. Set < --cos_threshold to "
+                         "disable the extra-strict rule.")
     ap.add_argument("--lookahead_veto", action="store_true",
-                    help="Per-block 1-step binary lookahead. For each block that "
-                         "passes the r2 gate, propagate both (apply comp) and "
-                         "(skip comp) through block_fp[i+1] and veto apply when "
-                         "skip is closer to the FP reference. Principled "
-                         "replacement for max_block_for_qwt — no magic numbers.")
-    ap.add_argument("--rmse_margin", type=float, default=0.0,
-                    help="Require raw_rmse/after_rmse > this margin as an extra "
-                         "gate on top of --r2_threshold. 0 = disabled. 1.5 asks "
-                         "for at least 1.5x RMSE improvement from the comp; "
-                         "protects against knife-edge r² cases where the LS fit "
-                         "barely explains variance.")
-    ap.add_argument("--start_block", type=int, default=0)
-    ap.add_argument("--avg_sc_draws", type=int, default=1)
+                    help="One-step binary lookahead: propagate 'apply' vs "
+                         "'skip' through block i+1 and veto apply if skip is "
+                         "closer to the FP chain. Rarely fires under the "
+                         "cosine gate but is cheap insurance for borderline "
+                         "blocks.")
     ap.add_argument("--fwd_chunk", type=int, default=32)
-    ap.add_argument("--skip_baseline", action="store_true")
-    ap.add_argument("--comp_mode", choices=["fp", "sc"], default="sc")
-    ap.add_argument("--comp_sc_prec", type=int, default=8)
-    ap.add_argument("--comp_sc_mode", choices=["bipolar", "unipolar"], default="bipolar")
-    ap.add_argument("--n_variants", type=int, default=1,
-                    help="Number of Sobol seed variants in the K-bank "
-                         "(includes default + antithetic). 1 disables search.")
-    ap.add_argument("--polarity_flip", action="store_true",
-                    help="Also try polarity = -1 for each seed variant. "
-                         "Doubles variant count. 1 extra config bit per block.")
-    ap.add_argument("--w_scales", type=str, default="1.0",
-                    help="Comma-separated W magnitudes to try, e.g. '0.5,0.75,1.0'. "
-                         "Per-block selection. ⌈log_2 n_scales⌉ extra config bits.")
-    ap.add_argument("--head_aligned", action="store_true",
-                    help="Add head-aligned SC comp variants (per-head D=64 SC "
-                         "matmul reusing _CFG_CACHE[(64,8)] = block QK pool).")
-    ap.add_argument("--head_aligned_only", action="store_true",
-                    help="Drop the regular SC variants; only use head-aligned "
-                         "variants for the SC factories. Implies --head_aligned.")
-    ap.add_argument("--n_heads", type=int, default=16,
-                    help="Number of heads for head-aligned comp (must divide D=1024).")
+    ap.add_argument("--skip_baseline", action="store_true",
+                    help="Skip the raw-SC evaluation (useful when the baseline "
+                         "is already recorded from a sibling sweep).")
     ap.add_argument("--out_json", default="results/qwt_sc_overnight.json")
     # ---- Mixed precision (same CLI as eval.py; piped into patch_model) ----
     ap.add_argument("--mp_levels", default="")
@@ -394,123 +308,46 @@ def main():
         res_sc_raw = evaluate(model_sc, eval_loader, device)
         print("[result:sc_raw]", res_sc_raw, flush=True)
 
-    # Build the comp variants: cartesian of {seed configs} x {polarities} x {scales}.
-    D_resid = 1024  # ViT-L residual dim
-    seed_bank = build_seed_bank(D_resid, args.comp_sc_prec, args.n_variants)
-    polarities = [1, -1] if args.polarity_flip else [1]
-    scales = [float(s) for s in args.w_scales.split(",")]
-
-    variants = []
-    if args.comp_mode == "sc":
-        if not args.head_aligned_only:
-            for sname, cfg in seed_bank:
-                for pol in polarities:
-                    for sc in scales:
-                        name = f"sc/{sname}/p{'+' if pol > 0 else '-'}/s{sc:.2f}"
-                        variants.append((name, make_sc_factory(
-                            args.comp_sc_prec, args.comp_sc_mode,
-                            cfg_override=cfg, scale=sc, polarity=pol)))
-        if args.head_aligned or args.head_aligned_only:
-            # Head-aligned variants: each chunk uses its size's _CFG_CACHE
-            # entry by default (cfg_override=None). Don't search seed bank
-            # here — the point is to reuse block per-head SNG.
-            for pol in polarities:
-                for sc in scales:
-                    name = f"head_aligned/p{'+' if pol > 0 else '-'}/s{sc:.2f}/h{args.n_heads}"
-                    variants.append((name, make_head_aligned_factory(
-                        args.comp_sc_prec, args.comp_sc_mode,
-                        n_heads=args.n_heads, cfg_override=None,
-                        scale=sc, polarity=pol)))
-    else:  # comp_mode == "fp"
-        for pol in polarities:
-            for sc in scales:
-                name = f"fp/p{'+' if pol > 0 else '-'}/s{sc:.2f}"
-                variants.append((name, make_fp_factory(scale=sc, polarity=pol)))
-
-    print(f"[comp] variants={len(variants)}  "
-          f"(seeds={len(seed_bank)} pols={len(polarities)} "
-          f"scales={len(scales)})",
-          flush=True)
-    for name, _ in variants[:8]:
-        print(f"        - {name}", flush=True)
-    if len(variants) > 8:
-        print(f"        ... ({len(variants)-8} more)", flush=True)
-
-    # Collapse to single-variant if K=1 with no polarity/scale/fp_sc — use comp_factory
-    # path so calibrate_qwt skips its variant loop.
-    comp_factory = None
-    comp_factory_variants = None
-    if len(variants) == 1:
-        comp_factory = variants[0][1]
-        print(f"[comp] single-variant fast path: {variants[0][0]}", flush=True)
-    else:
-        comp_factory_variants = variants
-
-    print("[calib] starting QwT calibration", flush=True)
+    print("[calib] starting QwT cross-seed calibration", flush=True)
     t_cal = time.time()
     seed_all(args.calib_seed)
     blocks_fp = list(get_blocks(model_fp))
     blocks_sc_container = get_blocks(model_sc)
+    if args.calib_seed_b == args.calib_seed:
+        raise ValueError("--calib_seed_b must differ from --calib_seed")
+    calib_ds_b = build_dataset(args.data_root, args.calib_seed_b, args.n_calib)
+    calib_loader_b = DataLoader(calib_ds_b, batch_size=args.batch_size, shuffle=False,
+                                num_workers=args.workers, pin_memory=True)
+    last_tau = args.last_block_cos_threshold if args.last_block_cos_threshold > args.cos_threshold else None
+    print(f"[calib] τ={args.cos_threshold}  seed_a={args.calib_seed} "
+          f"seed_b={args.calib_seed_b}  norm_floor={args.norm_floor}  "
+          f"last_τ={last_tau}", flush=True)
     calib_report = calibrate_qwt(
         model_fp=model_fp, model_sc=model_sc,
         blocks_fp=blocks_fp, blocks_sc_container=blocks_sc_container,
-        calib_loader=calib_loader, device=device,
-        n_calib=args.n_calib, ridge=args.ridge,
+        calib_loader_a=calib_loader, calib_loader_b=calib_loader_b,
+        device=device, n_calib=args.n_calib, ridge=args.ridge,
         start_block=args.start_block, fwd_chunk=args.fwd_chunk,
-        avg_sc_draws=args.avg_sc_draws,
-        comp_factory=comp_factory,
-        comp_factory_variants=comp_factory_variants,
-        comp_refit_iters=0,
-        r2_threshold=args.r2_threshold,
-        max_block_for_qwt=args.max_block_for_qwt,
-        last_block_r2_threshold=(args.last_block_r2_threshold
-                                 if args.last_block_r2_threshold >= 0.0
-                                 else None),
-        rmse_margin=args.rmse_margin,
+        cos_threshold=args.cos_threshold,
+        norm_floor=args.norm_floor,
+        last_block_cos_threshold=last_tau,
         lookahead_veto=args.lookahead_veto,
     )
     calib_s = time.time() - t_cal
     print(f"[calib] done in {calib_s:.1f}s", flush=True)
 
-    # Summarize variant choices and SC-coverage of comp
-    chosen = [r.get("variant") for r in calib_report]
-    n_fp_comp = sum(1 for c in chosen if c is not None and c.startswith("fp/"))
-    n_sc_comp = len(chosen) - n_fp_comp
-    n_enabled = sum(1 for r in calib_report if r.get("enabled", True))
+    n_enabled = sum(1 for r in calib_report if r.get("enabled", False))
     n_blocks_total = len(calib_report)
-    print(f"[comp] per-block choices: SC={n_sc_comp}  FP={n_fp_comp}  "
-          f"enabled={n_enabled}/{n_blocks_total} (r2_threshold={args.r2_threshold})",
-          flush=True)
-
-    # Corrected eff_sl: scale comp_macs by the fraction of blocks that actually
-    # run compensation after r2-threshold gating. compute_stoc_len_stats above
-    # assumed all blocks get comp; this recomputes the real per-MAC SL average.
-    if args.comp_mode == "sc" and n_blocks_total > 0:
-        _SEQ_C = 257
-        _OP_MACS_C = {
-            "qk":      16 * _SEQ_C * 64 * _SEQ_C,
-            "av":      16 * _SEQ_C * _SEQ_C * 64,
-            "proj":    _SEQ_C * 1024 * 3072 + _SEQ_C * 1024 * 1024,
-            "mlp_fc1": _SEQ_C * 1024 * 4096,
-            "mlp_fc2": _SEQ_C * 4096 * 1024,
-        }
-        _COMP_MACS_C = _SEQ_C * 1024 * 1024
-        main_macs_full = sl_stats["main_macs_B"] * 1e9
-        main_bitops_full = main_macs_full * sl_stats["main_sl"]
-        comp_macs_real = n_enabled * _COMP_MACS_C
-        comp_bitops_real = comp_macs_real * (2 ** args.comp_sc_prec)
-        total_real = main_macs_full + comp_macs_real
-        eff_sl_real = ((main_bitops_full + comp_bitops_real) / total_real
-                       if total_real > 0 else 0)
-        sl_stats["eff_sl_r2corrected"] = round(eff_sl_real, 2)
-        sl_stats["n_enabled_blocks"] = n_enabled
-        sl_stats["comp_macs_real_B"] = round(comp_macs_real / 1e9, 3)
-        print(f"[sl] corrected eff_sl (only {n_enabled} enabled blocks run comp) "
-              f"= {eff_sl_real:.2f}  vs nominal {sl_stats['eff_sl']}", flush=True)
-    from collections import Counter
-    cnt = Counter([c for c in chosen if c is not None])
-    for k, v in cnt.most_common():
-        print(f"        {k}: {v} blocks", flush=True)
+    en_blocks = [r["block"] for r in calib_report if r["enabled"]]
+    cos_admitted = [r["cos_ab"] for r in calib_report if r["enabled"]]
+    cos_rejected = [r["cos_ab"] for r in calib_report if not r["enabled"]]
+    print(f"[gate] admitted={n_enabled}/{n_blocks_total}  blocks={en_blocks}", flush=True)
+    if cos_admitted:
+        print(f"[gate] cos range admitted=[{min(cos_admitted):+.3f}, "
+              f"{max(cos_admitted):+.3f}]", flush=True)
+    if cos_rejected:
+        print(f"[gate] cos range rejected=[{min(cos_rejected):+.3f}, "
+              f"{max(cos_rejected):+.3f}]", flush=True)
 
     print("[eval] SC + comp", flush=True)
     seed_all(args.eval_seed)
@@ -526,20 +363,18 @@ def main():
         "config": {
             "sc_config": args.sc_config, "sc_prec": args.sc_prec,
             "n_calib": args.n_calib, "n_eval": args.n_eval,
-            "calib_seed": args.calib_seed, "eval_seed": args.eval_seed,
+            "calib_seed": args.calib_seed, "calib_seed_b": args.calib_seed_b,
+            "eval_seed": args.eval_seed,
             "ridge": args.ridge, "start_block": args.start_block,
-            "avg_sc_draws": args.avg_sc_draws,
-            "comp_mode": args.comp_mode,
-            "comp_sc_prec": args.comp_sc_prec, "comp_sc_mode": args.comp_sc_mode,
-            "n_variants": args.n_variants, "polarity_flip": args.polarity_flip,
-            "w_scales": args.w_scales,
+            "cos_threshold": args.cos_threshold,
+            "norm_floor": args.norm_floor,
+            "last_block_cos_threshold": args.last_block_cos_threshold,
+            "lookahead_veto": bool(args.lookahead_veto),
         },
         "calib": {
             "per_block": calib_report,
             "elapsed_s": calib_s,
-            "n_fp_comp_blocks": n_fp_comp,
-            "n_sc_comp_blocks": n_sc_comp,
-            "variant_counts": dict(cnt),
+            "n_enabled_blocks": n_enabled,
         },
         "results": {"fp": res_fp, "sc_raw": res_sc_raw, "sc_comp": res_sc_comp},
         "stoc_len": sl_stats,
@@ -556,9 +391,6 @@ def main():
     print(f"  SC + comp         : top1={res_sc_comp['top1']:.4f}")
     print(f"  main_sl={sl_stats['main_sl']}  eff_sl={sl_stats['eff_sl']}  "
           f"reduction={sl_stats['eff_reduction_pct']}%")
-    if args.comp_mode == "sc":
-        print(f"  Comp SC coverage  : {n_sc_comp}/{len(chosen)} blocks "
-              f"({100*n_sc_comp/max(1,len(chosen)):.0f}% no-FP-mac)")
 
 
 if __name__ == "__main__":

@@ -1,5 +1,6 @@
 #!/usr/bin/env python
-"""Evaluate a custom stoc_len map with FP QwT compensation."""
+"""Evaluate a custom stoc_len map with the QwT cross-seed cosine-gated
+compensation. See ``qwt_sc/compensation.py`` for the admission rule."""
 from __future__ import annotations
 
 import argparse
@@ -23,20 +24,11 @@ if (QWT_SC_LIB / "qwt_sc").exists():
 
 from eval import load_model, seed_all
 from qwt_sc import calibrate_qwt
-from qwt_sc_compensation import build_dataset, evaluate, get_blocks
+from qwt_sc_overnight import build_dataset, evaluate, get_blocks
 from sc_attention_patch import SC_OP_NAMES, SCLinear, make_sc_attention_forward, set_noise_model
 from sc_integration.mp_linear import MPConfig
 from mp_budget_swap_search import (
     build_active_ops,
-)
-# Reuse the comp factories from qwt_sc_overnight so the QwT compensation block
-# matches the uniform-path behavior bit-for-bit (SC-kernel comp with the same
-# Sobol seed bank, scales, and optional head-aligned per-head routing).
-from qwt_sc_overnight import (
-    make_sc_factory,
-    make_fp_factory,
-    make_head_aligned_factory,
-    build_seed_bank,
 )
 
 _SEQ = 257
@@ -235,40 +227,28 @@ def main():
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--ridge", type=float, default=1e-2)
     ap.add_argument("--fwd_chunk", type=int, default=32)
-    ap.add_argument("--avg_sc_draws", type=int, default=1)
-    ap.add_argument("--start_block", type=int, default=0)
-    ap.add_argument("--r2_threshold", type=float, default=0.0,
-                    help="Skip QwT compensation in a block if its fit r2 is "
-                         "<= this threshold. Matches qwt_sc_overnight semantics.")
-    ap.add_argument("--max_block_for_qwt", type=int, default=10**9,
-                    help="Hard cap: never compensate blocks with index >= this. "
-                         "Matches qwt_sc_overnight semantics.")
-    ap.add_argument("--last_block_r2_threshold", type=float, default=-1.0,
-                    help="Stricter r2 gate for the LAST block only (negative = "
-                         "use --r2_threshold). Matches qwt_sc_overnight semantics.")
+    ap.add_argument("--start_block", type=int, default=0,
+                    help="Indices below this are never admitted (pass-through).")
+    # ---- Cross-seed gate (the single-recipe admission rule) ----
+    ap.add_argument("--cos_threshold", type=float, default=0.5,
+                    help="Admission τ for the cross-seed cosine gate. Pilot "
+                         "shows a bimodal cos distribution across all five "
+                         "cls regimes (noise ≈ 0, signal ≥ 0.68); any τ in "
+                         "[0.2, 0.65] yields the same decisions. Default 0.5.")
+    ap.add_argument("--calib_seed_b", type=int, default=2,
+                    help="Seed for the second calib loader; must differ from "
+                         "--calib_seed.")
+    ap.add_argument("--norm_floor", type=float, default=0.0,
+                    help="Additionally require min(||W_A||,||W_B||) > this. "
+                         "0 = disabled.")
+    ap.add_argument("--last_block_cos_threshold", type=float, default=0.8,
+                    help="Stricter τ for the last block (feeds the pre-head "
+                         "embedding). Default 0.8.")
     ap.add_argument("--lookahead_veto", action="store_true",
-                    help="Per-block 1-step binary lookahead. For each block that "
-                         "passes the r2 gate, compare downstream FP propagation "
-                         "with vs without comp and veto apply if skip is better. "
-                         "Matches qwt_sc_overnight semantics.")
-    ap.add_argument("--rmse_margin", type=float, default=0.0,
-                    help="Require raw_rmse/after_rmse > this margin as an extra "
-                         "gate on top of --r2_threshold. 0 = disabled. Matches "
-                         "qwt_sc_overnight semantics.")
+                    help="One-step binary lookahead on block i+1 — veto apply "
+                         "if 'skip' beats 'apply'. Cheap insurance.")
     ap.add_argument("--skip_qwt", action="store_true",
-                    help="Skip QwT calibration; evaluate raw SC model only (sc_raw).")
-    # Comp-block knobs (mirror qwt_sc_overnight.py). Default is SC comp so the
-    # QwT residual runs through the same Sobol/XNOR kernels as the block ops,
-    # matching uniform-path behavior. Pass --comp_mode fp to restore the
-    # historical FP-comp behavior implied by this script's filename.
-    ap.add_argument("--comp_mode", choices=["fp", "sc"], default="sc")
-    ap.add_argument("--comp_sc_prec", type=int, default=8)
-    ap.add_argument("--comp_sc_mode", choices=["bipolar", "unipolar"], default="bipolar")
-    ap.add_argument("--head_aligned", action="store_true",
-                    help="Use HeadAlignedSCLinear (per-head D=64, reuses block QK pool) "
-                         "for SC comp. No effect when --comp_mode fp.")
-    ap.add_argument("--n_heads", type=int, default=16,
-                    help="Head count for HeadAlignedSCLinear; must divide D=1024.")
+                    help="Skip calibration; evaluate raw SC model only.")
     ap.add_argument("--out_json", default="results/eval_custom_sl_map_fpcomp.json")
     args = ap.parse_args()
 
@@ -314,58 +294,33 @@ def main():
         print("[result:sc_raw]", res_sc_raw, flush=True)
         results_block["sc_raw"] = res_sc_raw
     else:
-        # Build comp factory: single-variant SC (default) or FP fallback. Mirrors
-        # qwt_sc_overnight's single-variant fast path — scale=1.0, polarity=+1.
-        D_resid = 1024
-        if args.comp_mode == "sc":
-            if args.head_aligned:
-                comp_factory = make_head_aligned_factory(
-                    args.comp_sc_prec, args.comp_sc_mode,
-                    n_heads=args.n_heads, cfg_override=None,
-                    scale=1.0, polarity=1,
-                )
-                comp_desc = f"sc/head_aligned/h{args.n_heads}/prec{args.comp_sc_prec}"
-            else:
-                seed_bank = build_seed_bank(D_resid, args.comp_sc_prec, 1)
-                cfg0 = seed_bank[0][1]
-                comp_factory = make_sc_factory(
-                    args.comp_sc_prec, args.comp_sc_mode,
-                    cfg_override=cfg0, scale=1.0, polarity=1,
-                )
-                comp_desc = f"sc/default/prec{args.comp_sc_prec}/{args.comp_sc_mode}"
-        else:
-            comp_factory = make_fp_factory(scale=1.0, polarity=1)
-            comp_desc = "fp"
-        print(f"[comp] factory={comp_desc}", flush=True)
-
         t0 = time.time()
         seed_all(args.calib_seed)
+        if args.calib_seed_b == args.calib_seed:
+            raise ValueError("--calib_seed_b must differ from --calib_seed")
+        calib_ds_b = build_dataset(args.data_root, args.calib_seed_b, args.n_calib)
+        calib_loader_b = DataLoader(calib_ds_b, batch_size=args.batch_size, shuffle=False,
+                                    num_workers=args.workers, pin_memory=True)
+        last_tau = args.last_block_cos_threshold if args.last_block_cos_threshold > args.cos_threshold else None
+        print(f"[calib] τ={args.cos_threshold}  seed_a={args.calib_seed} "
+              f"seed_b={args.calib_seed_b}  norm_floor={args.norm_floor}  "
+              f"last_τ={last_tau}", flush=True)
         calib_report = calibrate_qwt(
             model_fp=model_fp, model_sc=model_sc,
             blocks_fp=list(get_blocks(model_fp)),
             blocks_sc_container=get_blocks(model_sc),
-            calib_loader=calib_loader,
-            device=device,
-            n_calib=args.n_calib,
-            ridge=args.ridge,
-            start_block=args.start_block,
-            fwd_chunk=args.fwd_chunk,
-            avg_sc_draws=args.avg_sc_draws,
-            comp_factory=comp_factory,
-            comp_factory_variants=None,
-            comp_refit_iters=0,
-            r2_threshold=args.r2_threshold,
-            max_block_for_qwt=args.max_block_for_qwt,
-            last_block_r2_threshold=(args.last_block_r2_threshold
-                                     if args.last_block_r2_threshold >= 0.0
-                                     else None),
-            rmse_margin=args.rmse_margin,
+            calib_loader_a=calib_loader, calib_loader_b=calib_loader_b,
+            device=device, n_calib=args.n_calib, ridge=args.ridge,
+            start_block=args.start_block, fwd_chunk=args.fwd_chunk,
+            cos_threshold=args.cos_threshold,
+            norm_floor=args.norm_floor,
+            last_block_cos_threshold=last_tau,
             lookahead_veto=args.lookahead_veto,
         )
         calib_s = time.time() - t0
         print(f"[calib] done in {calib_s:.1f}s", flush=True)
 
-        print("[eval] SC + FP-comp", flush=True)
+        print("[eval] SC + comp", flush=True)
         seed_all(args.eval_seed)
         res_sc_comp = evaluate(model_sc, eval_loader, device)
         print("[result:sc_comp]", res_sc_comp, flush=True)
@@ -386,22 +341,16 @@ def main():
             "n_calib": args.n_calib,
             "n_eval": args.n_eval,
             "calib_seed": args.calib_seed,
+            "calib_seed_b": args.calib_seed_b,
             "eval_seed": args.eval_seed,
             "batch_size": args.batch_size,
             "ridge": args.ridge,
             "start_block": args.start_block,
-            "avg_sc_draws": args.avg_sc_draws,
-            "r2_threshold": args.r2_threshold,
-            "max_block_for_qwt": args.max_block_for_qwt,
-            "last_block_r2_threshold": args.last_block_r2_threshold,
-            "rmse_margin": args.rmse_margin,
+            "cos_threshold": args.cos_threshold,
+            "norm_floor": args.norm_floor,
+            "last_block_cos_threshold": args.last_block_cos_threshold,
             "lookahead_veto": bool(args.lookahead_veto),
             "skip_qwt": bool(args.skip_qwt),
-            "comp_mode": args.comp_mode,
-            "comp_sc_prec": args.comp_sc_prec,
-            "comp_sc_mode": args.comp_sc_mode,
-            "head_aligned": bool(args.head_aligned),
-            "n_heads": args.n_heads if args.head_aligned else None,
         },
         "main_sl": main_sl,
         "allocation": summarize_allocation_custom(sl_map, active_ops),
