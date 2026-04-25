@@ -34,14 +34,21 @@ sys.path.insert(0, str(QWT_SC_LIB))
 sys.path.insert(0, str(HERE / "sc"))
 
 import torch
+import torch.nn as nn
 from torch.utils.data import DataLoader, Subset
 
 from eval import (build_transform, load_model, seed_all,
                   _build_attn_mp_spec, _build_linear_mp_spec)
 from imagenet_parquet import ImageNetParquetVal
-from sc_attention_patch import patch_model, set_noise_model, SC_OP_NAMES
+from sc_attention_patch import patch_model, set_noise_model, SC_OP_NAMES, SCLinear
 
 from qwt_sc import calibrate_qwt
+from config_helpers import (
+    make_sobol_simple_config,
+    make_sobol_antithetic_config,
+    make_sobol_altseed_config,
+)
+from sc_integration.head_aligned_comp import HeadAlignedSCLinear
 
 
 SENSITIVITY_JSON = HERE / "results" / "sensitivity_all_ops.json"
@@ -95,13 +102,17 @@ def compute_stoc_len_stats(args, fine_schedule, preset, n_blocks=24):
     main_macs = sum(_OP_MACS[op] * active[op] for op in _OP_MACS)
     main_bitops = sum(_OP_MACS[op] * active[op] * op_sl[op] for op in _OP_MACS)
     main_sl = main_bitops / main_macs if main_macs > 0 else 0
-    # Comp runs as an FP nn.Linear (no SC bitops contribution).
+    comp_sl = 2 ** args.comp_sc_prec if args.comp_mode == "sc" else 0
+    comp_macs = n_blocks * _COMP_MACS if args.comp_mode == "sc" else 0
+    comp_bitops = comp_macs * comp_sl
+    total_macs = main_macs + comp_macs
+    eff_sl = (main_bitops + comp_bitops) / total_macs if total_macs > 0 else 0
     return {
         "main_sl": round(main_sl, 1),
-        "eff_sl": round(main_sl, 1),
-        "eff_reduction_pct": 0.0,
+        "eff_sl": round(eff_sl, 1),
+        "eff_reduction_pct": round((1 - eff_sl / base_sl) * 100, 1) if base_sl else 0.0,
         "main_macs_B": round(main_macs / 1e9, 2),
-        "comp_macs_B": 0.0,
+        "comp_macs_B": round(comp_macs / 1e9, 2),
     }
 
 
@@ -165,6 +176,78 @@ def evaluate(model, loader, device, log_every=20):
             "elapsed_s": dt, "img_per_s": n / dt if dt > 0 else 0.0}
 
 
+# ---------- Comp-kernel factories ----------
+# The cross-seed gate in qwt_sc.calibrate_qwt decides *whether* to install a
+# correction; these factories decide *how* the installed W̄, b̄ is evaluated
+# at inference — bare FP Linear, SCLinear with a chosen Sobol cfg, or
+# HeadAlignedSCLinear (per-head D=64 reusing the block QK Sobol pool).
+
+def build_seed_bank(D, sc_prec, n_variants, rng_seed=42):
+    """Build n_variants Sobol configs at dim D. Always includes default +
+    antithetic; pads with deterministic alt-seed variants for exploration."""
+    rnd = random.Random(rng_seed)
+    configs = [
+        ("default",    make_sobol_simple_config(D, D, sc_prec)),
+        ("antithetic", make_sobol_antithetic_config(D, D, sc_prec)),
+    ]
+    n_extra = max(0, n_variants - len(configs))
+    for i in range(n_extra):
+        seed = [1]
+        for j in range(1, sc_prec):
+            mx = 1 << (j + 1)
+            v = rnd.randint(0, mx // 2 - 1) * 2 + 1
+            seed.append(v)
+        cfg = make_sobol_altseed_config(D, D, sc_prec, k_seed=seed)
+        configs.append((f"alt{i}_{','.join(str(s) for s in seed[:4])}..", cfg))
+    return configs[:n_variants]
+
+
+def make_sc_factory(sc_prec, mode, cfg_override=None, scale=1.0, polarity=1):
+    """(W, b) -> SCLinear wrapping the ridge-fit (D_in, D_out) matmul. The
+    comp kernel then runs through the same XNOR/Sobol pipeline as the block
+    SC matmuls — so the whole inference path stays SC (no FP multiplier)."""
+    def factory(W, b):
+        D_in, D_out = W.shape
+        layer = nn.Linear(D_in, D_out, bias=True)
+        with torch.no_grad():
+            layer.weight.copy_((W.t().contiguous()) * (scale * polarity))
+            layer.bias.copy_(b * polarity if polarity == -1 else b)
+        return SCLinear(layer, sc_prec=sc_prec, mode=mode, cfg_override=cfg_override)
+    return factory
+
+
+def make_fp_factory(scale=1.0, polarity=1):
+    """(W, b) -> nn.Linear FP comp. Debug / baseline only — FP comp
+    reintroduces an FP multiplier that the SC hardware story was designed
+    to avoid."""
+    def factory(W, b):
+        D_in, D_out = W.shape
+        layer = nn.Linear(D_in, D_out, bias=True)
+        with torch.no_grad():
+            layer.weight.copy_((W.t().contiguous()) * (scale * polarity))
+            layer.bias.copy_(b * polarity if polarity == -1 else b)
+        return layer
+    return factory
+
+
+def make_head_aligned_factory(sc_prec, mode, n_heads=16, cfg_override=None,
+                              scale=1.0, polarity=1):
+    """(W, b) -> HeadAlignedSCLinear. Splits the comp matmul into n_heads
+    chunks of size (D_in/n_heads, D_out/n_heads), each reusing the
+    _CFG_CACHE[(D_in/n_heads, sc_prec)] entry that the block's per-head QK
+    matmul already populated — so the comp adds **zero** new Sobol config
+    cache, maximizing SC hardware reuse."""
+    def factory(W, b):
+        D_in, D_out = W.shape
+        layer = nn.Linear(D_in, D_out, bias=True)
+        with torch.no_grad():
+            layer.weight.copy_((W.t().contiguous()) * (scale * polarity))
+            layer.bias.copy_(b * polarity if polarity == -1 else b)
+        return HeadAlignedSCLinear(layer, sc_prec=sc_prec, mode=mode,
+                                   n_heads=n_heads, cfg_override=cfg_override)
+    return factory
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data_root", default="/scratch/nbleier_owned_root/nbleier_owned1/shared_data/imagenet/data")
@@ -216,6 +299,38 @@ def main():
     ap.add_argument("--skip_baseline", action="store_true",
                     help="Skip the raw-SC evaluation (useful when the baseline "
                          "is already recorded from a sibling sweep).")
+    # ---- Comp-kernel choice (how the installed W̄, b̄ is executed) ----
+    ap.add_argument("--comp_mode", choices=["fp", "sc"], default="sc",
+                    help="Kernel for the installed correction matmul. 'sc' "
+                         "(default) routes W̄ through SCLinear so the whole "
+                         "inference path stays in SC hardware. 'fp' uses a "
+                         "bare nn.Linear — debug / baseline only.")
+    ap.add_argument("--comp_sc_prec", type=int, default=8,
+                    help="SC bit-precision of the comp matmul (when --comp_mode sc).")
+    ap.add_argument("--comp_sc_mode", choices=["bipolar", "unipolar"], default="bipolar",
+                    help="Per-row SC quant mode of the comp matmul.")
+    ap.add_argument("--n_variants", type=int, default=1,
+                    help="Size of the Sobol-seed bank for the comp kernel "
+                         "(default + antithetic + alt-seeds). Per-block "
+                         "selection picks the variant with lowest post-comp "
+                         "residual = log2(n_variants) config bits per block. "
+                         "1 = no search (default).")
+    ap.add_argument("--polarity_flip", action="store_true",
+                    help="Add the -1 polarity variant for each Sobol cfg. "
+                         "Doubles n_variants (+1 extra config bit per block).")
+    ap.add_argument("--w_scales", type=str, default="1.0",
+                    help="Comma-separated W-magnitude scales to search over, "
+                         "e.g. '0.5,0.75,1.0'. Per-block pick. Extra "
+                         "log2(n_scales) config bits.")
+    ap.add_argument("--head_aligned", action="store_true",
+                    help="Include head-aligned SC comp variants (per-head "
+                         "D=64 SC matmul reusing _CFG_CACHE[(64, sc_prec)] = "
+                         "block QK pool — 0 extra Sobol config cache).")
+    ap.add_argument("--head_aligned_only", action="store_true",
+                    help="Drop the full-width SC variants; use only head-"
+                         "aligned. Implies --head_aligned.")
+    ap.add_argument("--n_heads", type=int, default=16,
+                    help="Head count for HeadAlignedSCLinear; must divide D=1024.")
     ap.add_argument("--out_json", default="results/qwt_sc_overnight.json")
     # ---- Mixed precision (same CLI as eval.py; piped into patch_model) ----
     ap.add_argument("--mp_levels", default="")
@@ -308,6 +423,50 @@ def main():
         res_sc_raw = evaluate(model_sc, eval_loader, device)
         print("[result:sc_raw]", res_sc_raw, flush=True)
 
+    # Build the comp-kernel variants: cartesian of
+    # {Sobol seeds} × {polarities} × {scales} × {full-width, head-aligned}.
+    D_resid = 1024  # ViT-L residual dim
+    seed_bank = build_seed_bank(D_resid, args.comp_sc_prec, args.n_variants)
+    polarities = [1, -1] if args.polarity_flip else [1]
+    scales = [float(s) for s in args.w_scales.split(",")]
+    variants = []
+    if args.comp_mode == "sc":
+        if not args.head_aligned_only:
+            for sname, cfg in seed_bank:
+                for pol in polarities:
+                    for sc in scales:
+                        name = f"sc/{sname}/p{'+' if pol > 0 else '-'}/s{sc:.2f}"
+                        variants.append((name, make_sc_factory(
+                            args.comp_sc_prec, args.comp_sc_mode,
+                            cfg_override=cfg, scale=sc, polarity=pol)))
+        if args.head_aligned or args.head_aligned_only:
+            for pol in polarities:
+                for sc in scales:
+                    name = f"head_aligned/p{'+' if pol > 0 else '-'}/s{sc:.2f}/h{args.n_heads}"
+                    variants.append((name, make_head_aligned_factory(
+                        args.comp_sc_prec, args.comp_sc_mode,
+                        n_heads=args.n_heads, cfg_override=None,
+                        scale=sc, polarity=pol)))
+    else:  # fp comp — debug / baseline
+        for pol in polarities:
+            for sc in scales:
+                name = f"fp/p{'+' if pol > 0 else '-'}/s{sc:.2f}"
+                variants.append((name, make_fp_factory(scale=sc, polarity=pol)))
+
+    print(f"[comp] mode={args.comp_mode}  variants={len(variants)}  "
+          f"(seeds={len(seed_bank)} pols={len(polarities)} scales={len(scales)})", flush=True)
+    for name, _ in variants[:8]:
+        print(f"        - {name}", flush=True)
+    if len(variants) > 8:
+        print(f"        ... ({len(variants)-8} more)", flush=True)
+
+    comp_factory = None
+    comp_factory_variants = None
+    if len(variants) == 1:
+        comp_factory = variants[0][1]
+    elif len(variants) > 1:
+        comp_factory_variants = variants
+
     print("[calib] starting QwT cross-seed calibration", flush=True)
     t_cal = time.time()
     seed_all(args.calib_seed)
@@ -332,6 +491,8 @@ def main():
         norm_floor=args.norm_floor,
         last_block_cos_threshold=last_tau,
         lookahead_veto=args.lookahead_veto,
+        comp_factory=comp_factory,
+        comp_factory_variants=comp_factory_variants,
     )
     calib_s = time.time() - t_cal
     print(f"[calib] done in {calib_s:.1f}s", flush=True)
@@ -359,6 +520,10 @@ def main():
     res_fp = evaluate(model_fp, eval_loader, device)
     print("[result:fp]", res_fp, flush=True)
 
+    from collections import Counter
+    chosen = [r.get("variant") for r in calib_report]
+    variant_counts = dict(Counter([c for c in chosen if c is not None]))
+
     out = {
         "config": {
             "sc_config": args.sc_config, "sc_prec": args.sc_prec,
@@ -370,11 +535,20 @@ def main():
             "norm_floor": args.norm_floor,
             "last_block_cos_threshold": args.last_block_cos_threshold,
             "lookahead_veto": bool(args.lookahead_veto),
+            "comp_mode": args.comp_mode,
+            "comp_sc_prec": args.comp_sc_prec,
+            "comp_sc_mode": args.comp_sc_mode,
+            "n_variants": args.n_variants,
+            "polarity_flip": bool(args.polarity_flip),
+            "w_scales": args.w_scales,
+            "head_aligned": bool(args.head_aligned or args.head_aligned_only),
+            "n_heads": args.n_heads if (args.head_aligned or args.head_aligned_only) else None,
         },
         "calib": {
             "per_block": calib_report,
             "elapsed_s": calib_s,
             "n_enabled_blocks": n_enabled,
+            "variant_counts": variant_counts,
         },
         "results": {"fp": res_fp, "sc_raw": res_sc_raw, "sc_comp": res_sc_comp},
         "stoc_len": sl_stats,

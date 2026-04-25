@@ -24,7 +24,10 @@ if (QWT_SC_LIB / "qwt_sc").exists():
 
 from eval import load_model, seed_all
 from qwt_sc import calibrate_qwt
-from qwt_sc_overnight import build_dataset, evaluate, get_blocks
+from qwt_sc_overnight import (
+    build_dataset, evaluate, get_blocks,
+    build_seed_bank, make_sc_factory, make_fp_factory, make_head_aligned_factory,
+)
 from sc_attention_patch import SC_OP_NAMES, SCLinear, make_sc_attention_forward, set_noise_model
 from sc_integration.mp_linear import MPConfig
 from mp_budget_swap_search import (
@@ -247,6 +250,19 @@ def main():
     ap.add_argument("--lookahead_veto", action="store_true",
                     help="One-step binary lookahead on block i+1 — veto apply "
                          "if 'skip' beats 'apply'. Cheap insurance.")
+    # ---- Comp-kernel choice (how the installed W̄, b̄ is executed) ----
+    ap.add_argument("--comp_mode", choices=["fp", "sc"], default="sc",
+                    help="Kernel for the installed correction matmul. 'sc' "
+                         "(default) routes W̄ through SCLinear so the whole "
+                         "inference path stays in SC hardware. 'fp' uses a "
+                         "bare nn.Linear — debug / baseline only.")
+    ap.add_argument("--comp_sc_prec", type=int, default=8)
+    ap.add_argument("--comp_sc_mode", choices=["bipolar", "unipolar"], default="bipolar")
+    ap.add_argument("--head_aligned", action="store_true",
+                    help="Use HeadAlignedSCLinear (per-head D=64, reuses block "
+                         "QK _CFG_CACHE) for SC comp. No effect when --comp_mode fp.")
+    ap.add_argument("--n_heads", type=int, default=16,
+                    help="Head count for HeadAlignedSCLinear; must divide D=1024.")
     ap.add_argument("--skip_qwt", action="store_true",
                     help="Skip calibration; evaluate raw SC model only.")
     ap.add_argument("--out_json", default="results/eval_custom_sl_map_fpcomp.json")
@@ -294,6 +310,30 @@ def main():
         print("[result:sc_raw]", res_sc_raw, flush=True)
         results_block["sc_raw"] = res_sc_raw
     else:
+        # Build the single-variant comp factory (fast path — MP driver does
+        # not expose K-seed-bank search; use the uniform driver for that).
+        D_resid = 1024
+        if args.comp_mode == "sc":
+            if args.head_aligned:
+                comp_factory = make_head_aligned_factory(
+                    args.comp_sc_prec, args.comp_sc_mode,
+                    n_heads=args.n_heads, cfg_override=None,
+                    scale=1.0, polarity=1,
+                )
+                comp_desc = f"sc/head_aligned/h{args.n_heads}/prec{args.comp_sc_prec}"
+            else:
+                seed_bank = build_seed_bank(D_resid, args.comp_sc_prec, 1)
+                cfg0 = seed_bank[0][1]
+                comp_factory = make_sc_factory(
+                    args.comp_sc_prec, args.comp_sc_mode,
+                    cfg_override=cfg0, scale=1.0, polarity=1,
+                )
+                comp_desc = f"sc/default/prec{args.comp_sc_prec}/{args.comp_sc_mode}"
+        else:
+            comp_factory = make_fp_factory(scale=1.0, polarity=1)
+            comp_desc = "fp"
+        print(f"[comp] factory={comp_desc}", flush=True)
+
         t0 = time.time()
         seed_all(args.calib_seed)
         if args.calib_seed_b == args.calib_seed:
@@ -316,6 +356,7 @@ def main():
             norm_floor=args.norm_floor,
             last_block_cos_threshold=last_tau,
             lookahead_veto=args.lookahead_veto,
+            comp_factory=comp_factory,
         )
         calib_s = time.time() - t0
         print(f"[calib] done in {calib_s:.1f}s", flush=True)
@@ -351,6 +392,11 @@ def main():
             "last_block_cos_threshold": args.last_block_cos_threshold,
             "lookahead_veto": bool(args.lookahead_veto),
             "skip_qwt": bool(args.skip_qwt),
+            "comp_mode": args.comp_mode,
+            "comp_sc_prec": args.comp_sc_prec,
+            "comp_sc_mode": args.comp_sc_mode,
+            "head_aligned": bool(args.head_aligned),
+            "n_heads": args.n_heads if args.head_aligned else None,
         },
         "main_sl": main_sl,
         "allocation": summarize_allocation_custom(sl_map, active_ops),
