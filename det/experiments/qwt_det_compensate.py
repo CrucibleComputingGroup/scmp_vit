@@ -40,6 +40,8 @@ for p in (_DET, _REPO, _QWT_LIB):
         sys.path.insert(0, str(p))
 
 from eval_common import load_model_and_loader, set_evaluator_output_dir
+from mp_spec import (add_mp_args, build_attn_mp_spec, build_linear_mp_spec,
+                     mp_args_to_dict)
 from sc_patch import sc_patch_eva, SC_OP_NAMES
 from sc_integration.sc_linear import SCLinear
 from sc_integration.head_aligned_comp import HeadAlignedSCLinear
@@ -215,6 +217,7 @@ def main():
                    help="DETECTRON2_DATASETS root (default: GreatLakes shared_data).")
     p.add_argument("--ckpt", type=str, default="",
                    help="Path to EVA-ViTDet checkpoint (default: GreatLakes shared_data).")
+    add_mp_args(p)
     args = p.parse_args()
 
     if args.calib_seed_b == args.calib_seed:
@@ -248,8 +251,17 @@ def main():
         args.n_eval, **_load_kw)
     model_sc.eval()
 
+    linear_mp_spec = build_linear_mp_spec(args) or None
+    attn_mp_spec = build_attn_mp_spec(args) or None
+    if linear_mp_spec:
+        print(f"[mp] linear_mp_spec ops={sorted(linear_mp_spec)}", flush=True)
+    if attn_mp_spec:
+        print(f"[mp] attn_mp_spec ops={sorted(attn_mp_spec)}", flush=True)
+
     print(f"[sc] patching model_sc (sc_prec={args.sc_prec})", flush=True)
-    stats = sc_patch_eva(model_sc, sc_prec=args.sc_prec, sc_ops_per_block=sched)
+    stats = sc_patch_eva(model_sc, sc_prec=args.sc_prec, sc_ops_per_block=sched,
+                        linear_mp_spec=linear_mp_spec,
+                        attn_mp_spec=attn_mp_spec)
     print(f"[sc] patched: {stats}", flush=True)
 
     # --- SC baseline (optional) ---
@@ -405,6 +417,7 @@ def main():
             "calib_slice_a_start": start_a,
             "calib_slice_b_start": start_b,
             "sc_cfg_cache_keys": [list(k) for k in cache_keys] if cache_keys else None,
+            "mp": mp_args_to_dict(args),
         },
         "calib": {
             "per_block": report,

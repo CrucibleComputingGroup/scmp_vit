@@ -25,13 +25,18 @@ import torch
 from eval_common import load_model_and_loader, set_evaluator_output_dir
 
 _HERE = Path(__file__).resolve().parent
-if str(_HERE) not in sys.path:
-    sys.path.insert(0, str(_HERE))
+_REPO = _HERE.parent
+for _p in (_HERE, _REPO):
+    if str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
 from sc_patch import (  # noqa: E402
     sc_patch_eva,
     SC_OP_NAMES,
     normalize_sc_ops_per_block,
     count_sc_ops,
+)
+from mp_spec import (  # noqa: E402
+    add_mp_args, build_attn_mp_spec, build_linear_mp_spec, mp_args_to_dict,
 )
 
 # Canonical 5-name vocabulary matching vit_sc's SC_OP_NAMES. "proj" expands
@@ -167,6 +172,7 @@ def main():
                    help="DETECTRON2_DATASETS root (default: GreatLakes shared_data).")
     p.add_argument("--ckpt", type=str, default="",
                    help="Path to EVA-ViTDet checkpoint (default: GreatLakes shared_data).")
+    add_mp_args(p)
     args = p.parse_args()
 
     tag = args.out_tag or f"sc_p{args.sc_prec}"
@@ -191,6 +197,13 @@ def main():
         on, tot = stats_requested[op]
         print(f"    {op:<10s}  {on:3d}/{tot}")
 
+    linear_mp_spec = build_linear_mp_spec(args) or None
+    attn_mp_spec = build_attn_mp_spec(args) or None
+    if linear_mp_spec:
+        print(f"    linear_mp_spec ops={sorted(linear_mp_spec)}")
+    if attn_mp_spec:
+        print(f"    attn_mp_spec ops={sorted(attn_mp_spec)}")
+
     print(f"[3] Patching backbone (sc_prec={args.sc_prec}, "
           f"mlp_mode={args.sc_mlp_mode}, proj_mode={args.sc_proj_mode})")
     stats = sc_patch_eva(
@@ -199,6 +212,8 @@ def main():
         sc_ops_per_block=sched,
         mlp_mode=args.sc_mlp_mode,
         proj_mode=args.sc_proj_mode,
+        linear_mp_spec=linear_mp_spec,
+        attn_mp_spec=attn_mp_spec,
     )
     print(f"    swapped: {stats}")
 
@@ -220,6 +235,7 @@ def main():
         "n_blocks": n_blocks,
         "schedule": {k: list(v) for k, v in sched.items()},
         "swapped": stats,
+        "mp": mp_args_to_dict(args),
         "eval_seconds": dt,
         **results,
     }
