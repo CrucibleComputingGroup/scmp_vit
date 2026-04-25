@@ -217,6 +217,11 @@ def main():
                    help="DETECTRON2_DATASETS root (default: GreatLakes shared_data).")
     p.add_argument("--ckpt", type=str, default="",
                    help="Path to EVA-ViTDet checkpoint (default: GreatLakes shared_data).")
+    p.add_argument("--sl_map_json", default="",
+                   help="Per-(op, block) stoc_len map from "
+                        "experiments/mp_budget_swap_search.py. When set, "
+                        "overrides --sc_ops_per_block_json and --mp_* flags; "
+                        "patches the SC model per-block via the sl_map.")
     add_mp_args(p)
     args = p.parse_args()
 
@@ -253,15 +258,35 @@ def main():
 
     linear_mp_spec = build_linear_mp_spec(args) or None
     attn_mp_spec = build_attn_mp_spec(args) or None
-    if linear_mp_spec:
-        print(f"[mp] linear_mp_spec ops={sorted(linear_mp_spec)}", flush=True)
-    if attn_mp_spec:
-        print(f"[mp] attn_mp_spec ops={sorted(attn_mp_spec)}", flush=True)
 
-    print(f"[sc] patching model_sc (sc_prec={args.sc_prec})", flush=True)
-    stats = sc_patch_eva(model_sc, sc_prec=args.sc_prec, sc_ops_per_block=sched,
-                        linear_mp_spec=linear_mp_spec,
-                        attn_mp_spec=attn_mp_spec)
+    if args.sl_map_json:
+        # Per-(op, block) sl_map mode — bypass sc_patch_eva for SC patching
+        # and use the MP search's per-block patcher.
+        from experiments.mp_budget_swap_search import _patch_block_with_spec
+        from sc_integration import mp_search as ms
+        with open(args.sl_map_json) as f:
+            sl_map_d = json.load(f)
+        sl_map = sl_map_d.get("sl_map", sl_map_d) if isinstance(sl_map_d, dict) else sl_map_d
+        print(f"[sc] patching model_sc per-block from sl_map "
+              f"({args.sl_map_json}) sc_prec={args.sc_prec}", flush=True)
+        stats = {op: 0 for op in SC_OP_NAMES}
+        for bi in range(len(model_sc.backbone.net.blocks)):
+            spec = ms.build_current_spec(sl_map, SC_OP_NAMES, bi)
+            new_blk = _patch_block_with_spec(
+                model_sc.backbone.net.blocks[bi], args.sc_prec, spec)
+            model_sc.backbone.net.blocks[bi] = new_blk.cuda()
+            for op in SC_OP_NAMES:
+                if ms.entry_to_mpconfig(spec.get(op, 0)) is not None:
+                    stats[op] += 1
+    else:
+        if linear_mp_spec:
+            print(f"[mp] linear_mp_spec ops={sorted(linear_mp_spec)}", flush=True)
+        if attn_mp_spec:
+            print(f"[mp] attn_mp_spec ops={sorted(attn_mp_spec)}", flush=True)
+        print(f"[sc] patching model_sc (sc_prec={args.sc_prec})", flush=True)
+        stats = sc_patch_eva(model_sc, sc_prec=args.sc_prec, sc_ops_per_block=sched,
+                            linear_mp_spec=linear_mp_spec,
+                            attn_mp_spec=attn_mp_spec)
     print(f"[sc] patched: {stats}", flush=True)
 
     # --- SC baseline (optional) ---

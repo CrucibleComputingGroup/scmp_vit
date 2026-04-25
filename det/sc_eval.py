@@ -172,6 +172,11 @@ def main():
                    help="DETECTRON2_DATASETS root (default: GreatLakes shared_data).")
     p.add_argument("--ckpt", type=str, default="",
                    help="Path to EVA-ViTDet checkpoint (default: GreatLakes shared_data).")
+    p.add_argument("--sl_map_json", default="",
+                   help="Per-(op, block) stoc_len map from "
+                        "experiments/mp_budget_swap_search.py. When set, "
+                        "overrides --sc_ops_per_block_json and --mp_* flags; "
+                        "patches each block individually via the sl_map.")
     add_mp_args(p)
     args = p.parse_args()
 
@@ -187,35 +192,60 @@ def main():
     n_blocks = len(list(model.backbone.net.blocks))
     print(f"    n_blocks = {n_blocks}")
 
-    sched = build_schedule(args, n_blocks)
-    stats_requested = count_sc_ops(sched)
+    if args.sl_map_json:
+        # Per-(op, block) sl_map mode — bypass sc_patch_eva and use the
+        # MP search's per-block patcher.
+        with open(args.sl_map_json) as f:
+            sl_map_d = json.load(f)
+        sl_map = sl_map_d.get("sl_map", sl_map_d) if isinstance(sl_map_d, dict) else sl_map_d
+        from experiments.mp_budget_swap_search import _patch_block_with_spec
+        from sc_integration import mp_search as ms
+        print(f"[2] Schedule (tier: sl_map_json={args.sl_map_json})")
+        sched = {op: [int(bool(ms.entry_to_mpconfig(sl_map[op][bi])))
+                      for bi in range(n_blocks)] for op in SC_OP_NAMES}
+        stats_requested = count_sc_ops(sched)
+        for op in SC_OP_NAMES:
+            on, tot = stats_requested[op]
+            print(f"    {op:<10s}  {on:3d}/{tot}")
+        print(f"[3] Patching backbone per-block from sl_map "
+              f"(sc_prec={args.sc_prec})")
+        for bi in range(n_blocks):
+            spec = ms.build_current_spec(sl_map, SC_OP_NAMES, bi)
+            new_blk = _patch_block_with_spec(
+                model.backbone.net.blocks[bi], args.sc_prec, spec)
+            model.backbone.net.blocks[bi] = new_blk.cuda()
+        stats = stats_requested
+        linear_mp_spec = None
+        attn_mp_spec = None
+    else:
+        sched = build_schedule(args, n_blocks)
+        stats_requested = count_sc_ops(sched)
+        tier = ("sc_ops_per_block_json" if args.sc_ops_per_block_json
+                else "sc_ops" if args.sc_ops else "per-op flags")
+        print(f"[2] Schedule (tier: {tier})")
+        for op in SC_OP_NAMES:
+            on, tot = stats_requested[op]
+            print(f"    {op:<10s}  {on:3d}/{tot}")
 
-    tier = ("sc_ops_per_block_json" if args.sc_ops_per_block_json
-            else "sc_ops" if args.sc_ops else "per-op flags")
-    print(f"[2] Schedule (tier: {tier})")
-    for op in SC_OP_NAMES:
-        on, tot = stats_requested[op]
-        print(f"    {op:<10s}  {on:3d}/{tot}")
+        linear_mp_spec = build_linear_mp_spec(args) or None
+        attn_mp_spec = build_attn_mp_spec(args) or None
+        if linear_mp_spec:
+            print(f"    linear_mp_spec ops={sorted(linear_mp_spec)}")
+        if attn_mp_spec:
+            print(f"    attn_mp_spec ops={sorted(attn_mp_spec)}")
 
-    linear_mp_spec = build_linear_mp_spec(args) or None
-    attn_mp_spec = build_attn_mp_spec(args) or None
-    if linear_mp_spec:
-        print(f"    linear_mp_spec ops={sorted(linear_mp_spec)}")
-    if attn_mp_spec:
-        print(f"    attn_mp_spec ops={sorted(attn_mp_spec)}")
-
-    print(f"[3] Patching backbone (sc_prec={args.sc_prec}, "
-          f"mlp_mode={args.sc_mlp_mode}, proj_mode={args.sc_proj_mode})")
-    stats = sc_patch_eva(
-        model,
-        sc_prec=args.sc_prec,
-        sc_ops_per_block=sched,
-        mlp_mode=args.sc_mlp_mode,
-        proj_mode=args.sc_proj_mode,
-        linear_mp_spec=linear_mp_spec,
-        attn_mp_spec=attn_mp_spec,
-    )
-    print(f"    swapped: {stats}")
+        print(f"[3] Patching backbone (sc_prec={args.sc_prec}, "
+              f"mlp_mode={args.sc_mlp_mode}, proj_mode={args.sc_proj_mode})")
+        stats = sc_patch_eva(
+            model,
+            sc_prec=args.sc_prec,
+            sc_ops_per_block=sched,
+            mlp_mode=args.sc_mlp_mode,
+            proj_mode=args.sc_proj_mode,
+            linear_mp_spec=linear_mp_spec,
+            attn_mp_spec=attn_mp_spec,
+        )
+        print(f"    swapped: {stats}")
 
     from detectron2.evaluation import inference_on_dataset
 

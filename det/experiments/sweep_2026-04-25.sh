@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
-# det production sweep — port of cls/experiments/sweep_int678_skip30.sh.
-# Cross-seed gate + head-aligned SC comp + uniform/MP-192 mode × QwT off/on
-# across sc_prec ∈ {7,8} × K ∈ {20,30}.
+# det production sweep — port of cls/experiments/sweep_int678_skip30.sh
+# matrix structure:
+#   prec_tag ∈ {p7, avg192, p8} × mode ∈ {uniform, mp} × qwt ∈ {off, on}
+#                                                = 10 evals (no p8_mp; same as cls)
+# plus 2 MP-budget swap searches (one per mp tag) producing the sl_maps.
 #
 # Smoke-test via env overrides:
-#   N_EVAL=100 N_CALIB=64 \
+#   N_EVAL=10 N_CALIB=16 SEARCH_N_SEARCH=4 SEARCH_MAX_ITERS=2 \
 #   RES_DIR=results/smoke_2026-04-25 LOG_DIR=logs/smoke_2026-04-25 \
 #     bash det/experiments/sweep_2026-04-25.sh
 #
@@ -18,15 +20,12 @@
 #
 # Notes
 # -----
-# * det has no skip_worst_*_int8.json — only int6/int7 sensitivity matrices
-#   exist. We use skip_worst_K_int7.json as the schedule for sc_prec=8 too,
-#   since at lower SC noise the cells worst at int7 stay the worst order
-#   (just smaller absolute drops). Conservative substitution; flagged in
-#   RESULTS.md.
-# * det has no MP-budget swap search yet (cls's mp_budget_swap_search.py
-#   has a known equal-MAC DP limitation; see docs/SC_COMP_ALGORITHM.md
-#   §"MP-vs-uniform parity"). MP runs here use the simple uniform-192
-#   trick — every linear/attn op gets stoc_len=192.
+# * det has no skip_worst_*_int8.json — we use skip_worst_K_int7.json for
+#   sc_prec=8 (conservative — int7-derived ranking is over-cautious at int8).
+# * det's MP-budget swap search lives at det/experiments/mp_budget_swap_search.py
+#   (uses the shared algorithm core in sc_integration/mp_search.py). Equal-MAC
+#   DP requires search ops to share the same per-(op, block) MAC; default
+#   --search_ops mlp_fc1,mlp_fc2 (qkv_proj/out_proj/qk/av pinned via fixed_ops).
 set -euo pipefail
 
 cd "$(dirname "$0")/.."   # → det/
@@ -47,112 +46,157 @@ RIDGE="${RIDGE:-1e-2}"
 FWD_CHUNK="${FWD_CHUNK:-2}"
 HEAD_ALIGNED="${HEAD_ALIGNED:-1}"
 HEAD_ALIGNED_HEADS="${HEAD_ALIGNED_HEADS:-16}"
+K_SCHEDULE="${K_SCHEDULE:-30}"
 
 LINEAR_MP_OPS="mlp_fc1,mlp_fc2,qkv_proj,out_proj"
-MP_LEVEL="${MP_LEVEL:-192}"  # uniform MP target stoc_len
+AVG192_LEVEL="${AVG192_LEVEL:-192}"
+
+# MP-budget swap search knobs
+SEARCH_OPS="${SEARCH_OPS:-mlp_fc1,mlp_fc2}"
+SEARCH_LEVELS="${SEARCH_LEVELS:-64,96,128,192,256}"
+SEARCH_PROXY="${SEARCH_PROXY:-comp_residual}"
+SEARCH_N_SEARCH="${SEARCH_N_SEARCH:-8}"
+SEARCH_MAX_ITERS="${SEARCH_MAX_ITERS:-4}"
+SEARCH_SEED="${SEARCH_SEED:-1}"
 
 LOG_DIR="${LOG_DIR:-logs/sweep_2026-04-25}"
 RES_DIR="${RES_DIR:-results/sweep_2026-04-25}"
-mkdir -p "$LOG_DIR" "$RES_DIR"
+MAP_DIR="${MAP_DIR:-$RES_DIR/sl_maps}"
+mkdir -p "$LOG_DIR" "$RES_DIR" "$MAP_DIR"
 
-# Schedule file lookup. Currently: int7 schedules used for both sc_prec=7
-# and sc_prec=8 (no int8 sensitivity sweep — see header note).
-sched_for() {
-  local sc_prec=$1 K=$2
-  local sens_p=7
-  [[ $sc_prec == 6 ]] && sens_p=6
-  echo "sensitivity/skip/skip_worst_${K}_int${sens_p}.json"
+SCHED_INT7="sensitivity/skip/skip_worst_${K_SCHEDULE}_int7.json"
+
+# --- Per-tag accessors ---------------------------------------------------------
+# target main SL: p7=128 (sc_prec=7), avg192=192, p8=256 (sc_prec=8).
+target_main_sl_for_tag() { case "$1" in p7) echo 128 ;; avg192) echo 192 ;; p8) echo 256 ;; esac; }
+# fixed-op stoc_len for the search (pin qk/av/projs to the target SL).
+fixed_for_tag()          {
+  local t=$(target_main_sl_for_tag "$1")
+  echo "qk=${t},av=${t},qkv_proj=${t},out_proj=${t}"
+}
+sl_map_for_tag()         { case "$1" in p7) echo "$MAP_DIR/p7_mp_sl_map.json" ;; avg192) echo "$MAP_DIR/avg192_mp_sl_map.json" ;; esac; }
+
+# --- Search command builder ---------------------------------------------------
+
+build_search_cmd() {
+  local tag=$1 out=$2
+  local target; target=$(target_main_sl_for_tag "$tag")
+  local fixed; fixed=$(fixed_for_tag "$tag")
+  echo python experiments/mp_budget_swap_search.py \
+    --sc_config "skip_worst${K_SCHEDULE}" \
+    --target_main_sl "$target" \
+    --levels "$SEARCH_LEVELS" \
+    --search_ops "$SEARCH_OPS" \
+    --fixed_ops "$fixed" \
+    --proxy "$SEARCH_PROXY" \
+    --init_mode uniform_repair --init_level "$target" \
+    --n_search "$SEARCH_N_SEARCH" --search_seed "$SEARCH_SEED" \
+    --max_iters "$SEARCH_MAX_ITERS" \
+    --sc_prec 8 \
+    --out_json "$out"
 }
 
-build_qwt_cmd() {
-  local sc_prec=$1 K=$2 mode=$3 qwt=$4 name=$5
-  local sched; sched=$(sched_for "$sc_prec" "$K")
-  local out_json="$RES_DIR/${name}.json"
-  local args=(
-    --sc_prec "$sc_prec"
-    --sc_ops_per_block_json "$sched"
-    --n_calib "$N_CALIB" --n_eval "$N_EVAL"
-    --calib_seed "$CALIB_SEED" --calib_seed_b "$CALIB_SEED_B"
-    --cos_threshold "$COS_THR"
-    --last_block_cos_threshold "$LAST_COS_THR"
-    --lookahead_veto
-    --ridge "$RIDGE" --fwd_chunk "$FWD_CHUNK"
-    --comp_mode sc --comp_sc_prec "$COMP_SC_PREC"
-    --out_tag "$name"
-    --out_json "$out_json"
-  )
+# --- Eval command builder -----------------------------------------------------
+
+build_eval_cmd() {
+  local tag=$1 mode=$2 qwt=$3 name=$4
+  local out_json=$RES_DIR/${name}.json
+  local ha_args=()
   if [[ -n "$HEAD_ALIGNED" ]]; then
-    args+=(--head_aligned --n_heads "$HEAD_ALIGNED_HEADS")
+    ha_args=(--head_aligned --n_heads "$HEAD_ALIGNED_HEADS")
   fi
-  if [[ "$mode" == "mp192" ]]; then
-    args+=(
-      --mp_levels "$MP_LEVEL" --mp_fractions 1.0 --mp_ops "$LINEAR_MP_OPS"
-      --qk_mp_levels "$MP_LEVEL" --qk_mp_fractions 1.0
-      --av_mp_levels "$MP_LEVEL" --av_mp_fractions 1.0
-    )
-  fi
-  echo python experiments/qwt_det_compensate.py "${args[@]}"
-}
 
-build_sc_cmd() {
-  # raw SC (no QwT) — uses sc_eval.py
-  local sc_prec=$1 K=$2 mode=$3 name=$4
-  local sched; sched=$(sched_for "$sc_prec" "$K")
-  local out_tag="$name"
-  local args=(
-    --sc_prec "$sc_prec"
-    --sc_ops_per_block_json "$sched"
-    --n-eval "$N_EVAL"
-    --out-tag "$out_tag"
-  )
-  if [[ "$mode" == "mp192" ]]; then
-    args+=(
-      --mp_levels "$MP_LEVEL" --mp_fractions 1.0 --mp_ops "$LINEAR_MP_OPS"
-      --qk_mp_levels "$MP_LEVEL" --qk_mp_fractions 1.0
-      --av_mp_levels "$MP_LEVEL" --av_mp_fractions 1.0
-    )
+  # Determine sc_prec / schedule / per-tag mode args.
+  local sc_prec=8
+  local sched=""
+  local mode_args=()
+  case "$tag" in
+    p7) sc_prec=7; sched="$SCHED_INT7" ;;
+    p8) sc_prec=8; sched="$SCHED_INT7" ;;
+    avg192)
+      sc_prec=8; sched="$SCHED_INT7"
+      # Uniform-fractional MP at AVG192_LEVEL across all SC ops (only for
+      # mode=uniform — the mp variant uses the search-derived sl_map).
+      mode_args=(
+        --mp_levels "$AVG192_LEVEL" --mp_fractions 1.0 --mp_ops "$LINEAR_MP_OPS"
+        --qk_mp_levels "$AVG192_LEVEL" --qk_mp_fractions 1.0
+        --av_mp_levels "$AVG192_LEVEL" --av_mp_fractions 1.0
+      )
+      ;;
+  esac
+
+  # MP variant: replace mode_args with the per-(op, block) sl_map.
+  if [[ "$mode" == "mp" ]]; then
+    local map; map=$(sl_map_for_tag "$tag")
+    mode_args=(--sl_map_json "$map")
   fi
-  echo python sc_eval.py "${args[@]}"
+
+  if [[ "$qwt" == "off" ]]; then
+    # Raw SC eval via sc_eval.py
+    local args=(
+      --sc_prec "$sc_prec"
+      --sc_ops_per_block_json "$sched"
+      --n-eval "$N_EVAL"
+      --out-tag "$name"
+      "${mode_args[@]}"
+    )
+    echo python sc_eval.py "${args[@]}"
+  else
+    # SC + cross-seed QwT comp via qwt_det_compensate.py
+    local args=(
+      --sc_prec "$sc_prec"
+      --sc_ops_per_block_json "$sched"
+      --n_calib "$N_CALIB" --n_eval "$N_EVAL"
+      --calib_seed "$CALIB_SEED" --calib_seed_b "$CALIB_SEED_B"
+      --cos_threshold "$COS_THR" --last_block_cos_threshold "$LAST_COS_THR"
+      --lookahead_veto
+      --ridge "$RIDGE" --fwd_chunk "$FWD_CHUNK"
+      --comp_mode sc --comp_sc_prec "$COMP_SC_PREC"
+      --out_tag "$name" --out_json "$out_json"
+      "${mode_args[@]}" "${ha_args[@]}"
+    )
+    echo python experiments/qwt_det_compensate.py "${args[@]}"
+  fi
 }
 
 # --- Task definitions --------------------------------------------------------
 TASK_NAMES=()
 TASK_CMDS=()
 TASK_OUT=()
+TASK_PREREQ=()
 
 add_task() {
-  local name=$1 cmd=$2 out=$3
-  TASK_NAMES+=("$name")
-  TASK_CMDS+=("$cmd")
-  TASK_OUT+=("$out")
+  TASK_NAMES+=("$1"); TASK_CMDS+=("$2"); TASK_OUT+=("$3"); TASK_PREREQ+=("$4")
 }
 
-# Eval cells: sc_prec ∈ {7,8} × K ∈ {20,30} × mode ∈ {uniform, mp192}
-# × qwt ∈ {off, on} = 16 evals. The qwt=on cell already runs raw SC inside
-# the same driver (`--skip_baseline` not set), so qwt=off is a sanity duplicate
-# that we route through sc_eval.py to keep raw vs comp on a fully separate
-# code path.
-for sc_prec in 7 8; do
-  for K in 20 30; do
-    for mode in uniform mp192; do
-      base="p${sc_prec}_K${K}_${mode}"
-      # qwt=off → raw SC eval via sc_eval.py
-      name_off="${base}_qwtoff"
-      out_off="$RES_DIR/${name_off}/metrics.json"
-      add_task "$name_off" "$(build_sc_cmd "$sc_prec" "$K" "$mode" "$name_off")" "$out_off"
-      # qwt=on → cross-seed calibration + head-aligned comp eval
-      name_on="${base}_qwton"
-      out_on="$RES_DIR/${name_on}.json"
-      add_task "$name_on" "$(build_qwt_cmd "$sc_prec" "$K" "$mode" on "$name_on")" "$out_on"
-    done
-  done
+# Searches first (their sl_maps are prereqs for mp evals).
+MAP_P7=$(sl_map_for_tag p7)
+MAP_AVG192=$(sl_map_for_tag avg192)
+[[ -f $MAP_P7 ]]     || add_task "search_p7"     "$(build_search_cmd p7 "$MAP_P7")"         "$MAP_P7" ""
+[[ -f $MAP_AVG192 ]] || add_task "search_avg192" "$(build_search_cmd avg192 "$MAP_AVG192")" "$MAP_AVG192" ""
+
+# Eval matrix. p8_mp omitted (same as cls — p8 has no mp variant).
+EVAL_RUNS=(
+  "p7     uniform off"  "p7     uniform on"
+  "p7     mp      off"  "p7     mp      on"
+  "p8     uniform off"  "p8     uniform on"
+  "avg192 uniform off"  "avg192 uniform on"
+  "avg192 mp      off"  "avg192 mp      on"
+)
+for entry in "${EVAL_RUNS[@]}"; do
+  read -r tag mode qwt <<< "$entry"
+  name="${tag}_${mode}_qwt${qwt}"
+  if [[ "$qwt" == "off" ]]; then
+    outj="$RES_DIR/${name}/metrics.json"
+  else
+    outj="$RES_DIR/${name}.json"
+  fi
+  prereq=""
+  [[ "$mode" == "mp" ]] && prereq=$(sl_map_for_tag "$tag")
+  add_task "$name" "$(build_eval_cmd "$tag" "$mode" "$qwt" "$name")" "$outj" "$prereq"
 done
 
 # --- Unified 4-GPU pool scheduler -------------------------------------------
-# Same shape as cls/experiments/sweep_int678_skip30.sh's scheduler. Det has
-# no search prereqs in this iteration (no MP-budget swap search yet), so the
-# task graph is fully parallel.
-
 MAX_PAR=4
 declare -A gpu_of_pid
 declare -A pid_on_gpu
@@ -245,6 +289,10 @@ while true; do
   launched_any=0
   for i in "${!TASK_NAMES[@]}"; do
     [[ ${done_mask[$i]} != 0 ]] && continue
+    prereq=${TASK_PREREQ[$i]}
+    if [[ -n $prereq && ! -f $prereq ]]; then
+      continue  # waiting for an upstream search's sl_map
+    fi
     gpu=$(pick_free_gpu) || break
     launch_task "$i" "$gpu"
     launched_any=1
@@ -253,7 +301,10 @@ while true; do
 
   if (( launched_any == 0 )); then
     if (( ${#active_pids[@]} == 0 )); then
-      echo "[fatal] no active workers and remaining tasks unlaunchable" >&2
+      echo "[fatal] no active workers and remaining tasks blocked on prereqs:" >&2
+      for i in "${!TASK_NAMES[@]}"; do
+        [[ ${done_mask[$i]} == 0 ]] && echo "  - ${TASK_NAMES[$i]} needs ${TASK_PREREQ[$i]}" >&2
+      done
       exit 1
     fi
     wait -n 2>/dev/null || true
