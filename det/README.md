@@ -3,6 +3,35 @@
 EVA-01-g ViTDet (patch16, 1280², embed 1408, 40 blocks) + COCO detection。
 SC 替换 attention / MLP 的六类 op（`mlp_fc1, mlp_fc2, qkv_proj, out_proj, qk, av`）。
 
+## What's new (2026-04-25)
+
+**Production status**: drivers rewritten around the cross-seed cosine gate
++ head-aligned SC compensator, mirroring the cls-side
+[`docs/SC_COMP_ALGORITHM.md`](../docs/SC_COMP_ALGORITHM.md) recipe (B_ha
+production winner at `n_heads=16, sc_prec=8`).
+
+- [`experiments/qwt_det_compensate.py`](experiments/qwt_det_compensate.py)
+  — calls the cross-seed `calibrate_qwt` API with two disjoint COCO val
+  slices (anchored at `--calib_seed` and `--calib_seed_b`); reports
+  per-block `cos_ab` instead of the deprecated `r²` field. Adds
+  `--head_aligned --n_heads 16` for HeadAlignedSCLinear comp.
+- [`sc_eval.py`](sc_eval.py) and the QwT driver above both gain the cls-side
+  MP CLI surface (`--mp_levels`, `--mp_ops`, `--qk_mp_levels`,
+  `--av_mp_levels`, plus `--range_mp*` / `--adaptive_mp*` for parity);
+  built into specs by [`mp_spec.py`](mp_spec.py) and passed through to
+  [`sc_patch_eva`](sc_patch/sc_model_eva.py).
+- [`experiments/sweep_2026-04-25.sh`](experiments/sweep_2026-04-25.sh) —
+  4-GPU pool harness covering `sc_prec ∈ {7, 8} × K ∈ {20, 30} × mode ∈
+  {uniform, mp192} × qwt ∈ {off, on}` at n_eval=5000.
+
+Updated [`RESULTS.md`](RESULTS.md) summarises the production recipe and
+holds the n_eval=5000 numbers (TBD until sweep finishes).
+
+The old `--min_r2` / `--avg_sc_draws` flags are gone — they belonged to
+the legacy r²-gate that the cross-seed gate physically supersedes (see
+[`third_party/QwT-SC/QwT-vit-sc/qwt_sc/compensation.py`](../third_party/QwT-SC/QwT-vit-sc/qwt_sc/compensation.py)
+module docstring for the derivation).
+
 ## 计划（三阶段）
 
 ### 阶段 1 — Sensitivity sweep（一次性）

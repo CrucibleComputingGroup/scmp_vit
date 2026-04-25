@@ -1,87 +1,99 @@
 # vit_sc/det — 实验结果
 
-本文件汇总 det 侧当前已完成的 QwT-SC 补偿实验结果，重点关注 `min_r2`
-门限对 SC-int8 补偿器稳定性的影响。
+本文件汇总 det 侧的 QwT-SC 补偿实验结果。当前的生产配方 = **cross-seed
+余弦门控 + head-aligned SC 补偿器**，与 cls 侧 ([`docs/SC_COMP_ALGORITHM.md`](../docs/SC_COMP_ALGORITHM.md))
+使用同一套门控算法和同一系列补偿核。
 
-项目规划、setup 与阶段划分见 [`README.md`](README.md)。
+项目规划见 [`README.md`](README.md)。
 
-## Baselines（COCO val, n_eval=10）
+## FP baseline (COCO val, n_eval=100)
 
-同一份 n_eval=10 子集（`results/smoke/`）：
+| metric | value |
+|---|---:|
+| bbox AP | 68.73 |
+| segm AP | 61.61 |
 
-| 模型 | bbox AP | segm AP |
-|---|---:|---:|
-| FP 参考（EVA-ViTDet-g） | 69.33 | 60.40 |
-| Raw SC（sw20_int6, sc_prec=6, no QwT） | 52.31 | 43.54 |
+源自 `results/fp100/metrics.json`。生产配置（n_eval=5000）下 FP 数字应
+在同一量级，因为 EVA-ViTDet 在 N=5000 vs N=100 之间几乎无 noise（metric
+是检测 AP，不是 top-1 比例）。
 
-Raw SC 相对 FP 损失约 −17.0 bbox / −16.9 segm。
+## Production sweep (n_eval=5000, 2026-04-25 之后)
 
-> 注：README 中记录的 FP@n_eval=100 是 bbox=68.73 / segm=61.61。本文所有实验
-> 都在 n_eval=10 上跑，数字波动较大（≈±1–2 AP），结论应以 Δ 而非绝对值理解。
+> **生产驱动器**：[`experiments/qwt_det_compensate.py`](experiments/qwt_det_compensate.py)
+> 用 cross-seed 余弦门控 + head-aligned 补偿核（默认配置：
+> `cos_threshold=0.5, last_block_cos_threshold=0.8, lookahead_veto,
+> n_heads=16, comp_sc_prec=8, comp_mode=sc`）。
+>
+> **Sweep 矩阵**：`sc_prec ∈ {7, 8} × K ∈ {20, 30} × mode ∈ {uniform,
+> mp192} × qwt ∈ {off, on}` = 16 个 cell。运行脚本：
+> [`experiments/sweep_2026-04-25.sh`](experiments/sweep_2026-04-25.sh)。
 
-## 阶段 3 预研：`min_r2` sweep（SC-int8 compensator）
+详见 `results/sweep_2026-04-25/` 下的每个 cell。**TBD：** 等 sweep 跑完
+后填入下表。占位符表示 sweep 未跑完。
 
-**固定**：`sc_prec=6`、schedule = `skip_worst_20_int6`（SC 覆盖 220/240
-op-block，≈92%）、`n_calib=16`、`n_eval=10`、`ridge=0.01`、`comp_mode=sc`、
-`comp_sc_prec=8`、`avg_sc_draws=1`。
+| sc_prec | K | mode | raw SC bbox | comp bbox | Δ bbox | admitted blocks |
+|---:|---:|---|---:|---:|---:|:---:|
+| 7 | 20 | uniform | TBD | TBD | TBD | TBD/40 |
+| 7 | 20 | mp192 | TBD | TBD | TBD | TBD/40 |
+| 7 | 30 | uniform | TBD | TBD | TBD | TBD/40 |
+| 7 | 30 | mp192 | TBD | TBD | TBD | TBD/40 |
+| 8 | 20 | uniform | TBD | TBD | TBD | TBD/40 |
+| 8 | 20 | mp192 | TBD | TBD | TBD | TBD/40 |
+| 8 | 30 | uniform | TBD | TBD | TBD | TBD/40 |
+| 8 | 30 | mp192 | TBD | TBD | TBD | TBD/40 |
 
-**变量**：`min_r2` ∈ {0.0, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8}。
+> **预期定性结论**（来自 cls N=50k）：
+> - largest Δ at lowest sc_prec：cls p7 +3.93 vs p8 +0.13；det 应同向。
+> - admitted blocks ≈ (N-2)/N：EVA-40 应 ≈38/40；blocks 0 / 39 拒掉。
+> - mp192 vs uniform 在同一 target SL 下基本持平（结构性，详见
+>   [`docs/SC_COMP_ALGORITHM.md`](../docs/SC_COMP_ALGORITHM.md) §"MP-vs-uniform parity"）。
 
-结果（`results/sw20_int6_qwt_sc_int8_n10[_r2_0_*]/run.json`）：
+## Sensitivity matrices 来源
 
-| min_r2 | enabled | bbox AP (comp) | segm AP (comp) | Δbbox vs raw SC |
-|---:|:---:|---:|---:|---:|
-| 0.0 | 40/40 |  0.00 |  0.00 | −52.31 |
-| **0.2** | **39/40** | **73.21** | **59.43** | **+20.90** |
-| 0.3 | 39/40 | 73.21 | 59.43 | +20.90 |
-| 0.4 | 38/40 | 72.34 | 59.01 | +20.03 |
-| 0.5 | 31/40 | 67.69 | 55.98 | +15.38 |
-| 0.6 | 29/40 | 65.30 | 55.25 | +12.99 |
-| 0.7 | 26/40 | 66.85 | 57.12 | +14.54 |
-| 0.8 | 21/40 | 67.61 | 55.81 | +15.30 |
+[`sensitivity/skip/skip_worst_{10,20,30}_int{6,7}.json`](sensitivity/skip/) —
+来自 [`sensitivity/sensitivity_int{6,7}_n100.json`](sensitivity/) 的 6×40
+COCO-AP-drop 矩阵，按 bbox_ap_drop 排序后取最差 K 个 (op, block) 留 FP。
 
-### 关键发现
+> **`int8` schedule 缺失**：当前没跑过 sc_prec=8 的 sensitivity sweep。
+> sc_prec=8 的 sweep 暂用 `skip_worst_K_int7.json`（保守替代：int7 最敏
+> 感的 cell 在 int8 下也是最敏感的 ordering，但绝对数值更小）。如果
+> int8 实测下出现 admitted < (N-2)/N 的反常，再做一次 `int8_n100`
+> sensitivity sweep。
 
-1. **Block 0 是毒瘤。** 当 `min_r2=0.0`（全 40 个 block 都上 SC-int8
-   补偿），bbox/segm 同时塌到 0.00。Block 0 的 calib r2 最低（0.164），
-   其 SC-int8 量化的 `W,b` 不稳定，串在流水线最前端会把后续所有特征
-   污染掉。只要把它禁掉（`min_r2 ≥ 0.2`，等价于 `enabled=39/40`），bbox
-   立刻回弹到 73.21（甚至在这个 n_eval=10 子集上超过 FP 参考）。
-2. **甜蜜点在 min_r2=0.2–0.3。** 这时只禁掉 block 0，其余 39 个 block
-   的 SC-int8 补偿都有效。
-3. **继续抬 min_r2 并非单调有益。** 0.4 仅比 0.2 略低；0.5 之后（禁掉
-   ≥9 个 block，补偿覆盖 <80%）bbox 回落到 65–68 区间，收益被"少补偿"
-   的副作用抵消。这说明大多数中等 r2 block 的补偿仍有正收益，不应因
-   r2 低就一刀切。
-4. **相对 raw SC 的净收益 ≈ +20 bbox / +16 segm**（min_r2=0.2 时），
-   证明 QwT 线性补偿 + SC-int8 投影在 det 路径上可行，和 cls 侧的结论
-   一致。
+## 配方变化（vs 旧版 RESULTS）
 
-### 未完成
-
-- `comp_sc_prec ∈ {6, 7}` 的 sweep：`results/sw20_int6_qwt_sc_int{6,7}_n10_r2_*/`
-  目录已建但 run.json 为空，对应 `logs/r2_sweep/*.log` 最后一行停在
-  `[calib] collecting first-block inputs from model_sc`（被 kill 或超时）。
-  需要重跑以比较 int6/int7 vs int8 补偿器的精度-比特权衡。
-- 所有数字都是 n_eval=10，噪声较大（bbox=73.21 > FP=69.33 本身就是
-  小样本的 artifact）。阶段 3 正式结果需要 n_eval=100。
-
-## 近期代码改动
-
-- `experiments/qwt_det_compensate.py`：新增 `--d2_datasets`、`--ckpt`
-  CLI 参数，把数据集和权重路径从硬编码提取为可覆盖项，方便在非
-  GreatLakes 环境复跑。默认仍走 shared_data 路径，行为不变。
+旧版本（≤ 2026-04-23）使用 r²-门 + `--min_r2`、`--avg_sc_draws` 这两
+个被弃用的 flag。**当前驱动器已重写**为 cross-seed 余弦门，详见
+[`experiments/qwt_det_compensate.py`](experiments/qwt_det_compensate.py)
+模块文档。Cross-seed 门相对 r² 门的物理推导和 N=50k 证据见
+[`third_party/QwT-SC/QwT-vit-sc/qwt_sc/compensation.py`](../third_party/QwT-SC/QwT-vit-sc/qwt_sc/compensation.py)。
 
 ## 复现命令
 
 ```bash
-# min_r2=0.2 甜蜜点（上表的最佳行）
+# Smoke (10 min)
 python experiments/qwt_det_compensate.py \
-    --sc_prec 6 \
-    --sc_ops_per_block_json sensitivity/skip/skip_worst_20_int6.json \
-    --n_calib 16 --n_eval 10 \
-    --ridge 0.01 --min_r2 0.2 \
-    --comp_mode sc --comp_sc_prec 8 --comp_sc_mode bipolar \
-    --out_tag sw20_int6_qwt_sc_int8_n10_r2_0_2 \
-    --out_json results/sw20_int6_qwt_sc_int8_n10_r2_0_2/run.json
+    --sc_prec 8 \
+    --sc_ops_per_block_json sensitivity/skip/skip_worst_30_int7.json \
+    --n_calib 64 --n_eval 100 \
+    --calib_seed 1 --calib_seed_b 2 \
+    --cos_threshold 0.5 --last_block_cos_threshold 0.8 --lookahead_veto \
+    --comp_mode sc --comp_sc_prec 8 \
+    --head_aligned --n_heads 16 \
+    --out_json results/qwt_det/smoke.json
+
+# Production sweep (4-GPU pool, ~10-12 h wall)
+nohup env \
+  RES_DIR=results/sweep_2026-04-25 \
+  LOG_DIR=logs/sweep_2026-04-25 \
+  HEAD_ALIGNED=1 HEAD_ALIGNED_HEADS=16 \
+  bash experiments/sweep_2026-04-25.sh \
+  > logs/sweep_2026-04-25/sched.log 2>&1 &
 ```
+
+## 旧版结果（已弃用，仅供参考）
+
+旧 `min_r2` sweep 的 n_eval=10 表参见 git 历史
+（`8742921 det: RESULTS.md with min_r2 sweep + CLI overrides for datasets/ckpt`）。
+那一轮是 r²-门下的早期探索，已被 cross-seed 门取代，绝对数字不再具备
+生产参考价值（n_eval=10 噪声 ±2 AP）。
