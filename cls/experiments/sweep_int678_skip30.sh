@@ -28,11 +28,16 @@ conda activate vit_sc
 export XFORMERS_DISABLED=1
 
 # --- Env-overridable knobs (prod defaults; smoke launcher overrides to small). ---
+# Gate = cross-seed cosine (see qwt_sc/compensation.py): fit W on two disjoint
+# calib batches (seeds 1 + 2 by default), admit iff cos(W_A, W_B) > COS_THR.
+# Replaces the earlier r²-based recipe that was the previous default here.
 N_CALIB="${N_CALIB:-1024}"
 N_EVAL="${N_EVAL:-50000}"
 BATCH="${BATCH:-16}"
 WORKERS="${WORKERS:-8}"
-R2_THR="${R2_THR:-0.7}"
+COS_THR="${COS_THR:-0.5}"
+LAST_COS_THR="${LAST_COS_THR:-0.8}"
+CALIB_SEED_B="${CALIB_SEED_B:-2}"
 COMP_SC_PREC="${COMP_SC_PREC:-8}"
 RIDGE="${RIDGE:-1e-4}"
 LINEAR_MP_OPS="mlp_fc1,mlp_fc2,qkv_proj,out_proj"
@@ -138,7 +143,10 @@ build_eval_cmd() {
       --batch_size "$BATCH" --workers "$WORKERS"
       --comp_mode sc --comp_sc_prec "$COMP_SC_PREC"
       --ridge "$RIDGE"
-      --r2_threshold "$R2_THR"
+      --cos_threshold "$COS_THR"
+      --last_block_cos_threshold "$LAST_COS_THR"
+      --calib_seed_b "$CALIB_SEED_B"
+      --lookahead_veto
       --out_json "$out_json"
     )
     [[ $qwt == off ]] && args+=(--skip_qwt)
@@ -171,7 +179,12 @@ build_eval_cmd() {
       "${common[@]}" "${uni_args[@]}" \
       --n_calib "$N_CALIB" --n_eval "$N_EVAL" \
       --comp_mode sc --comp_sc_prec "$COMP_SC_PREC" \
-      --r2_threshold "$R2_THR" --skip_baseline \
+      --ridge "$RIDGE" \
+      --cos_threshold "$COS_THR" \
+      --last_block_cos_threshold "$LAST_COS_THR" \
+      --calib_seed_b "$CALIB_SEED_B" \
+      --lookahead_veto \
+      --skip_baseline \
       --out_json "$out_json"
   else
     echo python eval.py --mode sc \
