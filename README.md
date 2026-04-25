@@ -586,11 +586,12 @@ python experiments/qwt_sc_overnight.py \
 
 | Flag | Default | What it does |
 |---|---|---|
-| `--comp_mode {fp,sc}` | `fp` | Comp matmul kernel. `sc` uses `SCLinear`. |
+| `--comp_mode {fp,sc}` | `sc` | Comp matmul kernel. `sc` uses `SCLinear`; `fp` is debug-only (breaks the SC-purity story). |
 | `--comp_sc_prec INT` | `8` | SC bit-precision of the comp matmul. |
 | `--comp_sc_mode {bipolar,unipolar}` | `bipolar` | Per-row SC quant mode of the comp matmul. |
-| `--comp_refit_iters INT` | `0` | If `>0` and `comp_mode=sc`: K rounds of *noise-aware refit* — measure the comp's own SC noise δ on the calibration set, refit `W` against `R − δ`. Linearization can overshoot on early/small-residual blocks; tune cautiously. |
-| `--comp_variant_select` | off | Per-block, try `{default, antithetic-K}` Sobol configs for the comp and pick the lower-residual one (1 config bit per block in HW). Empirically only ~−0.15 noise correlation, so gain is small and not strictly Pareto. |
+| `--n_variants INT` | `1` | Sobol-seed bank size for the per-block picker. `1` = single-variant (production default); `>1` enables `comp_factory_variants` selection logged as log₂(K) bits/block. |
+| `--polarity_flip` | off | Add the −1-polarity variant for each Sobol cfg (+1 config bit per block). |
+| `--w_scales LIST` | `"1.0"` | Comma-separated W-magnitude scales for the picker (e.g. `0.75,1.0`). |
 
 ### Results — SC comp vs FP comp (N=500, sc_prec=8, RTX 4080)
 
@@ -1013,7 +1014,11 @@ is still the natural next step if this recipe is committed.
   (available at r²=0.3) for universal stability. Tighter MP+QwT wins
   at aggressive thresholds would require either full-chain lookahead
   (expensive, see commit history) or a magnitude-aware multi-block
-  veto (open problem — see `docs/qwt_gate_investigation.md`).
+  veto. **All of the open problems in this section are resolved by the
+  cross-seed cosine gate** documented in
+  [`docs/SC_COMP_ALGORITHM.md`](docs/SC_COMP_ALGORITHM.md); this section
+  is preserved only as historical context for the legacy r²-gate
+  collapse modes.
 
 Scaling takeaway at K=30 (on raw-SC numbers, from the prod sweep):
 `avg192_uniform` (SL=192 everywhere, ~7.58-bit precision via SC early

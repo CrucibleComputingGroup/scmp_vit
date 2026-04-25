@@ -35,6 +35,268 @@ the kernel changes here.
 
 ---
 
+## Algorithm walkthrough
+
+The pipeline has three logically separable pieces:
+
+1. **Per-block residual fit** (closed-form ridge LS) — *what* to install at each block.
+2. **Cross-seed cosine gate** — *whether* to install it.
+3. **Head-aligned SC kernel** — *how* the installed correction runs at inference.
+
+Plus the SC-side preconditions (skip-worst-K schedule, MP search) that
+determine which (op, block) cells are SC vs FP and at what bit-stream
+length. The three pieces are independent design choices and can be
+swapped one at a time.
+
+### 1. Per-block residual fit
+
+For each transformer block `i`, observe the gap between FP and SC outputs
+on a small calibration batch:
+
+```
+R_i(X)  =  Y_fp_i(X)  −  Y_sc_i(X)              shape: (N_tokens, D)
+```
+
+Model the gap as an affine map of the block input `X`:
+
+```
+R_i(X)  ≈  X · W_i  +  b_i                       W_i: (D, D), b_i: (D,)
+```
+
+Solve `W_i, b_i` in closed form by ridge least-squares, with the bias
+absorbed into an augmented `[X | 1]` matrix (so only the slope is
+regularized):
+
+```
+[W; b]  =  (X_aug^T · X_aug  +  λ · diag(I, 0))^(-1)  ·  X_aug^T · R_i
+```
+
+Implementation: [`closed_form_ridge`](../third_party/QwT-SC/QwT-vit-sc/qwt_sc/compensation.py#L181)
+in the QwT-SC submodule. λ = `ridge` = 1e-4 in production.
+
+At inference, each block is wrapped:
+
+```
+out  =  block_sc(x)  +  comp(x)            comp(x) = x · W̄ + b̄
+```
+
+The fits are done **sequentially (Gauss-Seidel)**: after fitting block
+`i`, both calib chains (X_a and X_b — see §2) are propagated through the
+*installed* wrapper to seed block `i+1`'s calibration. Without this,
+each block is fitted on the FP-distribution input it would never see at
+inference, and the per-block errors compound across the 24-block depth.
+
+This is the same mechanism the original QwT paper (CVPR 2025) uses for
+INT quantization. The SC adaptation needs ridge (the original doesn't)
+because SC noise is *stochastic* — the regression target
+`R = Y_fp − Y_sc` has per-sample variance from the Sobol RNG that acts
+as label noise. Ridge shrinks W away from fitting that noise.
+
+### 2. Cross-seed cosine gate — the admission rule
+
+Per-block, a fitted `(W, b)` is **admitted** iff:
+
+```
+cos(flatten(W_A), flatten(W_B))  >  τ
+            AND
+min(‖W_A‖, ‖W_B‖)  >  ε
+```
+
+where `(W_A, b_A)` is the ridge fit on calibration batch A, and
+`(W_B, b_B)` is the **same** fit on a disjoint calibration batch B
+drawn with a different seed. The installed correction is
+`W̄ = (W_A + W_B) / 2`, `b̄ = (b_A + b_B) / 2`.
+
+τ = 0.5, ε = 0 in production. For the last block: τ = 0.8 (block N−1
+feeds the pre-head embedding directly, so demand tighter agreement).
+
+#### Physical argument
+
+The residual `R_i` decomposes into two additive components:
+
+```
+R_i(X)  =  bias_i(X)         +  noise_i(X)
+           ──────────────       ────────────────
+           deterministic         input-dependent
+           SC→FP gap             SC sampling noise:
+                                 a function of (X, Sobol-state)
+```
+
+A single ridge fit on one batch fits both indistinguishably.
+
+- **Signal regime** (`bias_i` ≫ `noise_i`): both batches see the same
+  deterministic gap → both fits land on roughly the same `W`.
+  cos(W_A, W_B) ≈ 1.
+- **Noise regime** (`noise_i` ≫ `bias_i`): each batch sees a *different*
+  realization of the Sobol noise. The two fits land on uncorrelated
+  directions in (D × D)-dim space. cos(W_A, W_B) ≈ 0 (random vectors in
+  high-D are nearly orthogonal).
+
+So the cosine literally measures *"is this W direction reproducible
+across input populations?"* — exactly the test for whether the fit will
+generalize from 1024 calib images to 50000 eval images.
+
+#### W_A vs W_B is reproducibility, not train/test
+
+W_A and W_B are **two independent estimators of the same parameter**,
+not a train/test split. Classic train/test would be: fit W on A, predict
+R on B, gate on cv-holdout r². That's *generalization*. Cross-seed
+instead does: fit W_A on A, fit W_B on B independently, gate on
+parameter-direction agreement. That's *reproducibility*.
+
+Closer analogies: bootstrap stability (resample → check parameter
+agreement) and bagging (average two unbiased estimators to halve
+variance — what `W̄ = (W_A + W_B) / 2` does for free). cv-holdout r²
+*was* tried in the legacy gate and didn't separate signal from noise:
+r² conflates "captured the bias direction" with "B's residual happens
+to have low variance." Direction-only agreement (cosine) doesn't have
+that ambiguity.
+
+#### Why r² fails
+
+r² is an *in-sample* metric: it measures how well `W` explains the
+residual on the same batch it was fit on. A noise-fit `W` that captures
+the random Sobol pattern of batch A will have r²(A) > 0, but its
+prediction on batch B (or eval) is uncorrelated with B's actual
+residual. r² can't see this. From the production sweep:
+
+| config / block | r²_a | cos_ab | legacy r²-gate | cross-seed gate |
+|---|---:|---:|---|---|
+| p8_uniform / blk1 | +0.44 | ≈ 0 (rejected blk) | would admit at τ=0.4 | rejects (correctly) |
+| avg192_uniform / blk14 | +0.08 | +0.85 (admitted) | rejects at τ=0.5 | admits (correctly) |
+
+The two metrics disagree on **both** false-positives and false-negatives.
+The cosine is the physically correct test.
+
+#### One-step lookahead veto (cheap insurance)
+
+For every block that passes the cosine gate, additionally simulate one
+step of forward propagation: compute `Y_apply = Y_sc + (X·W + b)` and
+`Y_skip = Y_sc`, push both through the next block's FP forward, and
+compare to the FP reference. If applying the correction increases
+downstream error, **veto the apply**. Implementation at
+[`compensation.py:370-388`](../third_party/QwT-SC/QwT-vit-sc/qwt_sc/compensation.py#L370-L388).
+Rarely fires under the cosine gate but is essentially free.
+
+#### What blocks get rejected
+
+22 / 24 admitted, identically across all 5 cls configs:
+
+- **Block 0** rejected — input is patch-embedding tokens before any
+  LN/attention has settled; no shared structure between two random
+  image batches.
+- **Block 23** rejected — feeds the pre-head embedding directly; the
+  stricter `last_block_cos_threshold = 0.8` filters it out (its actual
+  `cos_ab ≈ 0.7`, borderline; conservative rejection avoids a single
+  bad correction destroying classification).
+
+Blocks 1–22 admitted with `cos_ab` in [+0.68, +0.93] — clean bimodal
+separation from rejected blocks' near-zero cos.
+
+### 3. Head-aligned SC kernel — how the comp matmul executes
+
+Once `W̄, b̄` are admitted, the inference-time `x · W̄ + b̄` runs through
+a stochastic-computing matmul (so the entire inference path stays SC,
+no FP multiplier). Two natural realizations:
+
+**Full-width:**
+
+```
+x (N, 1024) ──→ SCLinear(D=1024) ──→ (N, 1024)
+                Sobol pool needed: _CFG_CACHE[(1024, 8)]
+```
+
+**Head-aligned (production winner):**
+
+```
+x (N, 1024)  reshape→  (N, 16, 64)
+              ├── head 0:  x[:, 0,:] (N, 64) × W₀ (64, 1024) → Δ₀ (N, 1024)
+              ├── head 1:  x[:, 1,:] (N, 64) × W₁ (64, 1024) → Δ₁ (N, 1024)
+              ├── ...                                            (16 of them)
+              └── head 15: x[:, 15,:] (N, 64) × W₁₅ (64, 1024) → Δ₁₅ (N, 1024)
+                          Σ + b̄ ──→ (N, 1024)
+              Sobol pool needed: _CFG_CACHE[(64, 8)]   ← shared with block QK
+```
+
+Each head's matmul is a per-head slice of the same `W̄` (1024 × 1024)
+reshaped as 16 × (64 × 1024). The 16 outputs sum.
+
+The (64, 8) Sobol pool is *already* needed by the per-head Q@K^T
+matmul that runs at every block (24/24), so head-aligned adds no new
+SNG circuit. The (1024, 8) pool exists at most blocks too but with
+narrower reuse breadth (17/24 under K=30). See the hardware accounting
+cheat-sheet below for the full cost breakdown.
+
+The N=1000 pilot showed full-width and head-aligned within noise on
+accuracy (geomean Δ +0.96 vs +0.87, well within ±1 pt N=1000 stderr).
+The N=50k production confirmation on head-aligned beats raw SC on
+every config (+1.80 geomean).
+
+### 4. End-to-end production flow
+
+What actually runs when you launch
+[`sweep_int678_skip30.sh`](../cls/experiments/sweep_int678_skip30.sh)
+with `HEAD_ALIGNED=1`:
+
+1. **Schedule selection** — `skip_worst_K.json` gives a 5-op × 24-block
+   0/1 mask: which (op, block) cells are SC, which stay FP. Built once
+   offline from a per-cell sensitivity sweep. K=30 = 30 worst cells
+   stay FP.
+
+2. **MP-budget swap search** (MP configs only) — given the active SC
+   cells, search for a per-cell stoc_len ∈ {64, 96, 128, 192, 256}
+   that hits a target main_sl budget while minimizing the
+   `comp_residual` proxy. Output: `sl_map.json` mapping each (op, block)
+   to its bit-stream length.
+
+3. **Patch the model** — `patch_model` walks the 24 blocks and swaps
+   modules-of-interest with `SCLinear` / `SCMatMul` per schedule + sl_map.
+   Both `model_fp` (untouched) and `model_sc` (patched) live on GPU
+   simultaneously.
+
+4. **Two-batch calibration** — draw two disjoint batches A and B
+   (different image seeds, same N_calib=1024 each). For each block
+   i = 0 … 23:
+   1. Forward both batches through both `block_fp[i]` and `block_sc[i]`
+      → `Y_fp_a, Y_sc_a, Y_fp_b, Y_sc_b`.
+   2. Compute `R_a = Y_fp_a − Y_sc_a`, `R_b = Y_fp_b − Y_sc_b`.
+   3. Solve closed-form ridge on each → `(W_a, b_a, r²_a)` and
+      `(W_b, b_b, r²_b)`.
+   4. Compute `cos(flatten(W_a), flatten(W_b))`.
+   5. Apply admission rule (cosine gate + last-block stricter τ +
+      lookahead veto).
+   6. If admitted: install
+      `CompensationBlock(block, W̄, b̄, comp=HeadAlignedSCLinear(...))`.
+      If rejected: install with `enabled=False`
+      (passes through `block_sc(x)` unchanged).
+   7. Propagate both calibration chains through the *just-installed*
+      wrapper to seed block `i+1`.
+
+5. **Eval** — run patched `model_sc` on full val set; compare to FP
+   reference.
+
+Each block costs ~30 sec of calibration on N=1024 images at SL=192
+(heaviest config). 24 blocks → ~12 min calib, then ~5 hrs eval at
+N=50000 (SC inference is the bottleneck, ~2.7 img/s).
+
+### What's NOT in the production algorithm
+
+- **No per-block picker.** The picker infrastructure
+  (`comp_factory_variants`) is wired up but used as single-variant in
+  production (default Sobol seed, polarity=+1, scale=1.0, sc_prec=8).
+  The N=1000 pilot didn't show enough lift from picker variants to
+  justify the per-block bits.
+- **No noise-aware refit.** An iterative refit (`comp_refit_iters`)
+  that subtracts the comp's own SC noise from the LS target was in the
+  legacy codebase. Removed during cleanup; not needed under cross-seed
+  (the gate filters out the failure modes refit was designed to
+  mitigate).
+- **No FP-comp fallback.** `--comp_mode fp` is a debug path. Production
+  must be `--comp_mode sc --head_aligned` to keep the inference path
+  SC-pure.
+
+---
+
 ## Hardware accounting cheat-sheet
 
 The comp adds 25.2 M MACs per block × 24 blocks = 605 M comp MACs per image.
