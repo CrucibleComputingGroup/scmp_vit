@@ -42,6 +42,7 @@ for p in (_DET, _REPO, _QWT_LIB):
 from eval_common import load_model_and_loader, set_evaluator_output_dir
 from sc_patch import sc_patch_eva, SC_OP_NAMES
 from sc_integration.sc_linear import SCLinear
+from sc_integration.head_aligned_comp import HeadAlignedSCLinear
 from qwt_sc import calibrate_qwt
 from qwt_sc.compensation import CompensationBlock
 
@@ -73,6 +74,26 @@ def make_sc_comp_factory(sc_prec: int, mode: str = "bipolar",
             layer.weight.copy_((W.t().contiguous()) * (scale * polarity))
             layer.bias.copy_(b * polarity if polarity == -1 else b)
         return SCLinear(layer, sc_prec=sc_prec, mode=mode)
+    return factory
+
+
+def make_head_aligned_comp_factory(sc_prec: int, mode: str = "bipolar",
+                                   n_heads: int = 16, scale: float = 1.0,
+                                   polarity: int = 1):
+    """(W, b) -> HeadAlignedSCLinear. Splits the comp matmul into
+    ``n_heads`` per-head SC matmuls of shape ``(D_in/n_heads, D_out/n_heads)``,
+    each reusing ``_CFG_CACHE[(D_in/n_heads, sc_prec)]`` — the same pool
+    that the block's per-head Q@K^T matmul already populates. Adds **zero**
+    new Sobol config cache entries on EVA-ViTDet (D_in=1408, n_heads=16,
+    per-head D=88; (88, 8) is shared with QK)."""
+    def factory(W, b):
+        D_in, D_out = W.shape
+        layer = nn.Linear(D_in, D_out, bias=True)
+        with torch.no_grad():
+            layer.weight.copy_((W.t().contiguous()) * (scale * polarity))
+            layer.bias.copy_(b * polarity if polarity == -1 else b)
+        return HeadAlignedSCLinear(layer, sc_prec=sc_prec, mode=mode,
+                                   n_heads=n_heads)
     return factory
 
 
@@ -177,6 +198,17 @@ def main():
                         "debug only.")
     p.add_argument("--comp_sc_prec", type=int, default=8)
     p.add_argument("--comp_sc_mode", choices=["bipolar", "unipolar"], default="bipolar")
+    p.add_argument("--head_aligned", action="store_true",
+                   help="Route the SC comp through HeadAlignedSCLinear "
+                        "(per-head SC matmul reusing _CFG_CACHE[(D_head, "
+                        "sc_prec)] = block QK pool — zero new Sobol config "
+                        "cache). Strongly recommended for production.")
+    p.add_argument("--head_aligned_only", action="store_true",
+                   help="Same as --head_aligned (kept for parity with cls "
+                        "driver; the variant picker isn't exposed here).")
+    p.add_argument("--n_heads", type=int, default=16,
+                   help="Head count for HeadAlignedSCLinear; must divide "
+                        "the residual dim (EVA-ViTDet: 1408 / 16 = 88).")
     p.add_argument("--out_tag", default="qwt_det")
     p.add_argument("--out_json", default="results/qwt_det/run.json")
     p.add_argument("--d2_datasets", type=str, default="",
@@ -266,11 +298,20 @@ def main():
                                          max_items=args.n_calib, tag="B")
 
     # --- Comp kernel choice ---
+    use_head_aligned = bool(args.head_aligned or args.head_aligned_only)
     comp_factory = None
     if args.comp_mode == "sc":
-        comp_factory = make_sc_comp_factory(args.comp_sc_prec, args.comp_sc_mode)
-        print(f"[comp] full-width SC compensator: sc_prec="
-              f"{args.comp_sc_prec} mode={args.comp_sc_mode}", flush=True)
+        if use_head_aligned:
+            comp_factory = make_head_aligned_comp_factory(
+                args.comp_sc_prec, args.comp_sc_mode, n_heads=args.n_heads)
+            print(f"[comp] head-aligned SC compensator: sc_prec="
+                  f"{args.comp_sc_prec} mode={args.comp_sc_mode} "
+                  f"n_heads={args.n_heads}", flush=True)
+        else:
+            comp_factory = make_sc_comp_factory(args.comp_sc_prec,
+                                                args.comp_sc_mode)
+            print(f"[comp] full-width SC compensator: sc_prec="
+                  f"{args.comp_sc_prec} mode={args.comp_sc_mode}", flush=True)
     else:
         comp_factory = make_fp_factory()
         print(f"[comp] FP compensator (debug)", flush=True)
@@ -306,6 +347,17 @@ def main():
     )
     calib_s = time.time() - t_cal
     print(f"[calib] done in {calib_s:.1f}s", flush=True)
+
+    # Cross-check: log the SNG pool entries that the run actually populated.
+    # On EVA-ViTDet the per-head QK matmul should populate (88, sc_prec); the
+    # head-aligned comp should reuse it — i.e. (88, sc_prec) appears once.
+    try:
+        from sc_integration.sc_linear import _CFG_CACHE as _SC_CACHE
+        cache_keys = sorted(list(_SC_CACHE.keys()))
+        print(f"[comp] _CFG_CACHE.keys(): {cache_keys}", flush=True)
+    except Exception as e:
+        print(f"[comp] could not introspect _CFG_CACHE: {e}", flush=True)
+        cache_keys = None
 
     n_enabled = sum(1 for r in report if r.get("enabled", False))
     n_blocks_total = len(report)
@@ -347,9 +399,12 @@ def main():
             "comp_mode": args.comp_mode,
             "comp_sc_prec": args.comp_sc_prec,
             "comp_sc_mode": args.comp_sc_mode,
+            "head_aligned": use_head_aligned,
+            "n_heads": args.n_heads if use_head_aligned else None,
             "fwd_chunk": args.fwd_chunk,
             "calib_slice_a_start": start_a,
             "calib_slice_b_start": start_b,
+            "sc_cfg_cache_keys": [list(k) for k in cache_keys] if cache_keys else None,
         },
         "calib": {
             "per_block": report,
