@@ -217,10 +217,10 @@ only one CUDA context per GPU. If a worker dies in <60 s with
 `nvidia-smi --query-compute-apps=pid --format=csv,noheader | xargs -r
 kill -9` clears zombies.
 
-**Suggested scaffold:** write a driver similar to
-[cls/experiments/opt2_lookahead_mini.sh](../cls/experiments/opt2_lookahead_mini.sh)
-— pool-scheduled across 4 GPUs, writes to
-`results/investigate/<experiment>/*.json` and `logs/investigate/<experiment>/`.
+**Suggested scaffold:** write a pool-scheduled driver (4 GPUs with a
+3-MP cap, singleton launch via `nohup + ssh -n -f`, zombie-reap via
+`pgrep` / `kill -0`) that writes to `results/investigate/<experiment>/*.json`
+and `logs/investigate/<experiment>/`.
 
 **Constraints for reproducibility:**
 - Hold `--n_calib 1024 --n_eval 1000` for quick iteration; confirm
@@ -231,11 +231,9 @@ kill -9` clears zombies.
   those are reference data.
 
 **Reference files:**
-- [third_party/QwT-SC/QwT-vit-sc/qwt_sc/compensation.py](../third_party/QwT-SC/QwT-vit-sc/qwt_sc/compensation.py) — `calibrate_qwt` + `CompensationBlock` + gate logic.
+- [third_party/QwT-SC/QwT-vit-sc/qwt_sc/compensation.py](../third_party/QwT-SC/QwT-vit-sc/qwt_sc/compensation.py) — `calibrate_qwt` + `CompensationBlock` + the cross-seed cosine gate (see module docstring for the algorithm that superseded this investigation's r²-based gates).
 - [cls/experiments/qwt_sc_overnight.py](../cls/experiments/qwt_sc_overnight.py) — uniform-path QwT driver.
 - [cls/experiments/eval_custom_sl_map_fpcomp.py](../cls/experiments/eval_custom_sl_map_fpcomp.py) — sl_map-driven QwT driver (used by MP configs).
-- [cls/experiments/sweep_int678_skip30.sh](../cls/experiments/sweep_int678_skip30.sh) — how the prod sweep is plumbed (inputs, CLI, dir layout).
-- [cls/experiments/opt2_lookahead_mini.sh](../cls/experiments/opt2_lookahead_mini.sh) — reference 5-config × r² mini-sweep launcher you can adapt.
 - [cls/experiments/mp_budget_swap_search.py](../cls/experiments/mp_budget_swap_search.py) — how the MP sl_maps are generated (for Case 2 hypothesis 3 if you need to regenerate a gentler map).
 
 **Result JSONs for the cases being investigated:**
