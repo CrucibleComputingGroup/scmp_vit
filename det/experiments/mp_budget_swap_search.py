@@ -188,22 +188,26 @@ def _patch_block_with_spec(block: nn.Module, sc_prec: int,
     return blk
 
 
+def _eva_blocks(model: nn.Module) -> nn.ModuleList:
+    """Resolve the EVA ViT's block ModuleList. Accepts either the full
+    Detectron2 model or just the EVA ViT (``backbone.net`` view)."""
+    if hasattr(model, "backbone") and hasattr(model.backbone, "net"):
+        return model.backbone.net.blocks
+    return model.blocks
+
+
 def _patch_model_with_sl_map(model: nn.Module, sc_prec: int,
                              sl_map: dict) -> dict:
-    """Patch every block of ``model`` according to ``sl_map``. Calls
-    sc_patch_eva block-by-block via the existing per-(op, block) schedule
-    machinery, plus a second pass for the per-op MPConfig wiring."""
-    blocks = list(model.backbone.net.blocks)
+    """Patch every block of ``model`` according to ``sl_map``. ``model`` may
+    be either the full Detectron2 model or the EVA ViT view; both expose
+    a ``blocks`` ModuleList we can mutate in place."""
+    blocks = _eva_blocks(model)
     nb = len(blocks)
     stats: dict[str, int] = {op: 0 for op in SC_OP_NAMES}
-    for bi, blk in enumerate(blocks):
+    for bi in range(nb):
         spec = ms.build_current_spec(sl_map, SC_OP_NAMES, bi)
-        # Reuse the per-block helper. It deepcopies; we replace in place.
-        new_blk = _patch_block_with_spec(blk, sc_prec, spec)
+        new_blk = _patch_block_with_spec(blocks[bi], sc_prec, spec)
         blocks[bi] = new_blk
-        # Update the parent's ModuleList in place.
-        model.backbone.net.blocks[bi] = new_blk
-        # Stats: count which ops actually got SC-installed.
         for op in SC_OP_NAMES:
             entry = spec.get(op, 0)
             mp = ms.entry_to_mpconfig(entry)
@@ -260,35 +264,33 @@ class DetBackend(ms.MPSearchBackend):
         }
 
     def load_model(self, device: torch.device) -> nn.Module:
-        # We always build the FP model; load_model_and_loader returns the
-        # full Detectron2 model on cuda (instantiate hard-codes .cuda()).
-        # If caller asks for CPU, move it.
-        # We use n_eval=self._n_search just to make a small loader; the model
-        # is what we care about.
+        """Return the EVA ViT (``model.backbone.net``) so that the search's
+        ``model_sc(imgs)`` accepts a (B, 3, H, W) tensor. Calling the full
+        Detectron2 cascade_mask_rcnn with a tensor breaks because it
+        expects list[dict]. The same trick is used by
+        qwt_det_compensate.py's calibrate_qwt invocation."""
         model, _, _, _ = load_model_and_loader(self._n_search, **self._d2_kw)
         model.eval()
         if device.type == "cpu":
             model = model.cpu()
         else:
             model = model.to(device)
-        return model
+        return model.backbone.net
 
     def get_blocks(self, model: nn.Module) -> list[nn.Module]:
-        return list(model.backbone.net.blocks)
+        return list(_eva_blocks(model))
 
     def build_loader(self, n_images: int, seed: int,
                      batch_size: int, workers: int) -> DataLoader:
-        # Det loader is built alongside the model in load_model_and_loader.
-        # The MP search uses one loader to capture block-0 inputs; we build
-        # a fresh one (rebuilds the model — wasteful but matches cls's
-        # discard-then-reload pattern).
-        _, loader, _, _ = load_model_and_loader(n_images, **self._d2_kw)
-        # Wrap so iteration yields (image_tensor,) as the algorithm expects
-        # (it does `imgs = batch[0] if isinstance(batch, (tuple, list)) else batch`).
-        # D2's test_loader yields list[dict]; we need to preprocess via the
-        # model.preprocess_image. Build a model just for preprocessing (it's
-        # the same model class — costs another ~30s to build, acceptable).
-        model_for_pp, _, _, _ = load_model_and_loader(n_images, **self._d2_kw)
+        # The d2 test_loader yields list[dict]; we wrap it so each iter
+        # yields (image_tensor,) — what the algorithm expects (it does
+        # `imgs = batch[0] if isinstance(batch, (tuple, list)) else batch`).
+        # ``preprocess_image`` lives on the full Detectron2 cascade_mask_rcnn,
+        # so we build the model+loader pair once and use the model just for
+        # preprocessing.
+        model_for_pp, loader, _, _ = load_model_and_loader(
+            n_images, **self._d2_kw)
+        model_for_pp.eval()
         device = torch.device("cuda")
 
         class _DetCalibLoader:

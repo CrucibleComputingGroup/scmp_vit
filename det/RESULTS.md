@@ -24,12 +24,40 @@
 > `cos_threshold=0.5, last_block_cos_threshold=0.8, lookahead_veto,
 > n_heads=16, comp_sc_prec=8, comp_mode=sc`）。
 >
-> **Sweep 矩阵**：`sc_prec ∈ {7, 8} × K ∈ {20, 30} × mode ∈ {uniform,
-> mp192} × qwt ∈ {off, on}` = 16 个 cell。运行脚本：
+> **Sweep 矩阵**（与 cls
+> [`sweep_int678_skip30.sh`](../cls/experiments/sweep_int678_skip30.sh) 同形）:
+> `prec_tag ∈ {p7, avg192, p8} × mode ∈ {uniform, mp} × qwt ∈ {off, on}`
+> = 10 个 cell（p8_mp 省略，与 cls 一致）。
+>
+> - `p7` = `--sc_prec 7`（base stoc_len=128）。
+> - `avg192` = `--sc_prec 8 --mp_levels 192 --mp_fractions 1.0` 应用于所有
+>   SC ops（uniform fractional MP，效力 stoc_len=192 ≈ 7.58 bits）。
+> - `p8` = `--sc_prec 8`（base stoc_len=256）。
+> - `uniform` = 同一 stoc_len 应用于所有 (op, block) 对。
+> - `mp` = 由
+>   [`experiments/mp_budget_swap_search.py`](experiments/mp_budget_swap_search.py)
+>   产生的 per-(op, block) sl_map（搜索目标 main_sl 等于该 prec_tag 的均值）。
+>
+> 运行脚本：
 > [`experiments/sweep_2026-04-25.sh`](experiments/sweep_2026-04-25.sh)。
 
 详见 `results/sweep_2026-04-25/` 下的每个 cell。**TBD：** 等 sweep 跑完
-后填入下表。占位符表示 sweep 未跑完。
+后填入下表。
+
+| prec_tag | mode | qwt | bbox AP | segm AP | admitted | comments |
+|---|---|---:|---:|---:|:---:|---|
+| p7 | uniform | off | TBD | TBD | n/a | raw SC, sc_prec=7 |
+| p7 | uniform | on  | TBD | TBD | TBD/40 | + cross-seed + head-aligned comp |
+| p7 | mp      | off | TBD | TBD | n/a | per-(op,block) sl_map |
+| p7 | mp      | on  | TBD | TBD | TBD/40 | + comp |
+| avg192 | uniform | off | TBD | TBD | n/a | uniform stoc_len=192 |
+| avg192 | uniform | on  | TBD | TBD | TBD/40 | + comp |
+| avg192 | mp      | off | TBD | TBD | n/a | search-derived |
+| avg192 | mp      | on  | TBD | TBD | TBD/40 | + comp |
+| p8 | uniform | off | TBD | TBD | n/a | raw SC, sc_prec=8 |
+| p8 | uniform | on  | TBD | TBD | TBD/40 | + comp |
+
+下面的旧 sc_prec×K 矩阵保留作为记录（替换前的初版）。
 
 | sc_prec | K | mode | raw SC bbox | comp bbox | Δ bbox | admitted blocks |
 |---:|---:|---|---:|---:|---:|:---:|
