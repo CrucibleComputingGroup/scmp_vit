@@ -49,6 +49,17 @@ SEARCH_PROXY="${SEARCH_PROXY:-comp_residual}"
 SEARCH_N_SEARCH="${SEARCH_N_SEARCH:-32}"
 SEARCH_SEED="${SEARCH_SEED:-1}"
 SEARCH_MAX_ITERS="${SEARCH_MAX_ITERS:-4}"
+# FIXED_OPS pins op-level SL during search. Default pins qk/av to the
+# target SL (legacy behavior — only proj/mlp_fc1/mlp_fc2 vary). Set to
+# "AUTO" to keep the legacy behavior, "" to unpin (search varies qk/av too),
+# or any explicit "qk=N,av=M" string. Special: AUTO is needed because we
+# can only resolve the per-tag target inside build_search_cmd.
+FIXED_OPS="${FIXED_OPS-AUTO}"
+# HEAD_ALIGNED=1 routes the QwT comp through HeadAlignedSCLinear (per-head
+# D=64, reuses _CFG_CACHE[(64, 8)] from the block QK pool — zero new SNG
+# pool entries). Empty (default) uses full-width SCLinear at D=1024.
+HEAD_ALIGNED="${HEAD_ALIGNED:-}"
+HEAD_ALIGNED_HEADS="${HEAD_ALIGNED_HEADS:-16}"
 
 LOG_DIR="${LOG_DIR:-logs/sweep_int678_k30}"
 RES_DIR="${RES_DIR:-results/sweep_int678_k30}"
@@ -114,12 +125,20 @@ sl_map_for_tag()         { case "$1" in p7) echo "$MAP_P7" ;; avg192) echo "$MAP
 build_search_cmd() {
   local tag=$1 out=$2
   local target; target=$(target_main_sl_for_tag "$tag")
+  local fixed=""
+  if [[ "$FIXED_OPS" == "AUTO" ]]; then
+    fixed="qk=${target},av=${target}"
+  else
+    fixed="$FIXED_OPS"
+  fi
+  local fixed_args=()
+  [[ -n "$fixed" ]] && fixed_args=(--fixed_ops "$fixed")
   echo python experiments/mp_budget_swap_search.py \
     --sc_config skip_worst30 \
     --target_main_sl "$target" \
     --levels "$SEARCH_LEVELS" \
     --search_ops "$SEARCH_OPS" \
-    --fixed_ops "qk=${target},av=${target}" \
+    "${fixed_args[@]}" \
     --op_min_levels "$SEARCH_OP_MIN" \
     --proxy "$SEARCH_PROXY" \
     --init_mode uniform_repair --init_level "$target" \
@@ -132,6 +151,10 @@ build_search_cmd() {
 build_eval_cmd() {
   local tag=$1 mode=$2 qwt=$3 name=$4
   local out_json=$RES_DIR/${name}.json
+  local ha_args=()
+  if [[ -n "$HEAD_ALIGNED" ]]; then
+    ha_args=(--head_aligned_only --n_heads "$HEAD_ALIGNED_HEADS")
+  fi
 
   if [[ $mode == mp ]]; then
     local map; map=$(sl_map_for_tag "$tag")
@@ -150,6 +173,7 @@ build_eval_cmd() {
       --out_json "$out_json"
     )
     [[ $qwt == off ]] && args+=(--skip_qwt)
+    [[ $qwt == on ]]  && args+=("${ha_args[@]}")
     echo python experiments/eval_custom_sl_map_fpcomp.py "${args[@]}"
     return
   fi
@@ -184,6 +208,7 @@ build_eval_cmd() {
       --last_block_cos_threshold "$LAST_COS_THR" \
       --calib_seed_b "$CALIB_SEED_B" \
       --lookahead_veto \
+      "${ha_args[@]}" \
       --skip_baseline \
       --out_json "$out_json"
   else

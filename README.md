@@ -13,6 +13,22 @@ through the SC kernels at configurable precision. The shared `SCLinear` /
 
 ## What's new
 
+- **Cross-seed cosine gate + head-aligned SC comp (2026-04-25).** The QwT
+  comp's admission rule is now `cos(W_A, W_B) > τ` over two disjoint calib
+  batches, replacing the legacy r²/cv-holdout gate. The comp matmul itself
+  now defaults to `HeadAlignedSCLinear` (per-head D=64 SCLinear, reuses the
+  block QK Sobol pool — zero new SNG entries, fully SC inference path).
+  N=50k production geomean Δ over raw SC = **+1.80 pt** across 5 configs;
+  beats the legacy reference on every config. See
+  [`docs/SC_COMP_ALGORITHM.md`](docs/SC_COMP_ALGORITHM.md) for the full
+  pilot → production write-up and hardware-cost analysis.
+- **Wider MP-search budget.** The default MP-budget swap search now uses
+  `--n_search 64 --max_iters 12` (was 32 / 4). On the same proj/mlp_fc1/
+  mlp_fc2 search space this drives `p7_mp` Δ from +1.14 to +3.37 vs the
+  legacy reference at unchanged eff_sl. Larger SEARCH_OPS (adding qk/av)
+  is still blocked by the equal-MAC DP constraint in
+  `build_initial_sl_map`; see SC_COMP_ALGORITHM.md for the next-iteration
+  recommendation.
 - **Mixed-precision MP.** Fixed-MP per-head on QK and per-row-within-head on
   AV, plus per-input-row MP on all linear ops, ported from `scmp_llm`.
   CLI flags: `--qk_mp_levels`, `--qk_mp_fractions`, `--av_mp_levels`,
@@ -25,6 +41,26 @@ through the SC kernels at configurable precision. The shared `SCLinear` /
   computes and prints FLOP-weighted average bitstream length for the main SC
   ops (`main_sl`) and including the compensation block (`eff_sl`), plus
   effective reduction vs full-precision SC. Saved in JSON under `"stoc_len"`.
+
+## Production status (2026-04-25)
+
+Headline N=50k results from `cls/results/sweep_2026-04-25/` — cross-seed
+gate + `HEAD_ALIGNED=1` (B_ha kernel) + wider MP search budget:
+
+| config         | raw SC | + B_ha + cross-seed | Δ | legacy r²-gate ref Δ |
+|----------------|---:|---:|---:|---:|
+| p7_uniform     | 78.94 | 82.87 | **+3.93** | +3.12 |
+| p7_mp          | 79.89 | 83.26 | **+3.37** | +1.14 |
+| p8_uniform     | 85.57 | 85.70 | +0.13 | +0.20 |
+| avg192_uniform | 84.67 | 85.42 | **+0.75** | +0.67 |
+| avg192_mp      | 84.62 | 85.47 | **+0.85** | +0.65 |
+| **geomean Δ**  |       |       | **+1.80** | +1.16 |
+
+Cross-seed gate admits 22/24 blocks (rejects 0 and 23) on every config.
+Reproduce with [the recipe in SC_COMP_ALGORITHM.md](docs/SC_COMP_ALGORITHM.md#how-to-reproduce).
+The "QwT compensation gate" section near the bottom of this README
+describes the *legacy r²-gate* (block-23 collapse mitigation) and is kept
+for historical context — the cross-seed gate supersedes it.
 
 ## Model and dataset
 
@@ -898,7 +934,17 @@ below). The generated `sl_map` JSONs referenced by the drivers are still
 on disk at `cls/results/sweep_int678_k30/sl_maps/` on machines where the
 sweep was run, and remain the MP baselines for current comparisons.
 
-#### QwT compensation gate — the block-23 collapse and how to avoid it
+#### QwT compensation gate — the block-23 collapse and how to avoid it (legacy r²-gate; superseded 2026-04-25)
+
+> **Status:** historical. The current production gate is the **cross-seed
+> cosine** rule documented in
+> [`docs/SC_COMP_ALGORITHM.md`](docs/SC_COMP_ALGORITHM.md) and the
+> [Production status](#production-status-2026-04-25) section above. The
+> `--r2_threshold` / `--last_block_r2_threshold` / `--max_block_for_qwt`
+> CLI flags described below have been replaced by `--cos_threshold` /
+> `--last_block_cos_threshold` / `--start_block` (still with
+> `--lookahead_veto`). This section is preserved for the block-23 collapse
+> analysis, which is still relevant context for any future gate redesign.
 
 Early runs at `--r2_threshold 0.5` exposed a catastrophic failure where
 some MP+QwT configs collapsed to `top1 ≈ 0`. Root cause: block 23's

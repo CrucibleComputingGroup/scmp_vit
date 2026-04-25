@@ -261,8 +261,22 @@ def main():
     ap.add_argument("--head_aligned", action="store_true",
                     help="Use HeadAlignedSCLinear (per-head D=64, reuses block "
                          "QK _CFG_CACHE) for SC comp. No effect when --comp_mode fp.")
+    ap.add_argument("--head_aligned_only", action="store_true",
+                    help="Drop the full-width SC variants from the picker; use "
+                         "only head-aligned. Implies --head_aligned. Only "
+                         "meaningful when --n_variants>1 or extra-axis flags set.")
     ap.add_argument("--n_heads", type=int, default=16,
                     help="Head count for HeadAlignedSCLinear; must divide D=1024.")
+    ap.add_argument("--n_variants", type=int, default=1,
+                    help="Sobol-seed bank size for the comp picker (default + "
+                         "antithetic + alt-seeds). >1 enables per-block variant "
+                         "search = log2(n_variants) config bits per block.")
+    ap.add_argument("--polarity_flip", action="store_true",
+                    help="Add the −1 polarity variant for each Sobol cfg "
+                         "(+1 config bit per block).")
+    ap.add_argument("--w_scales", type=str, default="1.0",
+                    help="Comma-separated W-magnitude scales to search over, "
+                         "e.g. '0.75,1.0'. Per-block pick adds log2(n) bits.")
     ap.add_argument("--skip_qwt", action="store_true",
                     help="Skip calibration; evaluate raw SC model only.")
     ap.add_argument("--out_json", default="results/eval_custom_sl_map_fpcomp.json")
@@ -310,29 +324,51 @@ def main():
         print("[result:sc_raw]", res_sc_raw, flush=True)
         results_block["sc_raw"] = res_sc_raw
     else:
-        # Build the single-variant comp factory (fast path — MP driver does
-        # not expose K-seed-bank search; use the uniform driver for that).
+        # Build the cartesian comp-kernel variant list (mirrors qwt_sc_overnight.py).
+        # When n_variants==1 and no extra-axis flags are set, falls through to
+        # a single-factory fast path; otherwise the picker chooses per block.
         D_resid = 1024
+        seed_bank = build_seed_bank(D_resid, args.comp_sc_prec, args.n_variants)
+        polarities = [1, -1] if args.polarity_flip else [1]
+        scales = [float(s) for s in args.w_scales.split(",")]
+        variants = []
         if args.comp_mode == "sc":
-            if args.head_aligned:
-                comp_factory = make_head_aligned_factory(
-                    args.comp_sc_prec, args.comp_sc_mode,
-                    n_heads=args.n_heads, cfg_override=None,
-                    scale=1.0, polarity=1,
-                )
-                comp_desc = f"sc/head_aligned/h{args.n_heads}/prec{args.comp_sc_prec}"
-            else:
-                seed_bank = build_seed_bank(D_resid, args.comp_sc_prec, 1)
-                cfg0 = seed_bank[0][1]
-                comp_factory = make_sc_factory(
-                    args.comp_sc_prec, args.comp_sc_mode,
-                    cfg_override=cfg0, scale=1.0, polarity=1,
-                )
-                comp_desc = f"sc/default/prec{args.comp_sc_prec}/{args.comp_sc_mode}"
-        else:
-            comp_factory = make_fp_factory(scale=1.0, polarity=1)
-            comp_desc = "fp"
-        print(f"[comp] factory={comp_desc}", flush=True)
+            if not args.head_aligned_only:
+                for sname, cfg in seed_bank:
+                    for pol in polarities:
+                        for sc in scales:
+                            name = f"sc/{sname}/p{'+' if pol > 0 else '-'}/s{sc:.2f}"
+                            variants.append((name, make_sc_factory(
+                                args.comp_sc_prec, args.comp_sc_mode,
+                                cfg_override=cfg, scale=sc, polarity=pol)))
+            if args.head_aligned or args.head_aligned_only:
+                for pol in polarities:
+                    for sc in scales:
+                        name = f"head_aligned/p{'+' if pol > 0 else '-'}/s{sc:.2f}/h{args.n_heads}"
+                        variants.append((name, make_head_aligned_factory(
+                            args.comp_sc_prec, args.comp_sc_mode,
+                            n_heads=args.n_heads, cfg_override=None,
+                            scale=sc, polarity=pol)))
+        else:  # fp comp — debug / baseline
+            for pol in polarities:
+                for sc in scales:
+                    name = f"fp/p{'+' if pol > 0 else '-'}/s{sc:.2f}"
+                    variants.append((name, make_fp_factory(scale=sc, polarity=pol)))
+
+        print(f"[comp] mode={args.comp_mode}  variants={len(variants)}  "
+              f"(seeds={len(seed_bank)} pols={len(polarities)} scales={len(scales)})",
+              flush=True)
+        for name, _ in variants[:8]:
+            print(f"        - {name}", flush=True)
+        if len(variants) > 8:
+            print(f"        ... ({len(variants)-8} more)", flush=True)
+
+        comp_factory = None
+        comp_factory_variants = None
+        if len(variants) == 1:
+            comp_factory = variants[0][1]
+        elif len(variants) > 1:
+            comp_factory_variants = variants
 
         t0 = time.time()
         seed_all(args.calib_seed)
@@ -357,6 +393,7 @@ def main():
             last_block_cos_threshold=last_tau,
             lookahead_veto=args.lookahead_veto,
             comp_factory=comp_factory,
+            comp_factory_variants=comp_factory_variants,
         )
         calib_s = time.time() - t0
         print(f"[calib] done in {calib_s:.1f}s", flush=True)
@@ -395,8 +432,12 @@ def main():
             "comp_mode": args.comp_mode,
             "comp_sc_prec": args.comp_sc_prec,
             "comp_sc_mode": args.comp_sc_mode,
-            "head_aligned": bool(args.head_aligned),
-            "n_heads": args.n_heads if args.head_aligned else None,
+            "head_aligned": bool(args.head_aligned or args.head_aligned_only),
+            "head_aligned_only": bool(args.head_aligned_only),
+            "n_heads": args.n_heads if (args.head_aligned or args.head_aligned_only) else None,
+            "n_variants": args.n_variants,
+            "polarity_flip": bool(args.polarity_flip),
+            "w_scales": args.w_scales,
         },
         "main_sl": main_sl,
         "allocation": summarize_allocation_custom(sl_map, active_ops),
@@ -405,6 +446,13 @@ def main():
         "calib": None if args.skip_qwt else {
             "elapsed_s": calib_s,
             "per_block": calib_report,
+            "variant_counts": (
+                None if calib_report is None else
+                dict(__import__("collections").Counter(
+                    [r.get("variant") for r in calib_report
+                     if r.get("variant") is not None]
+                ))
+            ),
         },
         "results": results_block,
         "sl_map": sl_map,
