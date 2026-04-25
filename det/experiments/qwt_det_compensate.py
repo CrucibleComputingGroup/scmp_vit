@@ -1,15 +1,24 @@
-"""QwT closed-form linear compensation for SC EVA-ViTDet.
+"""QwT cross-seed cosine-gated linear compensation for SC EVA-ViTDet.
 
-Det-side analogue of ``cls/experiments/qwt_sc_compensation.py``. Fits a
-per-block residual ``x @ W + b`` on a small calibration set, then wraps each
-SC block with a ``CompensationBlock`` and evaluates on COCO.
+Det-side analogue of ``cls/experiments/qwt_sc_overnight.py``. Fits a per-block
+residual ``x @ W + b`` on **two disjoint** calibration batches, admits a
+block iff the two ridge fits agree in direction (``cos(W_A, W_B) > τ``), then
+wraps each admitted SC block with a ``CompensationBlock`` and evaluates on
+COCO. The cross-seed admission rule lives in
+``third_party/QwT-SC/QwT-vit-sc/qwt_sc/compensation.py`` — see that module's
+docstring for the physical derivation. This driver only handles the D2 /
+COCO plumbing (image preprocessing through ``model.preprocess_image``,
+COCOEvaluator, 1024² fwd_chunk).
 
 Usage::
 
     python experiments/qwt_det_compensate.py \\
-        --sc_prec 7 --sc_ops qk,av,proj \\
-        --n_calib 16 --n_eval 100 \\
-        --out_json results/qwt_det_int7_qkavproj.json
+        --sc_prec 7 --sc_ops_per_block_json sensitivity/skip/skip_worst_30_int7.json \\
+        --n_calib 64 --n_eval 100 \\
+        --calib_seed 1 --calib_seed_b 2 \\
+        --cos_threshold 0.5 --last_block_cos_threshold 0.8 --lookahead_veto \\
+        --comp_mode sc --comp_sc_prec 8 \\
+        --out_json results/qwt_det/run.json
 """
 from __future__ import annotations
 
@@ -26,7 +35,7 @@ _HERE = Path(__file__).resolve().parent
 _DET = _HERE.parent
 _REPO = _DET.parent
 _QWT_LIB = _REPO / "third_party" / "QwT-SC" / "QwT-vit-sc"
-for p in (_DET, _QWT_LIB):
+for p in (_DET, _REPO, _QWT_LIB):
     if str(p) not in sys.path:
         sys.path.insert(0, str(p))
 
@@ -37,21 +46,40 @@ from qwt_sc import calibrate_qwt
 from qwt_sc.compensation import CompensationBlock
 
 
-def make_sc_comp_factory(sc_prec: int, mode: str = "bipolar"):
+def make_fp_factory(scale: float = 1.0, polarity: int = 1):
+    """(W, b) -> nn.Linear FP comp. Debug / baseline only — FP comp
+    reintroduces an FP multiplier that the SC hardware story was designed
+    to avoid. Production must use ``--comp_mode sc``."""
     def factory(W, b):
         D_in, D_out = W.shape
         layer = nn.Linear(D_in, D_out, bias=True)
         with torch.no_grad():
-            layer.weight.copy_(W.t().contiguous())
-            layer.bias.copy_(b)
+            layer.weight.copy_((W.t().contiguous()) * (scale * polarity))
+            layer.bias.copy_(b * polarity if polarity == -1 else b)
+        return layer
+    return factory
+
+
+def make_sc_comp_factory(sc_prec: int, mode: str = "bipolar",
+                         scale: float = 1.0, polarity: int = 1):
+    """(W, b) -> SCLinear wrapping the ridge-fit (D_in, D_out) matmul.
+    Routes the comp through the same XNOR/Sobol pipeline as the block SC
+    matmuls — keeps the whole inference path in SC hardware (no FP
+    multiplier). Pulls Sobol pool from ``_CFG_CACHE[(D_in, sc_prec)]``."""
+    def factory(W, b):
+        D_in, D_out = W.shape
+        layer = nn.Linear(D_in, D_out, bias=True)
+        with torch.no_grad():
+            layer.weight.copy_((W.t().contiguous()) * (scale * polarity))
+            layer.bias.copy_(b * polarity if polarity == -1 else b)
         return SCLinear(layer, sc_prec=sc_prec, mode=mode)
     return factory
 
 
 def parse_sc_ops(spec: str) -> dict:
-    """Turn 'qk,av,proj,mlp_fc1' into a 40-block sched dict ready for sc_patch_eva."""
+    """Turn 'qk,av,proj,mlp_fc1' into a sched dict ready for sc_patch_eva."""
     names = [s.strip() for s in spec.split(",") if s.strip()]
-    out = {n: 1 for n in names}  # sc_patch normalizes dict[op, scalar] → per-block
+    out = {n: 1 for n in names}
     if "proj" in out:
         v = out.pop("proj")
         out.setdefault("qkv_proj", v)
@@ -61,22 +89,37 @@ def parse_sc_ops(spec: str) -> dict:
 
 class BackboneCalibLoader:
     """Yields (image_tensor,) 1-tuples from a D2 test loader, using the
-    model's preprocess_image to get a normalized (B,3,H,W) float tensor."""
+    model's preprocess_image to get a normalized (B,3,H,W) float tensor.
 
-    def __init__(self, d2_loader, model_for_preproc, device, max_items):
+    Logs the COCO image_ids it yields when ``log_ids`` is set, so the
+    caller can verify the two cross-seed loaders are disjoint."""
+
+    def __init__(self, d2_loader, model_for_preproc, device, max_items,
+                 tag: str = "", log_ids: bool = False):
         self._loader = d2_loader
         self._pp = model_for_preproc
         self._device = device
         self._max = max_items
+        self._tag = tag
+        self._log_ids = log_ids
+        self.image_ids: list[int] = []
 
     def __iter__(self):
         n = 0
+        ids: list[int] = []
         for batched_inputs in self._loader:
+            for it in batched_inputs:
+                if "image_id" in it:
+                    ids.append(int(it["image_id"]))
             images = self._pp.preprocess_image(batched_inputs).tensor.to(self._device)
             yield (images,)
             n += images.size(0)
             if n >= self._max:
-                return
+                break
+        self.image_ids = ids
+        if self._log_ids:
+            print(f"[calib:{self._tag}] yielded {len(ids)} image_ids "
+                  f"(first 8: {ids[:8]})", flush=True)
 
 
 @torch.no_grad()
@@ -93,17 +136,45 @@ def main():
                    help="Comma-separated subset of {qk,av,proj,mlp_fc1,mlp_fc2}.")
     p.add_argument("--sc_ops_per_block_json", type=str, default="",
                    help="Optional per-(op, block) schedule JSON; overrides --sc_ops.")
-    p.add_argument("--n_calib", type=int, default=16)
+    p.add_argument("--n_calib", type=int, default=64)
     p.add_argument("--n_eval", type=int, default=100)
     p.add_argument("--ridge", type=float, default=1e-2)
-    p.add_argument("--start_block", type=int, default=0)
-    p.add_argument("--min_r2", type=float, default=0.0,
-                   help="Disable comp on blocks whose calib r2 <= this threshold.")
+    p.add_argument("--start_block", type=int, default=0,
+                   help="Indices below this are never admitted (pass-through).")
     p.add_argument("--fwd_chunk", type=int, default=2,
-                   help="Det images are 1024², so use tiny chunks.")
-    p.add_argument("--avg_sc_draws", type=int, default=1)
-    p.add_argument("--skip_baseline", action="store_true")
-    p.add_argument("--comp_mode", choices=["fp", "sc"], default="fp")
+                   help="Det images are 1280², so use tiny chunks.")
+    # ---- Cross-seed gate (single-recipe admission rule) ----
+    p.add_argument("--calib_seed", type=int, default=1,
+                   help="Image-range start for calib loader A. Used as "
+                        "start_idx into the COCO val list — A draws "
+                        "[calib_seed*0, n_calib).")
+    p.add_argument("--calib_seed_b", type=int, default=2,
+                   help="Image-range tag for calib loader B. Must differ "
+                        "from --calib_seed; B draws a disjoint slice from A.")
+    p.add_argument("--cos_threshold", type=float, default=0.5,
+                   help="Admission threshold τ. A block is admitted iff "
+                        "cos(W_A, W_B) > τ. Pilot on cls finds τ "
+                        "insensitive in [0.3, 0.65]; default 0.5.")
+    p.add_argument("--last_block_cos_threshold", type=float, default=0.8,
+                   help="Stricter τ for the last block (block N-1 feeds "
+                        "the head directly; demand tighter agreement). "
+                        "Default 0.8. Set ≤ --cos_threshold to disable.")
+    p.add_argument("--norm_floor", type=float, default=0.0,
+                   help="Additionally require min(||W_A||,||W_B||) > this.")
+    p.add_argument("--lookahead_veto", action="store_true",
+                   help="One-step binary lookahead: propagate 'apply' vs "
+                        "'skip' through block i+1 and veto apply if skip "
+                        "is closer to the FP chain. Cheap insurance for "
+                        "borderline blocks.")
+    p.add_argument("--skip_baseline", action="store_true",
+                   help="Skip raw-SC eval (use when sibling sweep already "
+                        "recorded the baseline).")
+    # ---- Comp-kernel choice ----
+    p.add_argument("--comp_mode", choices=["fp", "sc"], default="sc",
+                   help="Kernel for the installed correction matmul. 'sc' "
+                        "(default) routes W̄ through SCLinear so the whole "
+                        "inference path stays in SC hardware. 'fp' is "
+                        "debug only.")
     p.add_argument("--comp_sc_prec", type=int, default=8)
     p.add_argument("--comp_sc_mode", choices=["bipolar", "unipolar"], default="bipolar")
     p.add_argument("--out_tag", default="qwt_det")
@@ -113,6 +184,10 @@ def main():
     p.add_argument("--ckpt", type=str, default="",
                    help="Path to EVA-ViTDet checkpoint (default: GreatLakes shared_data).")
     args = p.parse_args()
+
+    if args.calib_seed_b == args.calib_seed:
+        raise SystemExit("--calib_seed_b must differ from --calib_seed "
+                         "(cross-seed gate requires disjoint calib batches)")
 
     device = torch.device("cuda")
     print(f"[env] torch {torch.__version__} cuda {torch.version.cuda} "
@@ -129,14 +204,16 @@ def main():
     print(f"[cfg] sc_prec={args.sc_prec}  {cfg_desc}  "
           f"n_calib={args.n_calib}  n_eval={args.n_eval}", flush=True)
 
-    # --- Load both models. Use same n_eval loader, we'll slice first n_calib for calib. ---
+    # --- Load FP + SC models, both with full eval loaders. ---
     _load_kw = dict(d2_datasets=args.d2_datasets, ckpt=args.ckpt)
     print("[model] loading FP reference", flush=True)
-    model_fp, test_loader_fp, evaluator_fp, _ = load_model_and_loader(args.n_eval, **_load_kw)
+    model_fp, test_loader_fp, evaluator_fp, _ = load_model_and_loader(
+        args.n_eval, **_load_kw)
     model_fp.eval()
 
     print("[model] loading SC model (fresh copy)", flush=True)
-    model_sc, test_loader_sc, evaluator_sc, _ = load_model_and_loader(args.n_eval, **_load_kw)
+    model_sc, test_loader_sc, evaluator_sc, _ = load_model_and_loader(
+        args.n_eval, **_load_kw)
     model_sc.eval()
 
     print(f"[sc] patching model_sc (sc_prec={args.sc_prec})", flush=True)
@@ -151,56 +228,104 @@ def main():
         print("[eval] SC baseline (no comp)", flush=True)
         t0 = time.time()
         res_sc_raw = run_coco_eval(model_sc, test_loader_sc, evaluator_sc,
-                                    out_dir_base / "sc_raw")
+                                   out_dir_base / "sc_raw")
         print(f"  bbox AP={res_sc_raw['bbox']['AP']:.2f}  "
               f"segm AP={res_sc_raw['segm']['AP']:.2f}  "
               f"({time.time()-t0:.0f}s)", flush=True)
 
-    # --- Calibration ---
-    # Use a fresh loader (not the test_loader_sc we just consumed) via reload.
-    calib_model, calib_loader_d2, _, _ = load_model_and_loader(args.n_calib, **_load_kw)
-    del calib_model  # only need the loader
-    calib_loader = BackboneCalibLoader(calib_loader_d2, model_sc, device,
-                                        max_items=args.n_calib)
+    # --- Two disjoint calib loaders for the cross-seed gate ---
+    # COCO val is deterministic in D2; we draw two disjoint contiguous
+    # slices to imitate the cls side's two-seed shuffle. The slice anchors
+    # come from --calib_seed{,_b} so reruns with different seed pairs use
+    # different slices.
+    start_a = (max(0, args.calib_seed - 1)) * args.n_calib
+    start_b = (max(0, args.calib_seed_b - 1)) * args.n_calib
+    if start_b == start_a:
+        # Fallback: shift B by n_calib so the slices are disjoint.
+        start_b = start_a + args.n_calib
+    print(f"[calib] slice A start={start_a}  B start={start_b}  "
+          f"size={args.n_calib} each", flush=True)
 
-    print(f"[calib] starting QwT calibration (n_calib={args.n_calib})", flush=True)
-    t0 = time.time()
-    blocks_fp = list(model_fp.backbone.net.blocks)
-    blocks_sc = model_sc.backbone.net.blocks
-    # calibrate_qwt invokes `model_sc(imgs)` to populate its block-0 hook.
-    # Pass .backbone.net directly — it accepts (B, 3, H, W) tensors.
+    _, calib_loader_d2_a, _, subset_a = load_model_and_loader(
+        args.n_calib, start_idx=start_a, **_load_kw)
+    _, calib_loader_d2_b, _, subset_b = load_model_and_loader(
+        args.n_calib, start_idx=start_b, **_load_kw)
+    ids_a = {int(it["image_id"]) for it in subset_a}
+    ids_b = {int(it["image_id"]) for it in subset_b}
+    overlap = ids_a & ids_b
+    if overlap:
+        raise RuntimeError(f"[calib] cross-seed loaders are not disjoint: "
+                           f"{len(overlap)} shared image_ids")
+    print(f"[calib] disjoint OK: |A|={len(ids_a)} |B|={len(ids_b)} "
+          f"first_a={sorted(ids_a)[:4]} first_b={sorted(ids_b)[:4]}",
+          flush=True)
+
+    calib_loader_a = BackboneCalibLoader(calib_loader_d2_a, model_sc, device,
+                                         max_items=args.n_calib, tag="A")
+    calib_loader_b = BackboneCalibLoader(calib_loader_d2_b, model_sc, device,
+                                         max_items=args.n_calib, tag="B")
+
+    # --- Comp kernel choice ---
     comp_factory = None
     if args.comp_mode == "sc":
         comp_factory = make_sc_comp_factory(args.comp_sc_prec, args.comp_sc_mode)
-        print(f"[comp] SC compensator: sc_prec={args.comp_sc_prec} "
-              f"mode={args.comp_sc_mode}", flush=True)
+        print(f"[comp] full-width SC compensator: sc_prec="
+              f"{args.comp_sc_prec} mode={args.comp_sc_mode}", flush=True)
     else:
-        print(f"[comp] FP compensator", flush=True)
+        comp_factory = make_fp_factory()
+        print(f"[comp] FP compensator (debug)", flush=True)
+
+    # --- Cross-seed calibration ---
+    last_tau = (args.last_block_cos_threshold
+                if args.last_block_cos_threshold > args.cos_threshold else None)
+    print(f"[calib] τ={args.cos_threshold}  last_τ={last_tau}  "
+          f"norm_floor={args.norm_floor}  lookahead_veto={args.lookahead_veto}",
+          flush=True)
+    print(f"[calib] starting QwT cross-seed calibration "
+          f"(n_calib={args.n_calib} per side)", flush=True)
+    t_cal = time.time()
+    blocks_fp = list(model_fp.backbone.net.blocks)
+    blocks_sc = model_sc.backbone.net.blocks
     report = calibrate_qwt(
         model_fp=model_fp.backbone.net,
         model_sc=model_sc.backbone.net,
         blocks_fp=blocks_fp,
         blocks_sc_container=blocks_sc,
-        calib_loader=calib_loader,
+        calib_loader_a=calib_loader_a,
+        calib_loader_b=calib_loader_b,
         device=device,
         n_calib=args.n_calib,
         ridge=args.ridge,
         start_block=args.start_block,
-        min_r2=args.min_r2,
         fwd_chunk=args.fwd_chunk,
-        avg_sc_draws=args.avg_sc_draws,
+        cos_threshold=args.cos_threshold,
+        norm_floor=args.norm_floor,
+        last_block_cos_threshold=last_tau,
+        lookahead_veto=args.lookahead_veto,
         comp_factory=comp_factory,
     )
-    calib_s = time.time() - t0
+    calib_s = time.time() - t_cal
     print(f"[calib] done in {calib_s:.1f}s", flush=True)
+
+    n_enabled = sum(1 for r in report if r.get("enabled", False))
+    n_blocks_total = len(report)
+    en_blocks = [r["block"] for r in report if r["enabled"]]
+    cos_admitted = [r["cos_ab"] for r in report if r["enabled"]]
+    cos_rejected = [r["cos_ab"] for r in report if not r["enabled"]]
+    print(f"[gate] admitted={n_enabled}/{n_blocks_total}  blocks={en_blocks}", flush=True)
+    if cos_admitted:
+        print(f"[gate] cos range admitted=[{min(cos_admitted):+.3f}, "
+              f"{max(cos_admitted):+.3f}]", flush=True)
+    if cos_rejected:
+        print(f"[gate] cos range rejected=[{min(cos_rejected):+.3f}, "
+              f"{max(cos_rejected):+.3f}]", flush=True)
 
     # --- Evaluate compensated model ---
     print("[eval] SC + QwT compensation", flush=True)
-    # reload evaluator (it has state from previous run)
     _, _, evaluator_sc2, _ = load_model_and_loader(args.n_eval, **_load_kw)
     t0 = time.time()
     res_sc_comp = run_coco_eval(model_sc, test_loader_sc, evaluator_sc2,
-                                 out_dir_base / "sc_comp")
+                                out_dir_base / "sc_comp")
     print(f"  bbox AP={res_sc_comp['bbox']['AP']:.2f}  "
           f"segm AP={res_sc_comp['segm']['AP']:.2f}  "
           f"({time.time()-t0:.0f}s)", flush=True)
@@ -212,12 +337,25 @@ def main():
             "sc_ops": args.sc_ops,
             "sc_ops_per_block_json": args.sc_ops_per_block_json,
             "n_calib": args.n_calib, "n_eval": args.n_eval,
+            "calib_seed": args.calib_seed,
+            "calib_seed_b": args.calib_seed_b,
             "ridge": args.ridge, "start_block": args.start_block,
-            "min_r2": args.min_r2,
-            "avg_sc_draws": args.avg_sc_draws,
+            "cos_threshold": args.cos_threshold,
+            "last_block_cos_threshold": args.last_block_cos_threshold,
+            "norm_floor": args.norm_floor,
+            "lookahead_veto": bool(args.lookahead_veto),
+            "comp_mode": args.comp_mode,
+            "comp_sc_prec": args.comp_sc_prec,
+            "comp_sc_mode": args.comp_sc_mode,
             "fwd_chunk": args.fwd_chunk,
+            "calib_slice_a_start": start_a,
+            "calib_slice_b_start": start_b,
         },
-        "calib": {"per_block": report, "elapsed_s": calib_s},
+        "calib": {
+            "per_block": report,
+            "elapsed_s": calib_s,
+            "n_enabled_blocks": n_enabled,
+        },
         "results": {
             "sc_raw": res_sc_raw,
             "sc_comp": res_sc_comp,
@@ -229,13 +367,15 @@ def main():
     print(f"[done] wrote {args.out_json}", flush=True)
 
     if res_sc_raw:
-        d = res_sc_comp['bbox']['AP'] - res_sc_raw['bbox']['AP']
+        d_bbox = res_sc_comp['bbox']['AP'] - res_sc_raw['bbox']['AP']
+        d_segm = res_sc_comp['segm']['AP'] - res_sc_raw['segm']['AP']
         print(f"\n=== SUMMARY ===")
         print(f"  SC raw      : bbox AP={res_sc_raw['bbox']['AP']:.2f}  "
               f"segm AP={res_sc_raw['segm']['AP']:.2f}")
         print(f"  SC + QwT    : bbox AP={res_sc_comp['bbox']['AP']:.2f}  "
               f"segm AP={res_sc_comp['segm']['AP']:.2f}")
-        print(f"  Δ bbox: {d:+.2f}")
+        print(f"  Δ bbox: {d_bbox:+.2f}   Δ segm: {d_segm:+.2f}")
+        print(f"  admitted blocks: {n_enabled}/{n_blocks_total}")
 
 
 if __name__ == "__main__":

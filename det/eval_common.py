@@ -26,12 +26,16 @@ CFG_PATH = f"{EVA_DET}/projects/ViTDet/configs/COCO/cascade_mask_rcnn_vitdet_eva
 
 
 def load_model_and_loader(n_eval: int, disable_act_checkpoint: bool = True,
-                          d2_datasets: str = "", ckpt: str = ""):
-    """Build FP model + weights + test loader limited to first ``n_eval`` images.
+                          d2_datasets: str = "", ckpt: str = "",
+                          start_idx: int = 0):
+    """Build FP model + weights + test loader for COCO val images
+    ``[start_idx, start_idx + n_eval)``.
 
     Returns ``(model, test_loader, evaluator, subset)``. ``evaluator`` is a
     ``COCOEvaluator`` whose internal ``_coco_api`` has been filtered to the
-    subset, so AP is computed only against those images.
+    subset, so AP is computed only against those images. ``start_idx`` allows
+    disjoint slices for cross-seed calibration; default 0 preserves prior
+    behavior.
     """
     os.environ.setdefault("DETECTRON2_DATASETS", d2_datasets or _DEFAULT_D2_DATASETS)
     _ckpt = ckpt or _DEFAULT_CKPT
@@ -50,12 +54,15 @@ def load_model_and_loader(n_eval: int, disable_act_checkpoint: bool = True,
 
     orig_name = cfg.dataloader.test.dataset.names
     all_items = DatasetCatalog.get(orig_name)
-    subset = all_items[:n_eval]
-    sub_name = f"{orig_name}_first{n_eval}"
+    subset = all_items[start_idx:start_idx + n_eval]
+    if start_idx == 0:
+        sub_name = f"{orig_name}_first{n_eval}"
+    else:
+        sub_name = f"{orig_name}_slice_{start_idx}_{n_eval}"
     if sub_name in DatasetCatalog.list():
         DatasetCatalog.remove(sub_name)
         MetadataCatalog.remove(sub_name)
-    DatasetCatalog.register(sub_name, lambda: subset)
+    DatasetCatalog.register(sub_name, lambda subset=subset: subset)
     md = MetadataCatalog.get(orig_name).as_dict()
     md.pop("name", None)
     MetadataCatalog.get(sub_name).set(**md)
