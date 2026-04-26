@@ -2062,23 +2062,18 @@ def sc_matmul_enable_batched_bipolar(
     # boundary/sign already in (BH, D, N/M) layout from fused-transpose quant kernel
     output = torch.empty(BH, N, M, dtype=torch.float32, device=device)
 
-    # Adaptive tile size: smaller tiles for small N/M to increase GPU occupancy
-    if N <= 64 or M <= 64:
-        BLOCK_M = 16
-        BLOCK_N = 16
+    # cls-stable heuristic by default; det opts in via ``det_kernel_tuning()``.
+    if _det_kernel_tuning_active():
+        BLOCK_M, BLOCK_N, BLOCK_K, nw = _pick_enable_block_sizes(N, M, D)
     else:
-        BLOCK_M = 32
-        BLOCK_N = 32
-    # BLOCK_K=4 reduces register pressure vs 8, improving occupancy
-    if D >= 4 and D % 4 == 0:
-        BLOCK_K = 4
-    elif D % 2 == 0:
-        BLOCK_K = 2
-    else:
-        BLOCK_K = 1
-
-    # Warp count tuning: more warps for larger tiles, fewer for smaller
-    nw = 8 if BLOCK_M == 32 else 2
+        if N <= 64 or M <= 64:
+            BLOCK_M = 16
+            BLOCK_N = 16
+        else:
+            BLOCK_M = 32
+            BLOCK_N = 32
+        BLOCK_K = _pick_block_k(D)
+        nw = 8 if BLOCK_M == 32 else 2
     grid_mm = (triton.cdiv(N, BLOCK_M), triton.cdiv(M, BLOCK_N), BH)
     enable_matmul_bipolar_batched_kernel[grid_mm](
         cum_indicator, k_table,
@@ -2183,6 +2178,82 @@ def _get_cached_k_table(
     return _k_table_cache[key]
 
 
+_DET_KERNEL_TUNING_DEPTH = 0
+
+
+class det_kernel_tuning:
+    """Context manager opting in to det-tuned tile selection for the
+    enable-signal SC kernels.
+
+    Within the ``with`` block, ``enable_matmul_triton`` and
+    ``sc_matmul_enable_batched_bipolar`` switch from the cls-stable
+    heuristic to ``_pick_enable_block_sizes``. Re-entrant: nested ``with``
+    blocks count up/down, and the original heuristic resumes only when the
+    outermost block exits. cls callers that don't enter the block see the
+    original behaviour and stay bit-identical.
+
+    Usage::
+
+        with det_kernel_tuning():
+            inference_on_dataset(model, loader, evaluator)
+    """
+
+    def __enter__(self):
+        global _DET_KERNEL_TUNING_DEPTH
+        _DET_KERNEL_TUNING_DEPTH += 1
+        return self
+
+    def __exit__(self, *_):
+        global _DET_KERNEL_TUNING_DEPTH
+        _DET_KERNEL_TUNING_DEPTH -= 1
+
+
+def _det_kernel_tuning_active() -> bool:
+    return _DET_KERNEL_TUNING_DEPTH > 0
+
+
+def _pick_enable_block_sizes(rows_a: int, rows_b: int, D: int) -> tuple:
+    """Pick (BLOCK_M, BLOCK_N, BLOCK_K, num_warps) for the enable-signal tiled
+    kernel — **det-only**. Tuned on RTX PRO 6000 Blackwell across the
+    EVA-ViTDet shape spectrum on real activations (post-LN/post-GELU, not
+    randn). Covers SC attn (BH-batched, K∈{88, 256, 6400}) and SC linear
+    (proj/fc1/fc2 at M=6400, K∈{1408, 6144}).
+
+    Activated by the :class:`det_kernel_tuning` context manager. cls callers
+    (default) get the original ``(N≤64 or M≤64 → 16,16; else 32,32)``
+    heuristic via the explicit guard in ``enable_matmul_triton`` and
+    ``sc_matmul_enable_batched_bipolar``, and remain bit- and perf-stable.
+
+    Decision tree (rows_a, rows_b, D == kernel-side N, M, D):
+
+      * ``rows_a≤64 or rows_b≤64`` → ``(16, 16, nw=2)`` — occupancy floor.
+      * ``D≤256`` (attn matmuls): ``(16, 64, nw=8)`` if ``rows_a*rows_b≥1M``
+        (global-attn) else ``(16, 32, nw=4)`` (window-attn).
+      * ``rows_b≥256`` → ``(32, 64, nw=8)`` — SCLinear (proj/fc1/fc2):
+        wider-N tile ~1.10–1.20× faster on real activations.
+      * Else (``D>256``, narrow output) → ``(32, 32, nw=8)`` — global-av
+        (large K, small N), bandwidth-bound; tile size doesn't help.
+    """
+    if rows_a <= 64 or rows_b <= 64:
+        return 16, 16, _pick_block_k(D), 2
+    if D <= 256:
+        if rows_a * rows_b >= 1 << 20:
+            return 16, 64, _pick_block_k(D), 8     # global-attn-like
+        return 16, 32, _pick_block_k(D), 4         # window-attn-like
+    if rows_b >= 256:
+        return 32, 64, _pick_block_k(D), 8         # SCLinear (proj/fc1/fc2)
+    return 32, 32, _pick_block_k(D), 8             # global-av (large K, small N)
+
+
+def _pick_block_k(D: int) -> int:
+    """BLOCK_K=4 unless D isn't 4-divisible. Keeps register pressure manageable."""
+    if D >= 4 and D % 4 == 0:
+        return 4
+    if D % 2 == 0:
+        return 2
+    return 1
+
+
 def enable_matmul_triton(
     cum_indicator: torch.Tensor,
     k_table: torch.Tensor,
@@ -2223,22 +2294,19 @@ def enable_matmul_triton(
         sign_a = sign_a.t().contiguous()
         sign_b = sign_b.t().contiguous()
 
-    # Adaptive tile size: smaller tiles for small N/M to increase GPU occupancy
-    if N <= 64 or M <= 64:
-        BLOCK_M = 16
-        BLOCK_N = 16
+    # Tile selection — cls-stable heuristic by default; det opts into the
+    # tuned heuristic via the ``det_kernel_tuning()`` context manager.
+    if _det_kernel_tuning_active():
+        BLOCK_M, BLOCK_N, BLOCK_K, nw = _pick_enable_block_sizes(N, M, D)
     else:
-        BLOCK_M = 32
-        BLOCK_N = 32
-    # BLOCK_K=4 reduces register pressure vs 8, improving occupancy
-    if D >= 4 and D % 4 == 0:
-        BLOCK_K = 4
-    elif D % 2 == 0:
-        BLOCK_K = 2
-    else:
-        BLOCK_K = 1
-    # Warp count tuning: more warps for larger tiles, fewer for smaller
-    nw = 8 if BLOCK_M == 32 else 2
+        if N <= 64 or M <= 64:
+            BLOCK_M = 16
+            BLOCK_N = 16
+        else:
+            BLOCK_M = 32
+            BLOCK_N = 32
+        BLOCK_K = _pick_block_k(D)
+        nw = 8 if BLOCK_M == 32 else 2
     grid = (triton.cdiv(N, BLOCK_M), triton.cdiv(M, BLOCK_N))
     if is_bipolar:
         enable_matmul_bipolar_tiled_kernel[grid](
@@ -3037,6 +3105,164 @@ def sc_matmul_grouped_enable_triton(
         result = result.to(device)
 
     return result
+
+
+def _grouped_symmetric_quant_batched(x, G, q_max, clip_margin=0):
+    """Batched per-row-group symmetric quant. ``x`` is (BH, rows, cols).
+
+    Currently only ``G == 1`` (per-row) and ``G >= rows`` (per-batch-tensor)
+    are implemented — SCMatMul always uses ``group_a=group_b=1`` so per-row is
+    the hot path. Returns (scale_row, x_int, sign), all shaped (BH, rows[, cols]).
+    """
+    assert x.dim() == 3, f"expected (BH, rows, cols), got {tuple(x.shape)}"
+    BH, rows, cols = x.shape
+    q_clip = q_max - clip_margin
+
+    if G >= rows:
+        abs_max = x.abs().amax(dim=(1, 2)).clamp(min=1e-5)        # (BH,)
+        scale = abs_max / q_clip                                    # (BH,)
+        x_int = (x / scale[:, None, None]).round().clamp(-q_max, q_max)
+        sign = torch.sign(x_int).to(torch.int8)
+        sign = torch.where(sign == 0, torch.ones_like(sign), sign)
+        return scale[:, None].expand(BH, rows).contiguous(), x_int, sign
+
+    if G == 1:
+        abs_max = x.abs().amax(dim=2).clamp(min=1e-5)               # (BH, rows)
+        scale = abs_max / q_clip                                    # (BH, rows)
+        x_int = (x / scale[:, :, None]).round().clamp(-q_max, q_max)
+        sign = torch.sign(x_int).to(torch.int8)
+        sign = torch.where(sign == 0, torch.ones_like(sign), sign)
+        return scale, x_int, sign
+
+    raise NotImplementedError(
+        f"_grouped_symmetric_quant_batched: G={G} not supported "
+        f"(use G=1 or G>=rows)")
+
+
+@torch.no_grad()
+def sc_matmul_grouped_enable_triton_batched(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    group_a: int = 1,
+    group_b: int = 1,
+    mode: str = "bipolar",
+    sc_prec: int = 8,
+    config: Optional[dict] = None,
+    stoc_len: Optional[int] = None,
+) -> torch.Tensor:
+    """Batched 3D version of ``sc_matmul_grouped_enable_triton``: ``a @ b^T``
+    over a leading batch dim, in **one** kernel launch.
+
+    Same enable-signal kernel as the 2D path; we reuse the cached
+    (cum_indicator, k_table) tables (they only depend on D and the RNG
+    config, not on batch) and pass per-row dequant scales on host. Eliminates
+    the per-head Python loop in ``SCMatMul`` for det attn.
+
+    Args:
+        a: (BH, M, D) left operand.
+        b: (BH, N, D) right operand (already in row-major form).
+        group_a, group_b: rows per quantization group inside each batch.
+            Currently supports 1 or >=rows.
+        mode: ``"bipolar"`` only — unipolar batched falls back to a per-batch
+            loop over the 2D entry.
+        sc_prec, config, stoc_len: same semantics as the 2D entry.
+
+    Returns:
+        (BH, M, N) float32.
+    """
+    assert a.dim() == 3 and b.dim() == 3, \
+        f"Expected 3D, got a:{a.dim()}D b:{b.dim()}D"
+    BH, M, D = a.shape
+    BH_b, N, D_b = b.shape
+    assert BH == BH_b, f"batch mismatch: a BH={BH} vs b BH={BH_b}"
+    assert D == D_b, f"inner-dim mismatch: a D={D} vs b D={D_b}"
+
+    if stoc_len is None:
+        stoc_len = 2 ** sc_prec
+
+    if config is None:
+        from config_helpers import make_sobol_simple_config
+        config = make_sobol_simple_config(D, D, sc_prec)
+
+    device = a.device
+
+    # Unipolar: no batched kernel yet. Fall back to per-batch loop. SCMatMul
+    # uses bipolar for both qk and av in production, so this is rare.
+    if mode == "unipolar":
+        out = torch.empty(BH, M, N, dtype=torch.float32, device=device)
+        for i in range(BH):
+            out[i] = sc_matmul_grouped_enable_triton(
+                a[i].contiguous(), b[i].contiguous(),
+                group_a=group_a, group_b=group_b,
+                mode=mode, sc_prec=sc_prec, config=config, stoc_len=stoc_len,
+            )
+        return out
+    if mode != "bipolar":
+        raise ValueError(f"Unknown mode: {mode}")
+
+    a = a.float().contiguous()
+    b = b.float().contiguous()
+
+    rand_seqs_a_t, rand_seqs_b_t = _get_cached_sequences(config, sc_prec, device)
+    V = 2 ** sc_prec + 1
+    cum_table_bytes = D * (stoc_len + 1) * V * 2
+    use_compact = cum_table_bytes > _COMPACT_ENABLE_THRESHOLD_BYTES
+
+    # Compact path (force-compact env var only) is not batched yet.
+    if use_compact:
+        out = torch.empty(BH, M, N, dtype=torch.float32, device=device)
+        for i in range(BH):
+            out[i] = sc_matmul_grouped_enable_triton(
+                a[i], b[i],
+                group_a=group_a, group_b=group_b,
+                mode=mode, sc_prec=sc_prec, config=config, stoc_len=stoc_len,
+            )
+        return out
+
+    q_max = 2 ** (sc_prec - 1) - 1
+    max_rng_val = 2 ** sc_prec
+    q_max_sq = float(q_max * q_max)
+
+    scale_a_row, a_int, sign_a = _grouped_symmetric_quant_batched(
+        a, group_a, q_max, clip_margin=0)         # scale (BH, M); a_int/sign (BH, M, D)
+    scale_b_row, b_int, sign_b = _grouped_symmetric_quant_batched(
+        b, group_b, q_max, clip_margin=0)         # scale (BH, N); b_int/sign (BH, N, D)
+
+    boundary_a = (a_int.abs() * (max_rng_val / q_max)).round().short()  # (BH, M, D)
+    boundary_b = (b_int.abs() * (max_rng_val / q_max)).round().short()  # (BH, N, D)
+
+    # Kernel expects (BH, D, rows) layout for coalesced loads — one transpose
+    # per batch dim, not per-batch-element.
+    boundary_a_t = boundary_a.transpose(1, 2).contiguous()  # (BH, D, M)
+    sign_a_t = sign_a.transpose(1, 2).contiguous()
+    boundary_b_t = boundary_b.transpose(1, 2).contiguous()  # (BH, D, N)
+    sign_b_t = sign_b.transpose(1, 2).contiguous()
+
+    cum_indicator, k_table = _get_cached_enable_tables(
+        config, sc_prec, device, rand_seqs_a_t, rand_seqs_b_t, stoc_len)
+    V_actual = cum_indicator.shape[2]
+
+    # Per-row scales handled on host below — feed ones for kernel's head_scale.
+    head_scale_ones = torch.ones(BH, dtype=torch.float32, device=device)
+    output = torch.empty(BH, M, N, dtype=torch.float32, device=device)
+
+    BLOCK_M, BLOCK_N, BLOCK_K, nw = _pick_enable_block_sizes(M, N, D)
+    grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N), BH)
+    # Kernel naming convention: its (N, M) = (rows of A, rows of B) = our (M, N).
+    enable_matmul_bipolar_batched_kernel[grid](
+        cum_indicator, k_table,
+        boundary_a_t, boundary_b_t,
+        sign_a_t, sign_b_t,
+        output, head_scale_ones,
+        M, N, D,
+        stoc_len, V_actual, q_max_sq,
+        BLOCK_M, BLOCK_N, BLOCK_K,
+        num_warps=nw,
+    )
+
+    # Per-row dequantization: result[bh, m, n] *= scale_a[bh, m] * scale_b[bh, n].
+    output.mul_(scale_a_row.unsqueeze(2) * scale_b_row.unsqueeze(1))
+    return output
 
 
 def _sc_matmul_bipolar_grouped_enable(

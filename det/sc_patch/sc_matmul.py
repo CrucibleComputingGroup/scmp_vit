@@ -33,7 +33,10 @@ if str(_VIT_SC / "sc") not in sys.path:
 if str(_VIT_SC) not in sys.path:
     sys.path.insert(0, str(_VIT_SC))
 
-from sc_triton import sc_matmul_grouped_enable_triton  # noqa: E402
+from sc_triton import (  # noqa: E402
+    sc_matmul_grouped_enable_triton,
+    sc_matmul_grouped_enable_triton_batched,
+)
 from config_helpers import make_sobol_simple_config    # noqa: E402
 from mp_config import (  # noqa: E402
     MPConfig, AdaptiveMPConfig,
@@ -117,18 +120,22 @@ class SCMatMul(nn.Module):
         assignment = _classify(metric, cfg, operator="qk")
 
         out_flat = torch.empty(BH, M, N, device=A_flat.device, dtype=torch.float32)
+        # B is fed to the kernel in row-major (N, K) form; doing the transpose
+        # once per bucket (over the head subset) is much cheaper than per-head.
         for sl, heads in assignment.level_row_indices.items():
             if int(sl) == 0 or heads.numel() == 0:
                 continue
             sp = sc_prec_for_stoc_len(int(sl))
             cfg_k = _get_config(K, sp)
-            for i in heads.tolist():
-                out_flat[i] = sc_matmul_grouped_enable_triton(
-                    A_flat[i], B_flat[i].transpose(0, 1).contiguous(),
-                    group_a=1, group_b=1,
-                    mode=self.mode, sc_prec=sp, config=cfg_k,
-                    stoc_len=int(sl),
-                )
+            A_sub = A_flat.index_select(0, heads).contiguous()         # (n_h, M, K)
+            B_sub = B_flat.index_select(0, heads).transpose(1, 2).contiguous()  # (n_h, N, K)
+            sub = sc_matmul_grouped_enable_triton_batched(
+                A_sub, B_sub,
+                group_a=1, group_b=1,
+                mode=self.mode, sc_prec=sp, config=cfg_k,
+                stoc_len=int(sl),
+            )
+            out_flat.index_copy_(0, heads, sub)
         return out_flat
 
     # ---- AV bucketing: per-attn-row inside each head ----
@@ -177,14 +184,14 @@ class SCMatMul(nn.Module):
         elif self._mp() is not None and self.op == "av":
             out_flat = self._forward_av_mp(A_flat, B_flat, M, K, N)
         else:
+            # One batched launch over BH — replaces the per-head Python loop.
+            # Transpose B once (BH, K, N) → (BH, N, K) instead of per-head.
             cfg = _get_config(K, self.sc_prec)
-            out_flat = torch.empty(A_flat.shape[0], M, N,
-                                   device=A.device, dtype=torch.float32)
-            for i in range(A_flat.shape[0]):
-                out_flat[i] = sc_matmul_grouped_enable_triton(
-                    A_flat[i], B_flat[i].transpose(0, 1).contiguous(),
-                    group_a=1, group_b=1,
-                    mode=self.mode, sc_prec=self.sc_prec, config=cfg,
-                    stoc_len=self.stoc_len,
-                )
+            B_rowmajor = B_flat.transpose(1, 2).contiguous()       # (BH, N, K)
+            out_flat = sc_matmul_grouped_enable_triton_batched(
+                A_flat, B_rowmajor,
+                group_a=1, group_b=1,
+                mode=self.mode, sc_prec=self.sc_prec, config=cfg,
+                stoc_len=self.stoc_len,
+            )
         return out_flat.reshape(*lead, M, N).to(A.dtype)

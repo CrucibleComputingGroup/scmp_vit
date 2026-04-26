@@ -249,10 +249,11 @@ def main():
         print(f"    swapped: {stats}")
 
     from detectron2.evaluation import inference_on_dataset
+    from sc_triton import det_kernel_tuning
 
     print(f"[4] Running inference on {args.n_eval} images")
     t0 = time.time()
-    with torch.no_grad():
+    with torch.no_grad(), det_kernel_tuning():
         results = inference_on_dataset(model, test_loader, evaluator)
     dt = time.time() - t0
     print(f"    done in {dt:.1f}s ({dt/args.n_eval:.2f}s/img)")
