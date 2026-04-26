@@ -200,7 +200,8 @@ def main():
         sl_map = sl_map_d.get("sl_map", sl_map_d) if isinstance(sl_map_d, dict) else sl_map_d
         from experiments.mp_budget_swap_search import _patch_block_with_spec
         from sc_integration import mp_search as ms
-        print(f"[2] Schedule (tier: sl_map_json={args.sl_map_json})")
+        tier = f"sl_map_json={args.sl_map_json}"
+        print(f"[2] Schedule (tier: {tier})")
         sched = {op: [int(bool(ms.entry_to_mpconfig(sl_map[op][bi])))
                       for bi in range(n_blocks)] for op in SC_OP_NAMES}
         stats_requested = count_sc_ops(sched)
