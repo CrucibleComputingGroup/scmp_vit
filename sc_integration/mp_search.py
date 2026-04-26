@@ -484,18 +484,43 @@ def build_initial_sl_map(
     sl_map = empty_sl_map(op_names, n_blocks)
     fixed_total = 0.0
     total_macs = 0.0
-    search_macs = {
+    # Per-unit effective MAC. Original constraint: must be identical across
+    # search_units so the DP's `sum_of_stoc_lens` directly tracks
+    # `sum_of_bitops`. Relaxed for regimes where the searchable ops have
+    # similar-but-not-identical MAC. Concrete case: det at 1280² puts
+    # mlp_fc1/2 (55.4G), qkv_proj (38.0G) inside a 1.46× spread — adding
+    # qkv_proj to SEARCH_OPS expands the search dimension by 50% with
+    # only mild bitop-budget drift. With mean-MAC approximation, the DP
+    # operates in stoc_len-sum space; actual MAC budget drifts by at
+    # most ``max/min - 1`` from the mean. Hard cap the relaxation: if
+    # the spread exceeds ``mac_spread_tol`` the original strict failure
+    # is preserved (cls regime + det's qk/av windowed-vs-global stay
+    # safely rejected).
+    search_mac_list = [
         float(op_macs_fn(*unit_parent(unit))) /
         (n_bins if len(unit) >= 3 else 1.0)
         for unit in search_units
-    }
-    if len(search_macs) != 1 and search_units:
-        raise ValueError(
-            "MP-budget swap search currently requires search units to share "
-            "the same per-unit MAC; got distinct values "
-            f"{sorted(search_macs)}. Restrict --search_ops to ops whose MACs "
-            "match (e.g. cls's `proj,mlp_fc1,mlp_fc2`).")
-    search_mac = float(next(iter(search_macs))) if search_units else 0.0
+    ]
+    if search_units:
+        macs_min = min(search_mac_list)
+        macs_max = max(search_mac_list)
+        mac_spread_tol = 1.5  # allow up to 50% max/min ratio
+        if macs_max / max(macs_min, 1e-9) > mac_spread_tol:
+            raise ValueError(
+                "MP-budget swap search: search-unit per-unit MACs span "
+                f"[{macs_min:.3g}, {macs_max:.3g}], ratio "
+                f"{macs_max/max(macs_min,1e-9):.2f}× > tolerance "
+                f"{mac_spread_tol}×. Restrict --search_ops to ops whose "
+                "MACs are within 1.5× of each other "
+                "(e.g. cls's `proj,mlp_fc1,mlp_fc2`; det at 1280²: add qk,av).")
+        search_mac = sum(search_mac_list) / len(search_mac_list)
+        if macs_max / max(macs_min, 1e-9) > 1.05:
+            print(f"[mp_search] heterogeneous MACs in search units "
+                  f"(spread {macs_max/macs_min:.2f}×); using mean MAC "
+                  f"{search_mac:.3g} for budget DP. Actual bitop budget "
+                  "may drift up to spread% from target.")
+    else:
+        search_mac = 0.0
 
     for op, bi in active_ops:
         total_macs += float(op_macs_fn(op, bi))
