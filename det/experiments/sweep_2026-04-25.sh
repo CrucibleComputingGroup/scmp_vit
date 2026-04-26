@@ -35,7 +35,7 @@ conda activate qwt_d2
 module load gcc/13.2.0
 
 # --- Env-overridable knobs (prod defaults). ---
-N_CALIB="${N_CALIB:-1024}"
+N_CALIB="${N_CALIB:-64}"   # det production calib size; cls uses 1024
 N_EVAL="${N_EVAL:-5000}"
 COS_THR="${COS_THR:-0.5}"
 LAST_COS_THR="${LAST_COS_THR:-0.8}"
@@ -51,12 +51,21 @@ K_SCHEDULE="${K_SCHEDULE:-30}"
 LINEAR_MP_OPS="mlp_fc1,mlp_fc2,qkv_proj,out_proj"
 AVG192_LEVEL="${AVG192_LEVEL:-192}"
 
-# MP-budget swap search knobs
-SEARCH_OPS="${SEARCH_OPS:-mlp_fc1,mlp_fc2}"
+# MP-budget swap search knobs.
+# - SEARCH_OPS adds qkv_proj alongside mlp_fc1/mlp_fc2 at det's 1280²
+#   scale (mlp_fc1=55.4G, mlp_fc2=55.4G, qkv_proj=38G — all within
+#   1.5× MAC, the relaxed-tolerance limit in mp_search.py). Adding qk/av
+#   needs more work: their per-block MAC swings 250× across window
+#   (0.23G) vs global (57.6G) attention blocks; equal-MAC DP can't
+#   absorb that without a per-block unit filter or two-stage search.
+#   out_proj (12.7G) is also outside the 1.5× tolerance vs mlp.
+# - SEARCH_N_SEARCH=64 / SEARCH_MAX_ITERS=12 match cls's N=50k production
+#   (the budget that made cls's `p7_mp` Δ jump from +1.14 → +3.37).
+SEARCH_OPS="${SEARCH_OPS:-mlp_fc1,mlp_fc2,qkv_proj}"
 SEARCH_LEVELS="${SEARCH_LEVELS:-64,96,128,192,256}"
 SEARCH_PROXY="${SEARCH_PROXY:-comp_residual}"
-SEARCH_N_SEARCH="${SEARCH_N_SEARCH:-8}"
-SEARCH_MAX_ITERS="${SEARCH_MAX_ITERS:-4}"
+SEARCH_N_SEARCH="${SEARCH_N_SEARCH:-64}"
+SEARCH_MAX_ITERS="${SEARCH_MAX_ITERS:-12}"
 SEARCH_SEED="${SEARCH_SEED:-1}"
 
 LOG_DIR="${LOG_DIR:-logs/sweep_2026-04-25}"
@@ -69,10 +78,12 @@ SCHED_INT7="sensitivity/skip/skip_worst_${K_SCHEDULE}_int7.json"
 # --- Per-tag accessors ---------------------------------------------------------
 # target main SL: p7=128 (sc_prec=7), avg192=192, p8=256 (sc_prec=8).
 target_main_sl_for_tag() { case "$1" in p7) echo 128 ;; avg192) echo 192 ;; p8) echo 256 ;; esac; }
-# fixed-op stoc_len for the search (pin qk/av/projs to the target SL).
+# fixed-op stoc_len for the search. qkv_proj joined SEARCH_OPS, but
+# qk/av (heterogeneous window vs global MACs) and out_proj (4× outside
+# 1.5× MAC tolerance) stay pinned at the target SL.
 fixed_for_tag()          {
   local t=$(target_main_sl_for_tag "$1")
-  echo "qk=${t},av=${t},qkv_proj=${t},out_proj=${t}"
+  echo "qk=${t},av=${t},out_proj=${t}"
 }
 sl_map_for_tag()         { case "$1" in p7) echo "$MAP_DIR/p7_mp_sl_map.json" ;; avg192) echo "$MAP_DIR/avg192_mp_sl_map.json" ;; esac; }
 
@@ -196,8 +207,11 @@ for entry in "${EVAL_RUNS[@]}"; do
   add_task "$name" "$(build_eval_cmd "$tag" "$mode" "$qwt" "$name")" "$outj" "$prereq"
 done
 
-# --- Unified 4-GPU pool scheduler -------------------------------------------
-MAX_PAR=4
+# --- Unified GPU pool scheduler ----------------------------------------------
+# Default: 4-way parallel (overnight production). Set MAX_PAR=1 for
+# serialized single-GPU runs (e.g. tuning, debugging, or honoring the
+# "one GPU at a time" preference on a shared host).
+MAX_PAR="${MAX_PAR:-4}"
 declare -A gpu_of_pid
 declare -A pid_on_gpu
 declare -A start_time_of_pid

@@ -45,6 +45,7 @@ from mp_spec import (add_mp_args, build_attn_mp_spec, build_linear_mp_spec,
 from sc_patch import sc_patch_eva, SC_OP_NAMES
 from sc_integration.sc_linear import SCLinear
 from sc_integration.head_aligned_comp import HeadAlignedSCLinear
+from sc_triton import det_kernel_tuning
 from qwt_sc import calibrate_qwt
 from qwt_sc.compensation import CompensationBlock
 
@@ -149,7 +150,12 @@ class BackboneCalibLoader:
 def run_coco_eval(model, test_loader, evaluator, out_dir):
     from detectron2.evaluation import inference_on_dataset
     set_evaluator_output_dir(evaluator, out_dir)
-    return inference_on_dataset(model, test_loader, evaluator)
+    # det_kernel_tuning() opts in to det-tuned tile sizes for SCMatMul +
+    # SCLinear (commit 256f8ad: 1.81× e2e on EVA-ViTDet, bit-exact). cls
+    # path is unaffected — the context manager flips a re-entrant module
+    # counter that only enable-signal kernels read.
+    with det_kernel_tuning():
+        return inference_on_dataset(model, test_loader, evaluator)
 
 
 def main():
@@ -233,6 +239,9 @@ def main():
     print(f"[env] torch {torch.__version__} cuda {torch.version.cuda} "
           f"dev={torch.cuda.get_device_name(0)}", flush=True)
 
+    prof: dict[str, float] = {}
+    t_total0 = time.time()
+
     # --- Build SC schedule ---
     if args.sc_ops_per_block_json:
         with open(args.sc_ops_per_block_json) as f:
@@ -247,18 +256,23 @@ def main():
     # --- Load FP + SC models, both with full eval loaders. ---
     _load_kw = dict(d2_datasets=args.d2_datasets, ckpt=args.ckpt)
     print("[model] loading FP reference", flush=True)
+    _t = time.time()
     model_fp, test_loader_fp, evaluator_fp, _ = load_model_and_loader(
         args.n_eval, **_load_kw)
     model_fp.eval()
+    prof["model_load_fp"] = time.time() - _t
 
     print("[model] loading SC model (fresh copy)", flush=True)
+    _t = time.time()
     model_sc, test_loader_sc, evaluator_sc, _ = load_model_and_loader(
         args.n_eval, **_load_kw)
     model_sc.eval()
+    prof["model_load_sc"] = time.time() - _t
 
     linear_mp_spec = build_linear_mp_spec(args) or None
     attn_mp_spec = build_attn_mp_spec(args) or None
 
+    _t = time.time()
     if args.sl_map_json:
         # Per-(op, block) sl_map mode — bypass sc_patch_eva for SC patching
         # and use the MP search's per-block patcher.
@@ -287,6 +301,7 @@ def main():
         stats = sc_patch_eva(model_sc, sc_prec=args.sc_prec, sc_ops_per_block=sched,
                             linear_mp_spec=linear_mp_spec,
                             attn_mp_spec=attn_mp_spec)
+    prof["patch"] = time.time() - _t
     print(f"[sc] patched: {stats}", flush=True)
 
     # --- SC baseline (optional) ---
@@ -298,9 +313,10 @@ def main():
         t0 = time.time()
         res_sc_raw = run_coco_eval(model_sc, test_loader_sc, evaluator_sc,
                                    out_dir_base / "sc_raw")
+        prof["raw_sc_eval"] = time.time() - t0
         print(f"  bbox AP={res_sc_raw['bbox']['AP']:.2f}  "
               f"segm AP={res_sc_raw['segm']['AP']:.2f}  "
-              f"({time.time()-t0:.0f}s)", flush=True)
+              f"({prof['raw_sc_eval']:.0f}s)", flush=True)
 
     # --- Two disjoint calib loaders for the cross-seed gate ---
     # COCO val is deterministic in D2; we draw two disjoint contiguous
@@ -364,7 +380,10 @@ def main():
     t_cal = time.time()
     blocks_fp = list(model_fp.backbone.net.blocks)
     blocks_sc = model_sc.backbone.net.blocks
-    report = calibrate_qwt(
+    # Calib also benefits from det-tuned kernel tiles — the per-block SC
+    # forwards go through the same SCMatMul / SCLinear paths as eval.
+    with det_kernel_tuning():
+      report = calibrate_qwt(
         model_fp=model_fp.backbone.net,
         model_sc=model_sc.backbone.net,
         blocks_fp=blocks_fp,
@@ -381,8 +400,12 @@ def main():
         last_block_cos_threshold=last_tau,
         lookahead_veto=args.lookahead_veto,
         comp_factory=comp_factory,
-    )
+      )
     calib_s = time.time() - t_cal
+    prof["calib_total"] = calib_s
+    prof["per_block_calib"] = sum(float(r.get("dt_s", 0.0)) for r in report)
+    # collect_x0 (A+B) is the calib-phase wall not attributed to per-block.
+    prof["collect_x0_total"] = max(0.0, calib_s - prof["per_block_calib"])
     print(f"[calib] done in {calib_s:.1f}s", flush=True)
 
     # Cross-check: log the SNG pool entries that the run actually populated.
@@ -415,9 +438,10 @@ def main():
     t0 = time.time()
     res_sc_comp = run_coco_eval(model_sc, test_loader_sc, evaluator_sc2,
                                 out_dir_base / "sc_comp")
+    prof["comp_eval"] = time.time() - t0
     print(f"  bbox AP={res_sc_comp['bbox']['AP']:.2f}  "
           f"segm AP={res_sc_comp['segm']['AP']:.2f}  "
-          f"({time.time()-t0:.0f}s)", flush=True)
+          f"({prof['comp_eval']:.0f}s)", flush=True)
 
     # --- Save report ---
     out = {
@@ -454,6 +478,17 @@ def main():
             "sc_comp": res_sc_comp,
         },
     }
+    prof["total"] = time.time() - t_total0
+    out["profile"] = prof
+
+    def _fmt(k):
+        v = prof.get(k)
+        return f"{k}={v:.1f}s" if v is not None else f"{k}=NA"
+    print("[profile] " + "  ".join(_fmt(k) for k in (
+        "model_load_fp", "model_load_sc", "patch", "raw_sc_eval",
+        "collect_x0_total", "per_block_calib", "calib_total",
+        "comp_eval", "total")), flush=True)
+
     Path(args.out_json).parent.mkdir(parents=True, exist_ok=True)
     with open(args.out_json, "w") as f:
         json.dump(out, f, indent=2, default=lambda o: None)
