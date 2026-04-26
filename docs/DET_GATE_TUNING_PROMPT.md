@@ -114,10 +114,17 @@ is too permissive at det's `n_calib=16`. Three plausible fixes
    0.90}` — find the smallest τ that doesn't admit collapse-prone
    blocks. cls's pilot suggested τ=0.5 was safely inside the bimodal
    noise/signal gap; det may sit at the boundary, requiring τ ≥ 0.7.
-2. **Raise n_calib.** `n_calib ∈ {16, 64, 128, 256}` — more samples
-   should restore the bimodal cos distribution. Diminishing returns
-   plus calib wall-time dominates per-cell budget, so cap at the
-   point bimodality is restored.
+2. **Raise n_calib up to ~128, not beyond.** Try `n_calib ∈ {32, 64,
+   128}`. The user's directive: **n_calib=1024 overfits on det;
+   128 is the upper bound.** This may seem counter to cls's
+   `n_calib=1024` recipe, but cls and det are different regimes:
+   det's calib images at 1280² are highly correlated within a
+   contiguous COCO val slice, so additional samples past ~128 add
+   little new signal but let the LS fit pick up dataset-shared noise
+   structure that doesn't generalize to the eval distribution. So
+   the right operating point on det is between the 16-image floor
+   (visible noise-fit / collapse) and the 128-image ceiling (where
+   diminishing returns turn into overfitting).
 3. **Activate `norm_floor`.** Block 0 / block N-1 typically have
    small ||W̄||; cls's `norm_floor=0` lets them through. Det may need
    `norm_floor > 0` to filter out near-zero-bias blocks where cosine
@@ -192,13 +199,15 @@ done
 Pass criterion: at least one τ produces **bbox AP comp ≥ raw**, ideally
 matching the r²>0.3 reference admission set ± 2 blocks.
 
-### Step 3: sweep n_calib at the τ that worked
+### Step 3: sweep n_calib at the τ that worked (cap 128)
 
-If Step 2 found a working τ, hold it fixed and sweep n_calib ∈ {64,
-128, 256}. Goal: confirm whether more calib restores the original
-τ=0.5 — meaning det just needs more calib, not a different gate.
+If Step 2 found a working τ, hold it fixed and sweep n_calib ∈ {32,
+64, 128}. Goal: confirm where on the [16, 128] interval the gate
+stops collapsing — do NOT extrapolate beyond 128. The user has
+verified that n_calib=1024 overfits on det; we treat 128 as the
+hard upper bound and look for the sweet spot below it.
 
-(3 cells × ~80 min for n_calib=128 ÷ 3 GPUs = 80 min wall — n_calib
+(3 cells × ~70 min for n_calib=128 ÷ 3 GPUs = 70 min wall — n_calib
 scales calib forward time roughly linearly.)
 
 ### Step 4: compare admission decisions
@@ -324,11 +333,13 @@ When done, you should have:
    (`Claude Opus 4.7 (1M context) <noreply@anthropic.com>`).
 
 If at any point the diagnostic shows the cross-seed gate is
-fundamentally inappropriate for det at n_calib < 256 (e.g. no τ
-matches r²>0.3's admissions on >2/3 blocks), say so and propose
-either (a) det-specific gate (e.g. AND of cross-seed and r²) as a
-local extension, or (b) increase n_calib floor to 256 in det
-defaults. Don't ship either without flagging.
+fundamentally inappropriate for det in the n_calib ≤ 128 regime
+(e.g. no τ in [0.3, 0.95] matches r²>0.3's admissions on >2/3
+blocks at any n_calib ≤ 128), say so and propose a det-specific
+gate (e.g. AND of cross-seed and r², or a det-tuned r² floor with
+the cross-seed cosine as a tiebreaker). Do NOT propose raising
+n_calib past 128 — the user has verified that's already the
+overfitting regime on det.
 
 ## Quick re-check before you write code
 
