@@ -180,7 +180,8 @@ def sc_patch_eva(model,
                  av_mode: str = "bipolar",
                  linear_mp_spec=None,
                  attn_mp_spec=None,
-                 stoc_len: int | None = None):
+                 stoc_len: int | None = None,
+                 mlp_chunk_d: int = 0):
     """Swap EVA-ViT primitives with SC versions in place.
 
     Parameters
@@ -270,13 +271,13 @@ def sc_patch_eva(model,
             if sched["mlp_fc1"][i] and isinstance(getattr(mlp, "fc1", None), nn.Linear):
                 mlp.fc1 = SCLinear(
                     mlp.fc1, sc_prec=sc_prec, mode=mlp_mode,
-                    stoc_len=stoc_len,
+                    stoc_len=stoc_len, chunk_d=mlp_chunk_d,
                     **_det_mp_kwargs(linear_mp, "mlp_fc1"))
                 stats["mlp_fc1"] += 1
             if sched["mlp_fc2"][i] and isinstance(getattr(mlp, "fc2", None), nn.Linear):
                 mlp.fc2 = SCLinear(
                     mlp.fc2, sc_prec=sc_prec, mode=mlp_mode,
-                    stoc_len=stoc_len,
+                    stoc_len=stoc_len, chunk_d=mlp_chunk_d,
                     **_det_mp_kwargs(linear_mp, "mlp_fc2"))
                 stats["mlp_fc2"] += 1
 

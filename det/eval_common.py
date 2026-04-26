@@ -27,9 +27,13 @@ CFG_PATH = f"{EVA_DET}/projects/ViTDet/configs/COCO/cascade_mask_rcnn_vitdet_eva
 
 def load_model_and_loader(n_eval: int, disable_act_checkpoint: bool = True,
                           d2_datasets: str = "", ckpt: str = "",
-                          start_idx: int = 0):
+                          start_idx: int = 0, size: int = 0):
     """Build FP model + weights + test loader for COCO val images
     ``[start_idx, start_idx + n_eval)``.
+
+    If ``size`` > 0, override ``backbone.square_pad`` and the test
+    ResizeShortestEdge to that size. ``size`` must be a multiple of 256
+    (patch_size 16 * window_size 16). Pos params are interpolated at runtime.
 
     Returns ``(model, test_loader, evaluator, subset)``. ``evaluator`` is a
     ``COCOEvaluator`` whose internal ``_coco_api`` has been filtered to the
@@ -48,6 +52,13 @@ def load_model_and_loader(n_eval: int, disable_act_checkpoint: bool = True,
     cfg = LazyConfig.load(CFG_PATH)
     if disable_act_checkpoint:
         cfg.model.backbone.net.use_act_checkpoint = False
+    if size:
+        assert size % 256 == 0, f"size {size} must be a multiple of 256"
+        cfg.model.backbone.square_pad = size
+        test_aug = cfg.dataloader.test.mapper.augmentations
+        assert len(test_aug) == 1
+        test_aug[0].short_edge_length = size
+        test_aug[0].max_size = size
 
     model = instantiate(cfg.model).eval().cuda()
     DetectionCheckpointer(model).load(_ckpt)
@@ -55,10 +66,11 @@ def load_model_and_loader(n_eval: int, disable_act_checkpoint: bool = True,
     orig_name = cfg.dataloader.test.dataset.names
     all_items = DatasetCatalog.get(orig_name)
     subset = all_items[start_idx:start_idx + n_eval]
+    size_tag = f"_sz{size}" if size else ""
     if start_idx == 0:
-        sub_name = f"{orig_name}_first{n_eval}"
+        sub_name = f"{orig_name}_first{n_eval}{size_tag}"
     else:
-        sub_name = f"{orig_name}_slice_{start_idx}_{n_eval}"
+        sub_name = f"{orig_name}_slice_{start_idx}_{n_eval}{size_tag}"
     if sub_name in DatasetCatalog.list():
         DatasetCatalog.remove(sub_name)
         MetadataCatalog.remove(sub_name)

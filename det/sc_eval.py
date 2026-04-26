@@ -168,6 +168,15 @@ def main():
                    default="bipolar")
 
     p.add_argument("--out-tag", type=str, default=None)
+    p.add_argument("--mlp_chunk_d", type=int, default=0,
+                   help="When > 0, route mlp_fc1 / mlp_fc2 SC matmul through "
+                        "the chunked MLP-specialized kernel "
+                        "(sc_matmul_enable_triton_mlp). Recommended: 64 — "
+                        "evenly divides D_in for both fc1 (1408) and "
+                        "fc2 (6144), and shrinks the cum_indicator table "
+                        "from O(D) to O(chunk_d) so it fits in L2.")
+    p.add_argument("--size", type=int, default=0,
+                   help="Override input square size (multiple of 256). 0=default(1280).")
     p.add_argument("--d2_datasets", type=str, default="",
                    help="DETECTRON2_DATASETS root (default: GreatLakes shared_data).")
     p.add_argument("--ckpt", type=str, default="",
@@ -180,13 +189,15 @@ def main():
     add_mp_args(p)
     args = p.parse_args()
 
-    tag = args.out_tag or f"sc_p{args.sc_prec}"
+    tag = args.out_tag or (f"sc_p{args.sc_prec}_sz{args.size}" if args.size
+                           else f"sc_p{args.sc_prec}")
     out_dir = Path(__file__).parent / "results" / tag
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    print("[1] Loading config + model + weights")
+    print(f"[1] Loading config + model + weights (size={args.size or 'default'})")
     model, test_loader, evaluator, subset = load_model_and_loader(
-        args.n_eval, d2_datasets=args.d2_datasets, ckpt=args.ckpt)
+        args.n_eval, d2_datasets=args.d2_datasets, ckpt=args.ckpt,
+        size=args.size)
     set_evaluator_output_dir(evaluator, out_dir)
 
     n_blocks = len(list(model.backbone.net.blocks))
@@ -245,6 +256,7 @@ def main():
             proj_mode=args.sc_proj_mode,
             linear_mp_spec=linear_mp_spec,
             attn_mp_spec=attn_mp_spec,
+            mlp_chunk_d=args.mlp_chunk_d,
         )
         print(f"    swapped: {stats}")
 
@@ -264,6 +276,7 @@ def main():
         "schedule_tier": tier,
         "sc_mlp_mode": args.sc_mlp_mode,
         "sc_proj_mode": args.sc_proj_mode,
+        "mlp_chunk_d": args.mlp_chunk_d,
         "n_blocks": n_blocks,
         "schedule": {k: list(v) for k, v in sched.items()},
         "swapped": stats,

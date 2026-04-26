@@ -22,6 +22,8 @@ def main():
                    help="Number of COCO val images (first-N).")
     p.add_argument("--out-tag", type=str, default="fp",
                    help="Subdir under results/ (e.g. fp100).")
+    p.add_argument("--size", type=int, default=0,
+                   help="Override input square size (multiple of 256). 0=default(1280).")
     p.add_argument("--d2_datasets", type=str, default="",
                    help="DETECTRON2_DATASETS root (default: GreatLakes shared_data).")
     p.add_argument("--ckpt", type=str, default="",
@@ -33,7 +35,8 @@ def main():
 
     print(f"[1] Loading config + model + weights")
     model, test_loader, evaluator, subset = load_model_and_loader(
-        args.n_eval, d2_datasets=args.d2_datasets, ckpt=args.ckpt)
+        args.n_eval, d2_datasets=args.d2_datasets, ckpt=args.ckpt,
+        size=args.size)
     n_params = sum(p.numel() for p in model.parameters()) / 1e6
     print(f"    params: {n_params:.1f}M   subset: {len(subset)} images")
 

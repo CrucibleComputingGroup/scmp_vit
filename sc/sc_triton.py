@@ -2783,13 +2783,21 @@ def _sc_matmul_bipolar_mlp_chunked(
         chunk_d, stoc_len, V,
     )
 
-    # Tiled matmul params — adaptive tile size for small N/M
-    if N <= 64 or M <= 64:
+    # Tiled matmul params — match generic enable_matmul_triton's tile picker
+    # under det_kernel_tuning(). The chunked path was hardcoding (32, 32) which
+    # halved the per-block output footprint vs generic's (32, 64) for SCLinear
+    # shapes (rows_b ≥ 256), explaining most of the chunked-vs-generic gap at
+    # sc_prec=8 fc2 (M=6400, N=1408, chunk_d>=64).
+    if _det_kernel_tuning_active():
+        BLOCK_M, BLOCK_N, _, nw = _pick_enable_block_sizes(N, M, chunk_d)
+    elif N <= 64 or M <= 64:
         BLOCK_M = 16
         BLOCK_N = 16
+        nw = 2
     else:
         BLOCK_M = 32
         BLOCK_N = 32
+        nw = 8
     if chunk_d >= 4 and chunk_d % 4 == 0:
         BLOCK_K = 4
     elif chunk_d % 2 == 0:
@@ -2797,7 +2805,7 @@ def _sc_matmul_bipolar_mlp_chunked(
     else:
         BLOCK_K = 1
     # Warp count tuning: more warps for larger tiles, fewer for smaller
-    nw = 8 if BLOCK_M == 32 else 2
+    # nw = 8 if BLOCK_M == 32 else 2
     grid_mm = (triton.cdiv(N, BLOCK_M), triton.cdiv(M, BLOCK_N))
 
     # Reusable buffer for partial matmul output

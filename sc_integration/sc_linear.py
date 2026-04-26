@@ -31,6 +31,7 @@ if str(_SC_DIR) not in sys.path:
 
 from sc_triton import (  # noqa: E402
     sc_matmul_grouped_enable_triton as sc_matmul_grouped_bipolar,
+    sc_matmul_enable_triton_mlp,
 )
 from config_helpers import make_sobol_simple_config  # noqa: E402
 
@@ -102,7 +103,7 @@ def _sym_range(t: torch.Tensor) -> tuple[float, float]:
 
 def _sc_linear(x: torch.Tensor, weight: torch.Tensor, bias, sc_prec: int,
                mode: str = "bipolar", cfg_override: dict = None,
-               stoc_len: int | None = None):
+               stoc_len: int | None = None, chunk_d: int = 0):
     """y = x @ weight^T + bias via SC.
 
     mode="bipolar": per-row symmetric quant (|max|), q_max = 2^(sc_prec-1)-1.
@@ -115,6 +116,15 @@ def _sc_linear(x: torch.Tensor, weight: torch.Tensor, bias, sc_prec: int,
     default — lets the comp use an alternative Sobol scrambling per block.
     ``stoc_len``: explicit bit-stream length (arbitrary int). When None,
     kernels fall back to ``2**sc_prec``.
+    ``chunk_d``: when > 0 and mode == "bipolar" (and no cfg_override), use the
+    MLP-specialized kernel ``sc_matmul_enable_triton_mlp`` with internal
+    D-chunking. For wide MLP layers (det's fc1 D=1408, fc2 D=6144) this:
+      * shrinks the cum_indicator table from O(D) → O(chunk_d) so it fits in
+        L2 (avoids the ~800 MB table for fc2 at sc_prec=8);
+      * fuses per-row quant kernels (~10× fewer launches than the generic
+        grouped path);
+      * is the same fast path Q-DiT's SCMlp uses.
+    Ignored when ``cfg_override`` is set (the comp pool is sized for full D).
     """
     orig_shape = x.shape
     D_in = orig_shape[-1]
@@ -124,6 +134,15 @@ def _sc_linear(x: torch.Tensor, weight: torch.Tensor, bias, sc_prec: int,
         y = noisy_sc_matmul_grouped(x2, w, group_a=1, group_b=1,
                                     mode=mode, sc_prec=sc_prec,
                                     stoc_len=stoc_len)
+    elif (chunk_d > 0 and mode == "bipolar"
+          and D_in > chunk_d and cfg_override is None):
+        cfg = _get_config(chunk_d, sc_prec)
+        y = sc_matmul_enable_triton_mlp(
+            x2, w,
+            mode=mode, sc_prec=sc_prec, config=cfg,
+            group_a=1, group_b=1, chunk_d=chunk_d,
+            stoc_len=stoc_len,
+        )
     else:
         cfg = cfg_override if cfg_override is not None else _get_config(D_in, sc_prec)
         y = sc_matmul_grouped_bipolar(x2, w, group_a=1, group_b=1,
@@ -136,17 +155,28 @@ def _sc_linear(x: torch.Tensor, weight: torch.Tensor, bias, sc_prec: int,
 
 
 def _mm_one_bucket(x_sub: torch.Tensor, w_sub: torch.Tensor,
-                   stoc_len: int, sc_prec: int, mode: str) -> torch.Tensor:
+                   stoc_len: int, sc_prec: int, mode: str,
+                   chunk_d: int = 0) -> torch.Tensor:
     """One SC matmul call at a chosen ``stoc_len``. Picks the noise-surrogate
     backend when ``USE_NOISE_MODEL`` is on, otherwise the Triton kernel.
-    Both accept ``stoc_len`` as a kwarg.
+    Both accept ``stoc_len`` as a kwarg. ``chunk_d`` enables the MLP fast
+    path (same semantics as ``_sc_linear``).
     """
     if USE_NOISE_MODEL:
         return noisy_sc_matmul_grouped(
             x_sub, w_sub, group_a=1, group_b=1,
             mode=mode, sc_prec=sc_prec, stoc_len=stoc_len,
         )
-    cfg = _get_config(x_sub.shape[-1], sc_prec)
+    D_in = x_sub.shape[-1]
+    if chunk_d > 0 and mode == "bipolar" and D_in > chunk_d:
+        cfg = _get_config(chunk_d, sc_prec)
+        return sc_matmul_enable_triton_mlp(
+            x_sub, w_sub,
+            mode=mode, sc_prec=sc_prec, config=cfg,
+            group_a=1, group_b=1, chunk_d=chunk_d,
+            stoc_len=stoc_len,
+        )
+    cfg = _get_config(D_in, sc_prec)
     return sc_matmul_grouped_bipolar(
         x_sub, w_sub, group_a=1, group_b=1,
         mode=mode, sc_prec=sc_prec, config=cfg, stoc_len=stoc_len,
@@ -158,7 +188,8 @@ def _sc_linear_mp(x: torch.Tensor, weight: torch.Tensor, bias,
                   range_entries: list[DispatchEntry] | None = None,
                   mp_cfg: MPConfig | None = None,
                   adaptive_mp_cfg: AdaptiveMPConfig | None = None,
-                  operator: str | None = None) -> torch.Tensor:
+                  operator: str | None = None,
+                  chunk_d: int = 0) -> torch.Tensor:
     """MP-aware SC linear: ``y = x @ weight^T + bias``.
 
     * ``mp_cfg``         → per-input-row stoc_len buckets (fixed quantile).
@@ -178,7 +209,8 @@ def _sc_linear_mp(x: torch.Tensor, weight: torch.Tensor, bias,
     D_out = w.shape[0]
 
     if range_entries is None and mp_cfg is None and adaptive_mp_cfg is None:
-        y = _mm_one_bucket(x_flat, w, 2 ** sc_prec, sc_prec, mode)
+        y = _mm_one_bucket(x_flat, w, 2 ** sc_prec, sc_prec, mode,
+                           chunk_d=chunk_d)
         if bias is not None:
             y = y + bias.float()
         return y.to(x.dtype).reshape(*orig_shape[:-1], D_out)
@@ -231,7 +263,8 @@ def _sc_linear_mp(x: torch.Tensor, weight: torch.Tensor, bias,
                 continue
             x_sub = x_flat.index_select(0, rows).contiguous()
             sp = sc_prec_for_stoc_len(int(sl))
-            sub = _mm_one_bucket(x_sub, w, int(sl), sp, mode)
+            sub = _mm_one_bucket(x_sub, w, int(sl), sp, mode,
+                                 chunk_d=chunk_d)
             result.index_copy_(0, rows, sub)
     else:
         # Range dispatch, optionally combined with dynamic MP.
@@ -249,7 +282,8 @@ def _sc_linear_mp(x: torch.Tensor, weight: torch.Tensor, bias,
                     continue
                 x_sub = x_flat.index_select(0, rows).contiguous()
                 sp = sc_prec_for_stoc_len(int(sl))
-                sub = _mm_one_bucket(x_sub, entry.weight, int(sl), sp, mode)
+                sub = _mm_one_bucket(x_sub, entry.weight, int(sl), sp, mode,
+                                     chunk_d=chunk_d)
                 result[rows.unsqueeze(1), entry.out_indices.unsqueeze(0)] = sub
 
     if bias is not None:
@@ -283,7 +317,8 @@ class SCLinear(nn.Module):
                  range_mp_cfg: RangeMPConfig | None = None,
                  range_mp_group_size: int = 0,
                  operator: str | None = None,
-                 stoc_len: int | None = None):
+                 stoc_len: int | None = None,
+                 chunk_d: int = 0):
         super().__init__()
         self.sc_prec = sc_prec
         self.stoc_len = stoc_len
@@ -298,6 +333,7 @@ class SCLinear(nn.Module):
         self.mp_cfg = mp_cfg
         self.adaptive_mp_cfg = adaptive_mp_cfg
         self.operator = operator
+        self.chunk_d = chunk_d
         if range_mp_cfg is not None:
             self.range_entries = build_range_dispatch(
                 self.weight.detach(), range_mp_cfg,
@@ -312,9 +348,10 @@ class SCLinear(nn.Module):
             # Uniform path — keep cfg_override support (residual compensator).
             return _sc_linear(x, self.weight, self.bias, self.sc_prec,
                               mode=self.mode, cfg_override=self.cfg_override,
-                              stoc_len=self.stoc_len)
+                              stoc_len=self.stoc_len, chunk_d=self.chunk_d)
         return _sc_linear_mp(
             x, self.weight, self.bias, self.sc_prec, self.mode,
             range_entries=self.range_entries, mp_cfg=self.mp_cfg,
             adaptive_mp_cfg=self.adaptive_mp_cfg, operator=self.operator,
+            chunk_d=self.chunk_d,
         )
