@@ -81,6 +81,9 @@ def main():
     p.add_argument("--size", type=int, default=0,
                    help="Override image size (square_pad + ResizeShortestEdge). "
                         "Must be multiple of 256. 0 ⇒ config default (1280).")
+    p.add_argument("--tmp_dir", type=str, default="",
+                   help="COCO evaluator scratch dir. Default sensitivity/_tmp. "
+                        "Use a unique value per process when sharding.")
     args = p.parse_args()
 
     if args.sc_prec is None:
@@ -102,7 +105,7 @@ def main():
     default_name = f"sensitivity_{tag}_n{args.n_eval}{size_tag}.json"
     out_path = _DET / (args.out_json or f"sensitivity/{default_name}")
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_dir = _DET / "sensitivity" / "_tmp"
+    tmp_dir = Path(args.tmp_dir) if args.tmp_dir else _DET / "sensitivity" / "_tmp"
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
     # --- Resume ---
