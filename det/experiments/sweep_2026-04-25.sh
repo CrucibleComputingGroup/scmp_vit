@@ -40,6 +40,8 @@ N_EVAL="${N_EVAL:-5000}"
 EVAL_START_IDX="${EVAL_START_IDX:-0}"   # COCO val start index for eval slice;
                                          # use to extend a prior run incrementally
 SIZE="${SIZE:-0}"          # input square size override (mult of 256); 0=default 1280
+INCLUDE_MP="${INCLUDE_MP:-1}"   # 0 to skip mp eval cells AND mp searches
+                                # (uniform-only sweep — useful on 1-GPU hosts)
 COS_THR="${COS_THR:-0.5}"
 LAST_COS_THR="${LAST_COS_THR:-0.8}"
 CALIB_SEED="${CALIB_SEED:-1}"
@@ -190,17 +192,28 @@ add_task() {
 # Searches first (their sl_maps are prereqs for mp evals).
 MAP_P7=$(sl_map_for_tag p7)
 MAP_AVG192=$(sl_map_for_tag avg192)
-[[ -f $MAP_P7 ]]     || add_task "search_p7"     "$(build_search_cmd p7 "$MAP_P7")"         "$MAP_P7" ""
-[[ -f $MAP_AVG192 ]] || add_task "search_avg192" "$(build_search_cmd avg192 "$MAP_AVG192")" "$MAP_AVG192" ""
+if [[ "$INCLUDE_MP" == "1" ]]; then
+  [[ -f $MAP_P7 ]]     || add_task "search_p7"     "$(build_search_cmd p7 "$MAP_P7")"         "$MAP_P7" ""
+  [[ -f $MAP_AVG192 ]] || add_task "search_avg192" "$(build_search_cmd avg192 "$MAP_AVG192")" "$MAP_AVG192" ""
+fi
 
 # Eval matrix. p8_mp omitted (same as cls — p8 has no mp variant).
-EVAL_RUNS=(
-  "p7     uniform off"  "p7     uniform on"
-  "p7     mp      off"  "p7     mp      on"
-  "p8     uniform off"  "p8     uniform on"
-  "avg192 uniform off"  "avg192 uniform on"
-  "avg192 mp      off"  "avg192 mp      on"
-)
+# When INCLUDE_MP=0, only the uniform variants run (6 cells, no MP search).
+if [[ "$INCLUDE_MP" == "1" ]]; then
+  EVAL_RUNS=(
+    "p7     uniform off"  "p7     uniform on"
+    "p7     mp      off"  "p7     mp      on"
+    "p8     uniform off"  "p8     uniform on"
+    "avg192 uniform off"  "avg192 uniform on"
+    "avg192 mp      off"  "avg192 mp      on"
+  )
+else
+  EVAL_RUNS=(
+    "p7     uniform off"  "p7     uniform on"
+    "p8     uniform off"  "p8     uniform on"
+    "avg192 uniform off"  "avg192 uniform on"
+  )
+fi
 for entry in "${EVAL_RUNS[@]}"; do
   read -r tag mode qwt <<< "$entry"
   name="${tag}_${mode}_qwt${qwt}"
@@ -219,6 +232,11 @@ done
 # serialized single-GPU runs (e.g. tuning, debugging, or honoring the
 # "one GPU at a time" preference on a shared host).
 MAX_PAR="${MAX_PAR:-4}"
+# GPU_LIST: space-separated logical GPU indices to schedule on. Default
+# uses all 4. Set GPU_LIST="2" (or "0 2", etc.) on a host where only some
+# physical GPUs are available — avoids the auto-block penalty for
+# CUDA-busy GPUs that the scheduler would otherwise try first.
+GPU_LIST="${GPU_LIST:-0 1 2 3}"
 declare -A gpu_of_pid
 declare -A pid_on_gpu
 declare -A start_time_of_pid
@@ -230,7 +248,7 @@ done_mask=()
 
 pick_free_gpu() {
   local g
-  for g in 0 1 2 3; do
+  for g in $GPU_LIST; do
     if [[ -z ${pid_on_gpu[$g]:-} && -z ${gpu_blocked[$g]:-} ]]; then
       echo "$g"; return 0
     fi
