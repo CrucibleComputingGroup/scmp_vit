@@ -21,3 +21,4 @@ results/
 det/results/
 det/sensitivity/_smoke/
 det/sensitivity/_tmp/
+det/sensitivity/_shards/_tmp_*/

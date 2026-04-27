@@ -1,0 +1,105 @@
+{
+  "config": {
+    "n_eval": 100,
+    "sc_prec": 7,
+    "stoc_len": 128,
+    "n_blocks": 40,
+    "op_names": [
+      "mlp_fc1",
+      "mlp_fc2",
+      "qkv_proj",
+      "out_proj",
+      "qk",
+      "av"
+    ],
+    "block_start": 4,
+    "block_end": 13
+  },
+  "fp_baseline": {
+    "bbox_ap": 68.7493,
+    "segm_ap": 61.5928
+  },
+  "grid": [
+    {
+      "op": "av",
+      "block": 4,
+      "bbox_ap": 68.7171,
+      "segm_ap": 61.5748,
+      "bbox_ap_drop": 0.0322,
+      "segm_ap_drop": 0.0179,
+      "eval_s": 121.3
+    },
+    {
+      "op": "av",
+      "block": 5,
+      "bbox_ap": 68.64,
+      "segm_ap": 61.5873,
+      "bbox_ap_drop": 0.1094,
+      "segm_ap_drop": 0.0054,
+      "eval_s": 125.4
+    },
+    {
+      "op": "av",
+      "block": 6,
+      "bbox_ap": 68.8077,
+      "segm_ap": 61.6256,
+      "bbox_ap_drop": -0.0583,
+      "segm_ap_drop": -0.0329,
+      "eval_s": 129.7
+    },
+    {
+      "op": "av",
+      "block": 7,
+      "bbox_ap": 68.5355,
+      "segm_ap": 61.6884,
+      "bbox_ap_drop": 0.2139,
+      "segm_ap_drop": -0.0957,
+      "eval_s": 157.4
+    },
+    {
+      "op": "av",
+      "block": 8,
+      "bbox_ap": 68.8332,
+      "segm_ap": 61.5961,
+      "bbox_ap_drop": -0.0839,
+      "segm_ap_drop": -0.0033,
+      "eval_s": 127.3
+    },
+    {
+      "op": "av",
+      "block": 9,
+      "bbox_ap": 68.6223,
+      "segm_ap": 61.6072,
+      "bbox_ap_drop": 0.1271,
+      "segm_ap_drop": -0.0144,
+      "eval_s": 124.4
+    },
+    {
+      "op": "av",
+      "block": 10,
+      "bbox_ap": 68.7288,
+      "segm_ap": 61.5974,
+      "bbox_ap_drop": 0.0205,
+      "segm_ap_drop": -0.0047,
+      "eval_s": 122.7
+    },
+    {
+      "op": "av",
+      "block": 11,
+      "bbox_ap": 68.4914,
+      "segm_ap": 61.5707,
+      "bbox_ap_drop": 0.2579,
+      "segm_ap_drop": 0.0221,
+      "eval_s": 151.7
+    },
+    {
+      "op": "av",
+      "block": 12,
+      "bbox_ap": 68.6879,
+      "segm_ap": 61.5609,
+      "bbox_ap_drop": 0.0615,
+      "segm_ap_drop": 0.0319,
+      "eval_s": 120.8
+    }
+  ]
+}
