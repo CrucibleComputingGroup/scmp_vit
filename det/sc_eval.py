@@ -191,12 +191,21 @@ def main():
                         "experiments/mp_budget_swap_search.py. When set, "
                         "overrides --sc_ops_per_block_json and --mp_* flags; "
                         "patches each block individually via the sl_map.")
+    p.add_argument("--out_dir", type=str, default="",
+                   help="Output directory (containing metrics.json, predictions, "
+                        "etc.). Default = det/results/<out-tag>. Use to redirect "
+                        "into a sweep RES_DIR — e.g. results/sweep_x/<out-tag>.")
     add_mp_args(p)
     args = p.parse_args()
 
     tag = args.out_tag or (f"sc_p{args.sc_prec}_sz{args.size}" if args.size
                            else f"sc_p{args.sc_prec}")
-    out_dir = Path(__file__).parent / "results" / tag
+    if args.out_dir:
+        out_dir = Path(args.out_dir)
+        if not out_dir.is_absolute():
+            out_dir = Path(__file__).parent / out_dir
+    else:
+        out_dir = Path(__file__).parent / "results" / tag
     out_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"[1] Loading config + model + weights (size={args.size or 'default'}, "

@@ -156,6 +156,7 @@ build_eval_cmd() {
       --start_idx "$EVAL_START_IDX"
       --size "$SIZE"
       --out-tag "$name"
+      --out_dir "$RES_DIR/$name"
       "${mode_args[@]}"
     )
     echo python sc_eval.py "${args[@]}"
