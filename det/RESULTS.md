@@ -78,15 +78,29 @@
 
 ## Sensitivity matrices 来源
 
-[`sensitivity/skip/skip_worst_{10,20,30}_int{6,7}.json`](sensitivity/skip/) —
-来自 [`sensitivity/sensitivity_int{6,7}_n100.json`](sensitivity/) 的 6×40
-COCO-AP-drop 矩阵，按 bbox_ap_drop 排序后取最差 K 个 (op, block) 留 FP。
+[`sensitivity/skip/skip_worst_{10,20,30}_{int6,int7,int8,len192,len96}.json`](sensitivity/skip/) —
+来自 6×40 COCO-AP-drop 矩阵（每 (op, block) 单独 SC, 其余 FP, n_eval=100），
+按 bbox_ap_drop 排序后取最差 K 个 (op, block) 留 FP。
 
-> **`int8` schedule 缺失**：当前没跑过 sc_prec=8 的 sensitivity sweep。
-> sc_prec=8 的 sweep 暂用 `skip_worst_K_int7.json`（保守替代：int7 最敏
-> 感的 cell 在 int8 下也是最敏感的 ordering，但绝对数值更小）。如果
-> int8 实测下出现 admitted < (N-2)/N 的反常，再做一次 `int8_n100`
-> sensitivity sweep。
+| tag | stoc_len | sc_prec | image size | 来源 JSON |
+|---|---:|---:|---:|---|
+| int6 | 64 | 6 | 1280 (default) | [`sensitivity_int6_n100.json`](sensitivity/sensitivity_int6_n100.json) |
+| int7 | 128 | 7 | 1280 (default) | [`sensitivity_int7_n100.json`](sensitivity/sensitivity_int7_n100.json) |
+| int8 | 256 | 8 | 1024 | [`sensitivity_int8_n100_sz1024.json`](sensitivity/sensitivity_int8_n100_sz1024.json) |
+| len192 | 192 | 8 | 1024 | [`sensitivity_len192_n100_sz1024.json`](sensitivity/sensitivity_len192_n100_sz1024.json) |
+| len96 | 96 | 7 | 1024 | [`sensitivity_len96_n100_sz1024.json`](sensitivity/sensitivity_len96_n100_sz1024.json) |
+
+> **size 不一致说明**：int6/int7 用 config 默认 1280；int8/len192/len96
+> 用 `--size 1024`（FP baseline 67.74 vs 1280 下 68.73，掉 ~1 AP）。
+> 1024 跑得比 1280 快 ~36% (1024² / 1280² = 0.64)。生产配方仍跑 1280。
+>
+> **rank-1 跨 length**：
+> - int8 (256) → mlp_fc1 blk=0 (Δ=+28.07)
+> - len192 → mlp_fc1 blk=0 (Δ=+56.93)
+> - len96 → mlp_fc2 blk=0 (Δ=+13.79)
+>
+> mlp_fc1/mlp_fc2 blk=0 是所有 length 下的两个最敏感 cell；attention ops
+> (qkv/out/qk/av) 几乎全部留 SC。详见各 JSON。
 
 ## 配方变化（vs 旧版 RESULTS）
 

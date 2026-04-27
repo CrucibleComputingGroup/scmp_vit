@@ -1873,6 +1873,312 @@
       "bbox_ap_drop": 0.09,
       "segm_ap_drop": -0.0192,
       "eval_s": 110.9
+    },
+    {
+      "op": "av",
+      "block": 6,
+      "bbox_ap": 68.6634,
+      "segm_ap": 61.583,
+      "bbox_ap_drop": 0.0859,
+      "segm_ap_drop": 0.0098,
+      "eval_s": 117.9
+    },
+    {
+      "op": "av",
+      "block": 7,
+      "bbox_ap": 68.5498,
+      "segm_ap": 61.4674,
+      "bbox_ap_drop": 0.1996,
+      "segm_ap_drop": 0.1253,
+      "eval_s": 152.9
+    },
+    {
+      "op": "av",
+      "block": 8,
+      "bbox_ap": 68.4254,
+      "segm_ap": 61.5041,
+      "bbox_ap_drop": 0.3239,
+      "segm_ap_drop": 0.0886,
+      "eval_s": 120.3
+    },
+    {
+      "op": "av",
+      "block": 9,
+      "bbox_ap": 68.5841,
+      "segm_ap": 61.5922,
+      "bbox_ap_drop": 0.1652,
+      "segm_ap_drop": 0.0005,
+      "eval_s": 120.2
+    },
+    {
+      "op": "av",
+      "block": 10,
+      "bbox_ap": 68.6576,
+      "segm_ap": 61.6281,
+      "bbox_ap_drop": 0.0917,
+      "segm_ap_drop": -0.0354,
+      "eval_s": 118.7
+    },
+    {
+      "op": "av",
+      "block": 11,
+      "bbox_ap": 68.4699,
+      "segm_ap": 61.4851,
+      "bbox_ap_drop": 0.2794,
+      "segm_ap_drop": 0.1077,
+      "eval_s": 149.8
+    },
+    {
+      "op": "av",
+      "block": 12,
+      "bbox_ap": 68.7169,
+      "segm_ap": 61.5581,
+      "bbox_ap_drop": 0.0325,
+      "segm_ap_drop": 0.0346,
+      "eval_s": 120.8
+    },
+    {
+      "op": "av",
+      "block": 13,
+      "bbox_ap": 68.4077,
+      "segm_ap": 61.62,
+      "bbox_ap_drop": 0.3416,
+      "segm_ap_drop": -0.0273,
+      "eval_s": 119.7
+    },
+    {
+      "op": "av",
+      "block": 14,
+      "bbox_ap": 68.9165,
+      "segm_ap": 61.6808,
+      "bbox_ap_drop": -0.1671,
+      "segm_ap_drop": -0.088,
+      "eval_s": 117.4
+    },
+    {
+      "op": "av",
+      "block": 15,
+      "bbox_ap": 68.4436,
+      "segm_ap": 61.4903,
+      "bbox_ap_drop": 0.3058,
+      "segm_ap_drop": 0.1024,
+      "eval_s": 149.4
+    },
+    {
+      "op": "av",
+      "block": 16,
+      "bbox_ap": 68.5507,
+      "segm_ap": 61.6398,
+      "bbox_ap_drop": 0.1987,
+      "segm_ap_drop": -0.0471,
+      "eval_s": 118.1
+    },
+    {
+      "op": "av",
+      "block": 17,
+      "bbox_ap": 68.6643,
+      "segm_ap": 61.5972,
+      "bbox_ap_drop": 0.0851,
+      "segm_ap_drop": -0.0044,
+      "eval_s": 118.8
+    },
+    {
+      "op": "av",
+      "block": 18,
+      "bbox_ap": 68.8691,
+      "segm_ap": 61.4965,
+      "bbox_ap_drop": -0.1197,
+      "segm_ap_drop": 0.0962,
+      "eval_s": 120.5
+    },
+    {
+      "op": "av",
+      "block": 19,
+      "bbox_ap": 68.7784,
+      "segm_ap": 61.5702,
+      "bbox_ap_drop": -0.0291,
+      "segm_ap_drop": 0.0226,
+      "eval_s": 149.6
+    },
+    {
+      "op": "av",
+      "block": 20,
+      "bbox_ap": 68.6418,
+      "segm_ap": 61.674,
+      "bbox_ap_drop": 0.1075,
+      "segm_ap_drop": -0.0812,
+      "eval_s": 122.2
+    },
+    {
+      "op": "av",
+      "block": 21,
+      "bbox_ap": 68.6466,
+      "segm_ap": 61.601,
+      "bbox_ap_drop": 0.1028,
+      "segm_ap_drop": -0.0082,
+      "eval_s": 121.6
+    },
+    {
+      "op": "av",
+      "block": 22,
+      "bbox_ap": 68.7996,
+      "segm_ap": 61.6051,
+      "bbox_ap_drop": -0.0503,
+      "segm_ap_drop": -0.0124,
+      "eval_s": 120.8
+    },
+    {
+      "op": "av",
+      "block": 23,
+      "bbox_ap": 68.7818,
+      "segm_ap": 61.6373,
+      "bbox_ap_drop": -0.0325,
+      "segm_ap_drop": -0.0445,
+      "eval_s": 150.7
+    },
+    {
+      "op": "av",
+      "block": 24,
+      "bbox_ap": 68.7509,
+      "segm_ap": 61.6287,
+      "bbox_ap_drop": -0.0016,
+      "segm_ap_drop": -0.0359,
+      "eval_s": 122.4
+    },
+    {
+      "op": "av",
+      "block": 25,
+      "bbox_ap": 68.7024,
+      "segm_ap": 61.5777,
+      "bbox_ap_drop": 0.0469,
+      "segm_ap_drop": 0.0151,
+      "eval_s": 120.7
+    },
+    {
+      "op": "av",
+      "block": 26,
+      "bbox_ap": 68.8065,
+      "segm_ap": 61.6,
+      "bbox_ap_drop": -0.0572,
+      "segm_ap_drop": -0.0073,
+      "eval_s": 121.5
+    },
+    {
+      "op": "av",
+      "block": 27,
+      "bbox_ap": 68.8695,
+      "segm_ap": 61.5117,
+      "bbox_ap_drop": -0.1201,
+      "segm_ap_drop": 0.081,
+      "eval_s": 148.7
+    },
+    {
+      "op": "av",
+      "block": 28,
+      "bbox_ap": 68.7547,
+      "segm_ap": 61.6052,
+      "bbox_ap_drop": -0.0054,
+      "segm_ap_drop": -0.0125,
+      "eval_s": 120.5
+    },
+    {
+      "op": "av",
+      "block": 29,
+      "bbox_ap": 68.7949,
+      "segm_ap": 61.5985,
+      "bbox_ap_drop": -0.0455,
+      "segm_ap_drop": -0.0057,
+      "eval_s": 120.2
+    },
+    {
+      "op": "av",
+      "block": 30,
+      "bbox_ap": 68.733,
+      "segm_ap": 61.6334,
+      "bbox_ap_drop": 0.0163,
+      "segm_ap_drop": -0.0407,
+      "eval_s": 120.6
+    },
+    {
+      "op": "av",
+      "block": 31,
+      "bbox_ap": 68.7509,
+      "segm_ap": 61.5537,
+      "bbox_ap_drop": -0.0015,
+      "segm_ap_drop": 0.0391,
+      "eval_s": 151.8
+    },
+    {
+      "op": "av",
+      "block": 32,
+      "bbox_ap": 68.6049,
+      "segm_ap": 61.6432,
+      "bbox_ap_drop": 0.1444,
+      "segm_ap_drop": -0.0505,
+      "eval_s": 117.7
+    },
+    {
+      "op": "av",
+      "block": 33,
+      "bbox_ap": 68.5943,
+      "segm_ap": 61.6102,
+      "bbox_ap_drop": 0.155,
+      "segm_ap_drop": -0.0175,
+      "eval_s": 118.7
+    },
+    {
+      "op": "av",
+      "block": 34,
+      "bbox_ap": 68.6232,
+      "segm_ap": 61.6065,
+      "bbox_ap_drop": 0.1261,
+      "segm_ap_drop": -0.0138,
+      "eval_s": 120.3
+    },
+    {
+      "op": "av",
+      "block": 35,
+      "bbox_ap": 68.9284,
+      "segm_ap": 61.5809,
+      "bbox_ap_drop": -0.1791,
+      "segm_ap_drop": 0.0119,
+      "eval_s": 149.9
+    },
+    {
+      "op": "av",
+      "block": 36,
+      "bbox_ap": 68.7606,
+      "segm_ap": 61.6042,
+      "bbox_ap_drop": -0.0113,
+      "segm_ap_drop": -0.0115,
+      "eval_s": 120.7
+    },
+    {
+      "op": "av",
+      "block": 37,
+      "bbox_ap": 68.61,
+      "segm_ap": 61.6538,
+      "bbox_ap_drop": 0.1394,
+      "segm_ap_drop": -0.061,
+      "eval_s": 120.8
+    },
+    {
+      "op": "av",
+      "block": 38,
+      "bbox_ap": 68.7755,
+      "segm_ap": 61.5724,
+      "bbox_ap_drop": -0.0262,
+      "segm_ap_drop": 0.0204,
+      "eval_s": 120.2
+    },
+    {
+      "op": "av",
+      "block": 39,
+      "bbox_ap": 68.683,
+      "segm_ap": 61.604,
+      "bbox_ap_drop": 0.0664,
+      "segm_ap_drop": -0.0113,
+      "eval_s": 146.9
     }
   ]
 }

@@ -19,3 +19,5 @@ IDEA_REPORT.md
 # Experiment results (regenerable from code)
 results/
 det/results/
+det/sensitivity/_smoke/
+det/sensitivity/_tmp/

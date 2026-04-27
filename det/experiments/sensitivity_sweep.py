@@ -78,6 +78,9 @@ def main():
                    help="Skip (op, block) combos already in out_json.")
     p.add_argument("--d2_datasets", type=str, default="")
     p.add_argument("--ckpt", type=str, default="")
+    p.add_argument("--size", type=int, default=0,
+                   help="Override image size (square_pad + ResizeShortestEdge). "
+                        "Must be multiple of 256. 0 ⇒ config default (1280).")
     args = p.parse_args()
 
     if args.sc_prec is None:
@@ -95,7 +98,8 @@ def main():
             raise SystemExit(f"unknown op: {op} (valid: {SC_OP_NAMES})")
 
     tag = f"int{args.sc_prec}" if is_pow2 else f"len{args.stoc_len}"
-    default_name = f"sensitivity_{tag}_n{args.n_eval}.json"
+    size_tag = f"_sz{args.size}" if args.size else ""
+    default_name = f"sensitivity_{tag}_n{args.n_eval}{size_tag}.json"
     out_path = _DET / (args.out_json or f"sensitivity/{default_name}")
     out_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_dir = _DET / "sensitivity" / "_tmp"
@@ -113,7 +117,8 @@ def main():
     # --- FP baseline ---
     print(f"[1] loading model + loader (n_eval={args.n_eval})", flush=True)
     model, test_loader, evaluator, _ = load_model_and_loader(
-        args.n_eval, d2_datasets=args.d2_datasets, ckpt=args.ckpt)
+        args.n_eval, d2_datasets=args.d2_datasets, ckpt=args.ckpt,
+        size=args.size)
     n_blocks = len(list(model.backbone.net.blocks))
     blk_lo = args.block_start
     blk_hi = n_blocks if args.block_end < 0 else min(args.block_end, n_blocks)
@@ -146,7 +151,8 @@ def main():
             del model
             torch.cuda.empty_cache()
             model, test_loader, evaluator, _ = load_model_and_loader(
-                args.n_eval, d2_datasets=args.d2_datasets, ckpt=args.ckpt)
+                args.n_eval, d2_datasets=args.d2_datasets, ckpt=args.ckpt,
+                size=args.size)
 
             spec = {k: [0] * n_blocks for k in SC_OP_NAMES}
             spec[op][bi] = 1
