@@ -167,6 +167,17 @@ def main():
                    help="Optional per-(op, block) schedule JSON; overrides --sc_ops.")
     p.add_argument("--n_calib", type=int, default=64)
     p.add_argument("--n_eval", type=int, default=100)
+    p.add_argument("--eval_start_idx", type=int, default=0,
+                   help="COCO val start index for the eval slice. Default 0 "
+                        "evaluates [0, n_eval). Use to incrementally extend a "
+                        "prior n=N1 run by another N2 imgs: rerun with "
+                        "--eval_start_idx N1 --n_eval N2 (output dir must "
+                        "differ to avoid skipping). Calib slice is independent, "
+                        "driven by --calib_seed{,_b}.")
+    p.add_argument("--size", type=int, default=0,
+                   help="Override input square size (multiple of 256). "
+                        "0=default(1280). Smaller is faster (1024² ≈ 1.7× of "
+                        "1280² wall) but lower AP.")
     p.add_argument("--ridge", type=float, default=1e-2)
     p.add_argument("--start_block", type=int, default=0,
                    help="Indices below this are never admitted (pass-through).")
@@ -254,18 +265,18 @@ def main():
           f"n_calib={args.n_calib}  n_eval={args.n_eval}", flush=True)
 
     # --- Load FP + SC models, both with full eval loaders. ---
-    _load_kw = dict(d2_datasets=args.d2_datasets, ckpt=args.ckpt)
+    _load_kw = dict(d2_datasets=args.d2_datasets, ckpt=args.ckpt, size=args.size)
     print("[model] loading FP reference", flush=True)
     _t = time.time()
     model_fp, test_loader_fp, evaluator_fp, _ = load_model_and_loader(
-        args.n_eval, **_load_kw)
+        args.n_eval, start_idx=args.eval_start_idx, **_load_kw)
     model_fp.eval()
     prof["model_load_fp"] = time.time() - _t
 
     print("[model] loading SC model (fresh copy)", flush=True)
     _t = time.time()
     model_sc, test_loader_sc, evaluator_sc, _ = load_model_and_loader(
-        args.n_eval, **_load_kw)
+        args.n_eval, start_idx=args.eval_start_idx, **_load_kw)
     model_sc.eval()
     prof["model_load_sc"] = time.time() - _t
 
@@ -434,7 +445,8 @@ def main():
 
     # --- Evaluate compensated model ---
     print("[eval] SC + QwT compensation", flush=True)
-    _, _, evaluator_sc2, _ = load_model_and_loader(args.n_eval, **_load_kw)
+    _, _, evaluator_sc2, _ = load_model_and_loader(
+        args.n_eval, start_idx=args.eval_start_idx, **_load_kw)
     t0 = time.time()
     res_sc_comp = run_coco_eval(model_sc, test_loader_sc, evaluator_sc2,
                                 out_dir_base / "sc_comp")

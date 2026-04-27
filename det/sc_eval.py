@@ -177,6 +177,11 @@ def main():
                         "from O(D) to O(chunk_d) so it fits in L2.")
     p.add_argument("--size", type=int, default=0,
                    help="Override input square size (multiple of 256). 0=default(1280).")
+    p.add_argument("--start_idx", type=int, default=0,
+                   help="COCO val start index. Default 0 evaluates [0, n_eval). "
+                        "Use to incrementally extend a prior n=N1 run by another "
+                        "N2 imgs: rerun with --start_idx N1 --n_eval N2 (and a "
+                        "different --out_tag to avoid skipping).")
     p.add_argument("--d2_datasets", type=str, default="",
                    help="DETECTRON2_DATASETS root (default: GreatLakes shared_data).")
     p.add_argument("--ckpt", type=str, default="",
@@ -194,10 +199,11 @@ def main():
     out_dir = Path(__file__).parent / "results" / tag
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"[1] Loading config + model + weights (size={args.size or 'default'})")
+    print(f"[1] Loading config + model + weights (size={args.size or 'default'}, "
+          f"start_idx={args.start_idx})")
     model, test_loader, evaluator, subset = load_model_and_loader(
         args.n_eval, d2_datasets=args.d2_datasets, ckpt=args.ckpt,
-        size=args.size)
+        size=args.size, start_idx=args.start_idx)
     set_evaluator_output_dir(evaluator, out_dir)
 
     n_blocks = len(list(model.backbone.net.blocks))

@@ -37,6 +37,9 @@ module load gcc/13.2.0
 # --- Env-overridable knobs (prod defaults). ---
 N_CALIB="${N_CALIB:-64}"   # det production calib size; cls uses 1024
 N_EVAL="${N_EVAL:-5000}"
+EVAL_START_IDX="${EVAL_START_IDX:-0}"   # COCO val start index for eval slice;
+                                         # use to extend a prior run incrementally
+SIZE="${SIZE:-0}"          # input square size override (mult of 256); 0=default 1280
 COS_THR="${COS_THR:-0.5}"
 LAST_COS_THR="${LAST_COS_THR:-0.8}"
 CALIB_SEED="${CALIB_SEED:-1}"
@@ -148,6 +151,8 @@ build_eval_cmd() {
       --sc_prec "$sc_prec"
       --sc_ops_per_block_json "$sched"
       --n-eval "$N_EVAL"
+      --start_idx "$EVAL_START_IDX"
+      --size "$SIZE"
       --out-tag "$name"
       "${mode_args[@]}"
     )
@@ -158,6 +163,8 @@ build_eval_cmd() {
       --sc_prec "$sc_prec"
       --sc_ops_per_block_json "$sched"
       --n_calib "$N_CALIB" --n_eval "$N_EVAL"
+      --eval_start_idx "$EVAL_START_IDX"
+      --size "$SIZE"
       --calib_seed "$CALIB_SEED" --calib_seed_b "$CALIB_SEED_B"
       --cos_threshold "$COS_THR" --last_block_cos_threshold "$LAST_COS_THR"
       --lookahead_veto
