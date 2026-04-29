@@ -27,13 +27,20 @@ CFG_PATH = f"{EVA_DET}/projects/ViTDet/configs/COCO/cascade_mask_rcnn_vitdet_eva
 
 def load_model_and_loader(n_eval: int, disable_act_checkpoint: bool = True,
                           d2_datasets: str = "", ckpt: str = "",
-                          start_idx: int = 0, size: int = 0):
+                          start_idx: int = 0, size: int = 0,
+                          use_soft_nms: bool = True):
     """Build FP model + weights + test loader for COCO val images
     ``[start_idx, start_idx + n_eval)``.
 
     If ``size`` > 0, override ``backbone.square_pad`` and the test
     ResizeShortestEdge to that size. ``size`` must be a multiple of 256
-    (patch_size 16 * window_size 16). Pos params are interpolated at runtime.
+    (patch_size 16 * window_size 16). When ``size != 1280`` we also flip
+    ``backbone.net.interp_type`` to ``"beit"`` so the trained pos embed
+    gets bicubic-interpolated to the new resolution (mirrors the
+    cascade_mask_rcnn_vitdet_eva_1536.py recipe; img_size stays at 1280).
+
+    If ``use_soft_nms`` is True (default), enables linear soft-NMS in the
+    cascade roi heads (~+0.2-0.5 AP on COCO val, requires mmcv).
 
     Returns ``(model, test_loader, evaluator, subset)``. ``evaluator`` is a
     ``COCOEvaluator`` whose internal ``_coco_api`` has been filtered to the
@@ -59,6 +66,16 @@ def load_model_and_loader(n_eval: int, disable_act_checkpoint: bool = True,
         assert len(test_aug) == 1
         test_aug[0].short_edge_length = size
         test_aug[0].max_size = size
+        if size != 1280:
+            # Trained pos embed is 80x80 (=1280/16); BEIT interp resizes it
+            # to (size/16)^2 per forward. Set BEIT_INTERP=0 to fall back to
+            # the default "vitdet" interpolation (linear) — useful for
+            # isolating whether BEIT interp is the cause of SC accuracy
+            # collapse at non-1280 sizes.
+            if os.environ.get("BEIT_INTERP", "1") not in ("0", "false", "False", ""):
+                cfg.model.backbone.net.interp_type = "beit"
+    if use_soft_nms:
+        cfg.model.roi_heads.use_soft_nms = True
 
     model = instantiate(cfg.model).eval().cuda()
     DetectionCheckpointer(model).load(_ckpt)

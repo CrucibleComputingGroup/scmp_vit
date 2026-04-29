@@ -94,23 +94,57 @@ def _atomic_save(state: dict, path: Path):
 def _config_signature(args, skip_sha: str) -> dict:
     return {
         "sc_prec": args.sc_prec,
+        "stoc_len": args.stoc_len,
         "skip_json": str(args.skip) if args.skip else "",
         "skip_json_sha256": skip_sha,
         "n_eval": args.n_eval,
         "start_idx": args.start_idx,
         "sc_mlp_mode": args.sc_mlp_mode,
         "sc_proj_mode": args.sc_proj_mode,
+        "size": args.size,
+        "use_soft_nms": args.use_soft_nms,
     }
 
 
+def _default_skip_for(stoc_len: int, default_skip_pct: int) -> Path | None:
+    """Auto-locate a skip schedule for the given stoc_len.
+
+    Looks for ``det/sensitivity/skip/skip_worst_<pct>_int<sc_prec>.json`` if
+    ``stoc_len`` is a power of 2 (so a clean ``int<N>`` tag exists), or
+    ``..._len<stoc_len>.json`` otherwise. Returns None if no file exists.
+    """
+    import math
+    sc_prec_pow2 = (stoc_len & (stoc_len - 1)) == 0  # power of 2?
+    if sc_prec_pow2:
+        sc_prec = int(math.log2(stoc_len))
+        tag = f"int{sc_prec}"
+    else:
+        tag = f"len{stoc_len}"
+    candidate = (Path(__file__).resolve().parent / "sensitivity" / "skip"
+                 / f"skip_worst_{default_skip_pct}_{tag}.json")
+    return candidate if candidate.exists() else None
+
+
 def main():
+    import math
     p = argparse.ArgumentParser()
-    p.add_argument("--sc_prec", type=int, required=True,
-                   help="SC precision (stoc_len = 2**sc_prec).")
-    p.add_argument("--skip", type=str, default="",
+    grp = p.add_mutually_exclusive_group(required=True)
+    grp.add_argument("--sc_prec", type=int, default=None,
+                     help="SC precision in bits; stoc_len = 2**sc_prec. "
+                          "Use 6/7/8 for int6/int7/int8.")
+    grp.add_argument("--length", type=int, default=None,
+                     help="Stochastic stream length directly; need not be a "
+                          "power of 2 (e.g. 96, 192). Mutually exclusive "
+                          "with --sc_prec.")
+    p.add_argument("--skip", type=str, default="auto",
                    help="Path to per-(op, block) JSON schedule {op: [0/1]*n_blocks}. "
                         "1 = SC, 0 = FP. Same format as sensitivity/skip/*.json. "
-                        "Omit to SC every (op, block).")
+                        "Default 'auto' resolves to "
+                        "det/sensitivity/skip/skip_worst_<--skip_pct>_<tag>.json. "
+                        "Pass 'none' to SC every (op, block).")
+    p.add_argument("--skip_pct", type=int, default=20,
+                   help="Used only when --skip=auto: which skip-worst-N file to "
+                        "pick up (matches sensitivity/skip/skip_worst_<N>_*.json).")
     p.add_argument("--n_eval", type=int, default=-1,
                    help="# COCO val images to evaluate. -1 = full set (~5000). "
                         "Ignored when --num_shards is set.")
@@ -142,7 +176,38 @@ def main():
                    default="bipolar")
     p.add_argument("--sc_proj_mode", choices=["bipolar", "unipolar"],
                    default="bipolar")
+    p.add_argument("--size", type=int, default=1024,
+                   help="square_pad + ResizeShortestEdge (multiple of 256). "
+                        "Default 1024. Pass 1280 to skip the size override "
+                        "and use the cfg default.")
+    p.add_argument("--no_soft_nms", action="store_true",
+                   help="Disable soft-NMS (default ON, requires mmcv).")
     args = p.parse_args()
+
+    # Resolve --sc_prec / --length into both args.sc_prec + args.stoc_len so
+    # downstream code (and the config signature) can rely on having both.
+    if args.length is not None:
+        args.stoc_len = int(args.length)
+        args.sc_prec = max(1, int(math.ceil(math.log2(max(args.stoc_len, 2)))))
+    else:
+        args.stoc_len = 1 << args.sc_prec
+    args.use_soft_nms = not args.no_soft_nms
+
+    # Resolve --skip:
+    #   "auto" -> det/sensitivity/skip/skip_worst_<pct>_<tag>.json (if exists)
+    #   "none" -> SC every (op, block)
+    #   else   -> literal path
+    if args.skip == "auto":
+        auto = _default_skip_for(args.stoc_len, args.skip_pct)
+        if auto is not None:
+            print(f"[skip=auto] using {auto}")
+            args.skip = str(auto)
+        else:
+            print(f"[skip=auto] no skip_worst_{args.skip_pct}_* file found "
+                  f"for stoc_len={args.stoc_len}; falling back to all-ops SC")
+            args.skip = ""
+    elif args.skip == "none":
+        args.skip = ""
 
     out_dir = Path(args.out_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -190,7 +255,9 @@ def main():
 
     model, _full_loader, evaluator, full_subset = load_model_and_loader(
         args.n_eval, d2_datasets=args.d2_datasets, ckpt=args.ckpt,
-        start_idx=args.start_idx)
+        start_idx=args.start_idx, size=args.size,
+        use_soft_nms=args.use_soft_nms)
+    print(f"    size={args.size}  use_soft_nms={args.use_soft_nms}")
     set_evaluator_output_dir(evaluator, out_dir)
     # COCOEvaluator initializes self._predictions only inside reset(); call it
     # here so .process() / our resume code can rely on the attribute existing.
@@ -240,6 +307,7 @@ def main():
     stats_swapped = sc_patch_eva(
         model,
         sc_prec=args.sc_prec,
+        stoc_len=args.stoc_len,
         sc_ops_per_block=sched,
         mlp_mode=args.sc_mlp_mode,
         proj_mode=args.sc_proj_mode,
