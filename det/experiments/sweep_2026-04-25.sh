@@ -44,6 +44,7 @@ INCLUDE_MP="${INCLUDE_MP:-1}"   # 0 to skip mp eval cells AND mp searches
                                 # (uniform-only sweep — useful on 1-GPU hosts)
 COS_THR="${COS_THR:-0.5}"
 LAST_COS_THR="${LAST_COS_THR:-0.8}"
+R2_FLOOR="${R2_FLOOR:-}"      # det secondary admit gate (e.g. 0.30); empty = disabled (cls recipe)
 CALIB_SEED="${CALIB_SEED:-1}"
 CALIB_SEED_B="${CALIB_SEED_B:-2}"
 COMP_SC_PREC="${COMP_SC_PREC:-8}"
@@ -162,6 +163,8 @@ build_eval_cmd() {
     echo python sc_eval.py "${args[@]}"
   else
     # SC + cross-seed QwT comp via qwt_det_compensate.py
+    local r2_args=()
+    [[ -n "$R2_FLOOR" ]] && r2_args=(--r2_floor "$R2_FLOOR")
     local args=(
       --sc_prec "$sc_prec"
       --sc_ops_per_block_json "$sched"
@@ -170,6 +173,7 @@ build_eval_cmd() {
       --size "$SIZE"
       --calib_seed "$CALIB_SEED" --calib_seed_b "$CALIB_SEED_B"
       --cos_threshold "$COS_THR" --last_block_cos_threshold "$LAST_COS_THR"
+      "${r2_args[@]}"
       --lookahead_veto
       --ridge "$RIDGE" --fwd_chunk "$FWD_CHUNK"
       --comp_mode sc --comp_sc_prec "$COMP_SC_PREC"

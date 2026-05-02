@@ -199,6 +199,11 @@ def main():
                    help="Stricter τ for the last block (block N-1 feeds "
                         "the head directly; demand tighter agreement). "
                         "Default 0.8. Set ≤ --cos_threshold to disable.")
+    p.add_argument("--r2_floor", type=float, default=None,
+                   help="Per-fit r² floor for cross-seed admission. When set, "
+                        "requires min(r2_A, r2_B) >= r2_floor. Default unset "
+                        "(disabled, cls recipe). Det recipe sets >0 (e.g. "
+                        "0.30) to reject noise-fit blocks at small n_calib.")
     p.add_argument("--norm_floor", type=float, default=0.0,
                    help="Additionally require min(||W_A||,||W_B||) > this.")
     p.add_argument("--lookahead_veto", action="store_true",
@@ -384,7 +389,8 @@ def main():
     last_tau = (args.last_block_cos_threshold
                 if args.last_block_cos_threshold > args.cos_threshold else None)
     print(f"[calib] τ={args.cos_threshold}  last_τ={last_tau}  "
-          f"norm_floor={args.norm_floor}  lookahead_veto={args.lookahead_veto}",
+          f"r2_floor={args.r2_floor}  norm_floor={args.norm_floor}  "
+          f"lookahead_veto={args.lookahead_veto}",
           flush=True)
     print(f"[calib] starting QwT cross-seed calibration "
           f"(n_calib={args.n_calib} per side)", flush=True)
@@ -410,6 +416,7 @@ def main():
         norm_floor=args.norm_floor,
         last_block_cos_threshold=last_tau,
         lookahead_veto=args.lookahead_veto,
+        r2_floor=args.r2_floor,
         comp_factory=comp_factory,
       )
     calib_s = time.time() - t_cal
@@ -467,6 +474,7 @@ def main():
             "ridge": args.ridge, "start_block": args.start_block,
             "cos_threshold": args.cos_threshold,
             "last_block_cos_threshold": args.last_block_cos_threshold,
+            "r2_floor": args.r2_floor,
             "norm_floor": args.norm_floor,
             "lookahead_veto": bool(args.lookahead_veto),
             "comp_mode": args.comp_mode,
