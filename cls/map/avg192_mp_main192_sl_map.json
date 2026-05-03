@@ -1,0 +1,445 @@
+{
+  "sc_config": "skip_worst30",
+  "target_main_sl": 192,
+  "proxy": "comp_residual",
+  "levels": [
+    64,
+    96,
+    128,
+    192,
+    256
+  ],
+  "search_ops": [
+    "mlp_fc1",
+    "mlp_fc2",
+    "proj"
+  ],
+  "fraction_ops": [],
+  "fraction_units": 1,
+  "fixed_ops": {
+    "qk": 192,
+    "av": 192
+  },
+  "op_min_levels": {
+    "mlp_fc2": 192
+  },
+  "op_max_levels": {},
+  "n_search": 32,
+  "search_seed": 1,
+  "pair_eval_topk": 0,
+  "lookahead_blocks": 0,
+  "init_sl_map_json": "",
+  "init_meta": {
+    "init_mode": "uniform_repair",
+    "init_level": 192,
+    "init_from_map": false,
+    "search_slots": 44,
+    "fixed_bitops": 597345042432.0,
+    "target_total_bitops": 9703749451776.0,
+    "target_search_sum_sl": 8448,
+    "clipped_target_search_sum_sl": 8448,
+    "chosen_search_sum_sl": 8448,
+    "utility": 0.0,
+    "actual_main_sl": 192.0
+  },
+  "history": [
+    {
+      "iter": 0,
+      "delta_score": -0.02713446979453836,
+      "step": 64,
+      "pair_scope": [
+        0,
+        23
+      ],
+      "used_pair_refine": false,
+      "upgrade": {
+        "slot": [
+          "mlp_fc1",
+          23
+        ],
+        "old_sl": 192,
+        "new_sl": 256,
+        "delta_score": -0.027130421848498388
+      },
+      "downgrade": {
+        "slot": [
+          "proj",
+          0
+        ],
+        "old_sl": 192,
+        "new_sl": 128,
+        "delta_score": -4.047946039972028e-06
+      },
+      "main_sl_after": 192.0
+    },
+    {
+      "iter": 1,
+      "delta_score": -0.005900313328891364,
+      "step": 64,
+      "pair_scope": [
+        5,
+        21
+      ],
+      "used_pair_refine": false,
+      "upgrade": {
+        "slot": [
+          "mlp_fc1",
+          21
+        ],
+        "old_sl": 192,
+        "new_sl": 256,
+        "delta_score": -0.005903338777249669
+      },
+      "downgrade": {
+        "slot": [
+          "proj",
+          5
+        ],
+        "old_sl": 192,
+        "new_sl": 128,
+        "delta_score": 3.0254483583059425e-06
+      },
+      "main_sl_after": 192.0
+    },
+    {
+      "iter": 2,
+      "delta_score": -0.0034348697607263045,
+      "step": 64,
+      "pair_scope": [
+        5,
+        20
+      ],
+      "used_pair_refine": false,
+      "upgrade": {
+        "slot": [
+          "mlp_fc1",
+          20
+        ],
+        "old_sl": 192,
+        "new_sl": 256,
+        "delta_score": -0.0034393169116075472
+      },
+      "downgrade": {
+        "slot": [
+          "mlp_fc1",
+          5
+        ],
+        "old_sl": 192,
+        "new_sl": 128,
+        "delta_score": 4.447150881242728e-06
+      },
+      "main_sl_after": 192.0
+    },
+    {
+      "iter": 3,
+      "delta_score": -0.002464621278996344,
+      "step": 64,
+      "pair_scope": [
+        2,
+        18
+      ],
+      "used_pair_refine": false,
+      "upgrade": {
+        "slot": [
+          "proj",
+          18
+        ],
+        "old_sl": 192,
+        "new_sl": 256,
+        "delta_score": -0.002474078088762893
+      },
+      "downgrade": {
+        "slot": [
+          "proj",
+          2
+        ],
+        "old_sl": 192,
+        "new_sl": 128,
+        "delta_score": 9.456809766548873e-06
+      },
+      "main_sl_after": 192.0
+    }
+  ],
+  "last_iter": {
+    "iter": 3,
+    "actual_main_sl": 192.0,
+    "patch_stats": {
+      "attn": 24,
+      "qkv_proj": 17,
+      "out_proj": 17,
+      "mlp_fc1": 17,
+      "mlp_fc2": 10
+    },
+    "block_reports": [
+      {
+        "block": 0,
+        "weight": 3.810541521757841,
+        "current_score": 8.384948632596531e-05
+      },
+      {
+        "block": 1,
+        "weight": 4.290210455656052,
+        "current_score": 8.896484623159415e-05
+      },
+      {
+        "block": 2,
+        "weight": 4.6344838589429855,
+        "current_score": 0.00038270634899807346
+      },
+      {
+        "block": 3,
+        "weight": 4.027585193514824,
+        "current_score": 0.0001792713767823542
+      },
+      {
+        "block": 4,
+        "weight": 3.6055345833301544,
+        "current_score": 3.385872866393063e-05
+      },
+      {
+        "block": 5,
+        "weight": 2.121864929795265,
+        "current_score": 2.7858126720101917e-05
+      },
+      {
+        "block": 6,
+        "weight": 3.2076125741004944,
+        "current_score": 3.348837392803296e-05
+      },
+      {
+        "block": 7,
+        "weight": 4.043953627347946,
+        "current_score": 9.892798293425416e-05
+      },
+      {
+        "block": 8,
+        "weight": 4.46891325712204,
+        "current_score": 8.615193315980963e-05
+      },
+      {
+        "block": 9,
+        "weight": 4.796644896268845,
+        "current_score": 2.52757830262648e-05
+      },
+      {
+        "block": 10,
+        "weight": 6.251100242137909,
+        "current_score": 0.00010188057264929152
+      },
+      {
+        "block": 11,
+        "weight": 5.460457861423492,
+        "current_score": 6.101094186306e-05
+      },
+      {
+        "block": 12,
+        "weight": 4.6309657990932465,
+        "current_score": 3.595570834346319e-05
+      },
+      {
+        "block": 13,
+        "weight": 2.9114999771118164,
+        "current_score": 5.4671722627335485e-05
+      },
+      {
+        "block": 14,
+        "weight": 3.462649643421173,
+        "current_score": 7.579295899617533e-05
+      },
+      {
+        "block": 15,
+        "weight": 3.2006771564483643,
+        "current_score": 0.00017127935350637027
+      },
+      {
+        "block": 17,
+        "weight": 4.349478721618652,
+        "current_score": 0.0005648175566112948
+      },
+      {
+        "block": 18,
+        "weight": 3.7665499448776245,
+        "current_score": 0.002612383912973367
+      },
+      {
+        "block": 20,
+        "weight": 6.120686292648315,
+        "current_score": 0.0029112564450571973
+      },
+      {
+        "block": 21,
+        "weight": 5.544707298278809,
+        "current_score": 0.005101110220883143
+      },
+      {
+        "block": 23,
+        "weight": 2.81208598613739,
+        "current_score": 0.024705395160482087
+      }
+    ],
+    "pair_eval_topk": 0,
+    "lookahead_blocks": 0,
+    "used_pair_refine": false,
+    "elapsed_s": 100.54
+  },
+  "final_main_sl": 192.0,
+  "final_eff_sl": 199.26086916379685,
+  "allocation": {
+    "256": 8.5,
+    "192": 82.9,
+    "128": 8.5
+  },
+  "per_op_allocation": {
+    "av": {
+      "192": 1.0
+    },
+    "mlp_fc1": {
+      "256": 0.1765,
+      "192": 0.7647,
+      "128": 0.0588
+    },
+    "mlp_fc2": {
+      "192": 1.0
+    },
+    "proj": {
+      "256": 0.0588,
+      "192": 0.7647,
+      "128": 0.1765
+    },
+    "qk": {
+      "192": 1.0
+    }
+  },
+  "sl_map": {
+    "mlp_fc1": [
+      192,
+      192,
+      192,
+      192,
+      192,
+      128,
+      192,
+      192,
+      192,
+      192,
+      192,
+      192,
+      192,
+      0,
+      0,
+      0,
+      0,
+      192,
+      0,
+      0,
+      256,
+      256,
+      0,
+      256
+    ],
+    "mlp_fc2": [
+      0,
+      0,
+      192,
+      192,
+      192,
+      192,
+      192,
+      192,
+      192,
+      192,
+      192,
+      192,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "qk": [
+      192,
+      192,
+      192,
+      192,
+      192,
+      192,
+      192,
+      192,
+      192,
+      192,
+      192,
+      192,
+      192,
+      192,
+      192,
+      192,
+      192,
+      192,
+      192,
+      192,
+      192,
+      192,
+      192,
+      192
+    ],
+    "av": [
+      192,
+      192,
+      192,
+      192,
+      192,
+      192,
+      192,
+      192,
+      192,
+      192,
+      192,
+      192,
+      192,
+      192,
+      192,
+      192,
+      192,
+      192,
+      192,
+      192,
+      192,
+      192,
+      0,
+      0
+    ],
+    "proj": [
+      128,
+      192,
+      128,
+      192,
+      192,
+      128,
+      192,
+      192,
+      192,
+      192,
+      192,
+      192,
+      192,
+      192,
+      192,
+      192,
+      0,
+      0,
+      256,
+      0,
+      0,
+      0,
+      0,
+      0
+    ]
+  }
+}
