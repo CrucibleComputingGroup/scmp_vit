@@ -60,7 +60,7 @@ def _collapse_beit_like_qkv_bias(model) -> int:
 def load_model_and_loader(n_eval: int, disable_act_checkpoint: bool = True,
                           d2_datasets: str = "", ckpt: str = "",
                           start_idx: int = 0, size: int = 0,
-                          use_soft_nms: bool = False,
+                          use_soft_nms: bool = True,
                           interp_type: str = ""):
     """Build FP model + weights + test loader for COCO val images
     ``[start_idx, start_idx + n_eval)``.
