@@ -371,11 +371,25 @@ def main():
     ap.add_argument("--proxy", default="comp_residual",
                     choices=["raw_mse", "comp_residual"])
     ap.add_argument("--init_mode", default="sensitivity_dp",
-                    choices=["sensitivity_dp", "uniform_repair", "map_repair"],
+                    choices=["sensitivity_dp", "uniform_repair", "map_repair", "ilp"],
                     help="DP over sensitivity (default) maximizes "
                          "Σ sens·SL under the budget — most-sensitive slots "
                          "get high SL, least-sensitive get low SL. "
-                         "Combine with --no_search for pure-DP fast path.")
+                         "Combine with --no_search for pure-DP fast path. "
+                         "Use 'ilp' for arbitrary-MAC-spread search "
+                         "(scipy.optimize.milp; supports qkv_proj+out_proj+qk+av "
+                         "all together; pair with --mac_bucket_tol 0.10).")
+    ap.add_argument("--ilp_util_mode", default="sens_mac",
+                    choices=["sens_mac", "sens"],
+                    help="ILP utility: 'sens_mac' = max Σ sens·MAC·ℓ "
+                         "(pure-sens ranking, recommended for heterogeneous MAC); "
+                         "'sens' = max Σ sens·ℓ (cost-aware, sens/MAC ranking, "
+                         "matches the equal-MAC DP semantics).")
+    ap.add_argument("--ilp_floor_top_k", type=int, default=0,
+                    help="ILP only: enforce a hard SL floor (--ilp_floor_min_sl) "
+                         "for the top-K most-sensitive search units. 0 = off.")
+    ap.add_argument("--ilp_floor_min_sl", type=int, default=192,
+                    help="ILP only: floor SL value for top-K floored units.")
     ap.add_argument("--init_level", type=int, default=192)
     ap.add_argument("--init_sl_map_json", default="")
     ap.add_argument("--n_search", type=int, default=8,
@@ -405,6 +419,18 @@ def main():
                          "sensitivity grid was generated at 1280 so this "
                          "is a slight prior mismatch but the swap phase "
                          "overrides it via real forward MSE.")
+    ap.add_argument("--mac_bucket_tol", type=float, default=0.0,
+                    help="Swap pair MAC tolerance: bucket pairs by "
+                         "(MAC_class, |Δ_sl|) where two units share a class "
+                         "iff their MACs differ by ≤ this fraction. "
+                         "0.0 (default) = exact MAC match (legacy behavior). "
+                         "0.10 = 10%% tolerance, recommended with --init_mode ilp "
+                         "to allow within-class swaps across mlp/qk_global "
+                         "(both ~55-58G).")
+    ap.add_argument("--drift_warn_threshold", type=float, default=0.01,
+                    help="Warn if cumulative main_sl drift (relative to "
+                         "post-init main_sl) exceeds this fraction. "
+                         "Only meaningful with --mac_bucket_tol > 0.")
     ap.add_argument("--out_json",
                     default="sensitivity/sl_maps/avg192_mp.json")
     args = ap.parse_args()
@@ -459,6 +485,9 @@ def main():
         op_macs_fn=backend.op_macs, n_blocks=n_blocks,
         init_mode=args.init_mode, init_level=args.init_level,
         init_sl_map=init_sl_map, n_bins=1,
+        ilp_util_mode=args.ilp_util_mode,
+        ilp_floor_top_k=args.ilp_floor_top_k,
+        ilp_floor_min_sl=args.ilp_floor_min_sl,
     )
 
     init_main = ms.compute_main_sl(sl_map, active_ops, backend.op_macs)
@@ -486,6 +515,8 @@ def main():
             fwd_chunk=args.fwd_chunk, cache_dtype=cache_dtype, n_bins=1,
             pair_eval_topk=args.pair_eval_topk,
             lookahead_blocks=args.lookahead_blocks,
+            mac_bucket_tol=args.mac_bucket_tol,
+            drift_warn_threshold=args.drift_warn_threshold,
         )
 
     final_main = ms.compute_main_sl(final_sl_map, active_ops, backend.op_macs)
@@ -507,6 +538,11 @@ def main():
         "max_iters": 0 if args.no_search else args.max_iters,
         "no_search": bool(args.no_search),
         "init_mode": args.init_mode,
+        "ilp_util_mode": args.ilp_util_mode,
+        "ilp_floor_top_k": args.ilp_floor_top_k,
+        "ilp_floor_min_sl": args.ilp_floor_min_sl,
+        "mac_bucket_tol": args.mac_bucket_tol,
+        "drift_warn_threshold": args.drift_warn_threshold,
         "pair_eval_topk": args.pair_eval_topk,
         "lookahead_blocks": args.lookahead_blocks,
         "init_meta": init_meta,
