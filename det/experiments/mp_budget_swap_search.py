@@ -227,13 +227,13 @@ class DetBackend(ms.MPSearchBackend):
 
     def __init__(self, *, sc_prec: int, n_search: int, batch_size: int,
                  workers: int, sc_config: str,
-                 d2_datasets: str = "", ckpt: str = ""):
+                 d2_datasets: str = "", ckpt: str = "", size: int = 0):
         self._sc_prec = sc_prec
         self._n_search = n_search
         self._batch_size = batch_size
         self._workers = workers
         self._sc_config = sc_config
-        self._d2_kw = dict(d2_datasets=d2_datasets, ckpt=ckpt)
+        self._d2_kw = dict(d2_datasets=d2_datasets, ckpt=ckpt, size=size)
 
     def op_macs(self, op: str, block_idx: int) -> float:
         if op in _EVA_LINEAR_MACS:
@@ -370,14 +370,37 @@ def main():
                     help="Per-op maximum stoc_len.")
     ap.add_argument("--proxy", default="comp_residual",
                     choices=["raw_mse", "comp_residual"])
-    ap.add_argument("--init_mode", default="uniform_repair",
-                    choices=["sensitivity_dp", "uniform_repair", "map_repair"])
+    ap.add_argument("--init_mode", default="sensitivity_dp",
+                    choices=["sensitivity_dp", "uniform_repair", "map_repair", "ilp"],
+                    help="DP over sensitivity (default) maximizes "
+                         "Σ sens·SL under the budget — most-sensitive slots "
+                         "get high SL, least-sensitive get low SL. "
+                         "Combine with --no_search for pure-DP fast path. "
+                         "Use 'ilp' for arbitrary-MAC-spread search "
+                         "(scipy.optimize.milp; supports qkv_proj+out_proj+qk+av "
+                         "all together; pair with --mac_bucket_tol 0.10).")
+    ap.add_argument("--ilp_util_mode", default="sens_mac",
+                    choices=["sens_mac", "sens"],
+                    help="ILP utility: 'sens_mac' = max Σ sens·MAC·ℓ "
+                         "(pure-sens ranking, recommended for heterogeneous MAC); "
+                         "'sens' = max Σ sens·ℓ (cost-aware, sens/MAC ranking, "
+                         "matches the equal-MAC DP semantics).")
+    ap.add_argument("--ilp_floor_top_k", type=int, default=0,
+                    help="ILP only: enforce a hard SL floor (--ilp_floor_min_sl) "
+                         "for the top-K most-sensitive search units. 0 = off.")
+    ap.add_argument("--ilp_floor_min_sl", type=int, default=192,
+                    help="ILP only: floor SL value for top-K floored units.")
     ap.add_argument("--init_level", type=int, default=192)
     ap.add_argument("--init_sl_map_json", default="")
     ap.add_argument("--n_search", type=int, default=8,
                     help="Number of calibration images for the search proxy.")
     ap.add_argument("--search_seed", type=int, default=1)
     ap.add_argument("--max_iters", type=int, default=4)
+    ap.add_argument("--no_search", action="store_true",
+                    help="Skip iterative_swap_search entirely — output the "
+                         "DP-initialized sl_map directly. No model load, no "
+                         "calibration forward. Useful for fast sweeps over "
+                         "different target_main_sl / sc_config.")
     ap.add_argument("--pair_eval_topk", type=int, default=0)
     ap.add_argument("--lookahead_blocks", type=int, default=0)
     ap.add_argument("--ridge", type=float, default=1e-2)
@@ -390,6 +413,24 @@ def main():
     ap.add_argument("--workers", type=int, default=2)
     ap.add_argument("--d2_datasets", default="")
     ap.add_argument("--ckpt", default="")
+    ap.add_argument("--size", type=int, default=0,
+                    help="Override input square size (multiple of 256). "
+                         "0=default 1280. Use 1024 for ~36% speedup; "
+                         "sensitivity grid was generated at 1280 so this "
+                         "is a slight prior mismatch but the swap phase "
+                         "overrides it via real forward MSE.")
+    ap.add_argument("--mac_bucket_tol", type=float, default=0.0,
+                    help="Swap pair MAC tolerance: bucket pairs by "
+                         "(MAC_class, |Δ_sl|) where two units share a class "
+                         "iff their MACs differ by ≤ this fraction. "
+                         "0.0 (default) = exact MAC match (legacy behavior). "
+                         "0.10 = 10%% tolerance, recommended with --init_mode ilp "
+                         "to allow within-class swaps across mlp/qk_global "
+                         "(both ~55-58G).")
+    ap.add_argument("--drift_warn_threshold", type=float, default=0.01,
+                    help="Warn if cumulative main_sl drift (relative to "
+                         "post-init main_sl) exceeds this fraction. "
+                         "Only meaningful with --mac_bucket_tol > 0.")
     ap.add_argument("--out_json",
                     default="sensitivity/sl_maps/avg192_mp.json")
     args = ap.parse_args()
@@ -405,7 +446,7 @@ def main():
         sc_prec=args.sc_prec, n_search=args.n_search,
         batch_size=args.batch_size, workers=args.workers,
         sc_config=args.sc_config,
-        d2_datasets=args.d2_datasets, ckpt=args.ckpt,
+        d2_datasets=args.d2_datasets, ckpt=args.ckpt, size=args.size,
     )
 
     active_ops = backend.build_active_ops(args.sc_config)
@@ -444,12 +485,10 @@ def main():
         op_macs_fn=backend.op_macs, n_blocks=n_blocks,
         init_mode=args.init_mode, init_level=args.init_level,
         init_sl_map=init_sl_map, n_bins=1,
+        ilp_util_mode=args.ilp_util_mode,
+        ilp_floor_top_k=args.ilp_floor_top_k,
+        ilp_floor_min_sl=args.ilp_floor_min_sl,
     )
-
-    cache_dtype = (torch.float16 if args.cache_dtype == "float16"
-                   else torch.float32)
-    loader = backend.build_loader(args.n_search, args.search_seed,
-                                  args.batch_size, args.workers)
 
     init_main = ms.compute_main_sl(sl_map, active_ops, backend.op_macs)
     print(f"[swap_search] initial main_sl={init_main:.2f} "
@@ -458,16 +497,27 @@ def main():
     print(f"[swap_search] initial per_op="
           f"{ms.summarize_per_op(sl_map, active_ops)}", flush=True)
 
-    final_sl_map, history, last_iter = ms.iterative_swap_search(
-        backend=backend,
-        active_ops=active_ops, search_ops=search_ops,
-        search_units=search_units, sl_map=sl_map, spaces=spaces,
-        loader=loader, device=device, sc_prec=args.sc_prec,
-        proxy=args.proxy, ridge=args.ridge, max_iters=args.max_iters,
-        fwd_chunk=args.fwd_chunk, cache_dtype=cache_dtype, n_bins=1,
-        pair_eval_topk=args.pair_eval_topk,
-        lookahead_blocks=args.lookahead_blocks,
-    )
+    if args.no_search:
+        print(f"[swap_search] --no_search: skipping iterative_swap_search, "
+              f"using DP-init sl_map directly", flush=True)
+        final_sl_map, history, last_iter = sl_map, [], None
+    else:
+        cache_dtype = (torch.float16 if args.cache_dtype == "float16"
+                       else torch.float32)
+        loader = backend.build_loader(args.n_search, args.search_seed,
+                                      args.batch_size, args.workers)
+        final_sl_map, history, last_iter = ms.iterative_swap_search(
+            backend=backend,
+            active_ops=active_ops, search_ops=search_ops,
+            search_units=search_units, sl_map=sl_map, spaces=spaces,
+            loader=loader, device=device, sc_prec=args.sc_prec,
+            proxy=args.proxy, ridge=args.ridge, max_iters=args.max_iters,
+            fwd_chunk=args.fwd_chunk, cache_dtype=cache_dtype, n_bins=1,
+            pair_eval_topk=args.pair_eval_topk,
+            lookahead_blocks=args.lookahead_blocks,
+            mac_bucket_tol=args.mac_bucket_tol,
+            drift_warn_threshold=args.drift_warn_threshold,
+        )
 
     final_main = ms.compute_main_sl(final_sl_map, active_ops, backend.op_macs)
     final_eff = ms.compute_eff_sl(
@@ -477,15 +527,22 @@ def main():
     out = {
         "sc_config": args.sc_config,
         "target_main_sl": args.target_main_sl,
-        "proxy": args.proxy,
+        "proxy": "none" if args.no_search else args.proxy,
         "levels": levels,
         "search_ops": sorted(search_ops),
         "fixed_ops": fixed_ops,
         "op_min_levels": op_min_levels,
         "op_max_levels": op_max_levels,
-        "n_search": args.n_search,
+        "n_search": 0 if args.no_search else args.n_search,
         "search_seed": args.search_seed,
-        "max_iters": args.max_iters,
+        "max_iters": 0 if args.no_search else args.max_iters,
+        "no_search": bool(args.no_search),
+        "init_mode": args.init_mode,
+        "ilp_util_mode": args.ilp_util_mode,
+        "ilp_floor_top_k": args.ilp_floor_top_k,
+        "ilp_floor_min_sl": args.ilp_floor_min_sl,
+        "mac_bucket_tol": args.mac_bucket_tol,
+        "drift_warn_threshold": args.drift_warn_threshold,
         "pair_eval_topk": args.pair_eval_topk,
         "lookahead_blocks": args.lookahead_blocks,
         "init_meta": init_meta,

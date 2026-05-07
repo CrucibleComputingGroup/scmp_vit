@@ -28,6 +28,10 @@ def main():
                    help="DETECTRON2_DATASETS root (default: GreatLakes shared_data).")
     p.add_argument("--ckpt", type=str, default="",
                    help="Path to EVA-ViTDet checkpoint (default: GreatLakes shared_data).")
+    p.add_argument("--use_soft_nms", action="store_true",
+                   help="Enable mmcv linear soft NMS in CascadeROIHeads.")
+    p.add_argument("--interp_type", choices=["", "vitdet", "beit"], default="",
+                   help="ViT rel-pos interp type ('beit' for off-train res).")
     args = p.parse_args()
 
     out_dir = Path(__file__).parent / "results" / args.out_tag
@@ -36,7 +40,8 @@ def main():
     print(f"[1] Loading config + model + weights")
     model, test_loader, evaluator, subset = load_model_and_loader(
         args.n_eval, d2_datasets=args.d2_datasets, ckpt=args.ckpt,
-        size=args.size)
+        size=args.size,
+        use_soft_nms=args.use_soft_nms, interp_type=args.interp_type)
     n_params = sum(p.numel() for p in model.parameters()) / 1e6
     print(f"    params: {n_params:.1f}M   subset: {len(subset)} images")
 
@@ -53,6 +58,9 @@ def main():
 
     out = {
         "n_eval": args.n_eval,
+        "size": args.size or 1280,
+        "use_soft_nms": bool(args.use_soft_nms),
+        "interp_type": args.interp_type or "vitdet",
         "eval_seconds": dt,
         **results,
     }

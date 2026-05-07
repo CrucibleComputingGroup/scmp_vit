@@ -463,39 +463,32 @@ def build_initial_sl_map(
     init_level: Optional[int] = None,
     init_sl_map: Optional[dict[str, list]] = None,
     n_bins: int = 1,
+    ilp_util_mode: str = "sens_mac",
+    ilp_floor_top_k: int = 0,
+    ilp_floor_min_sl: int = 192,
 ) -> tuple[dict[str, list[int]], dict[str, object]]:
     """Build a starting sl_map that satisfies the budget exactly (or as
     closely as the level set permits).
 
     Init modes:
       * sensitivity_dp: maximize ``sum sens * sl`` while matching target.
+        Equal-MAC DP; raises if search-unit MACs spread > 1.5×.
       * uniform_repair: start from an all-``init_level`` baseline and only
         deviate where required to hit the budget; deviations on
-        high-sensitivity slots are penalized more.
+        high-sensitivity slots are penalized more. Equal-MAC DP.
       * map_repair: start from ``init_sl_map`` and stay close to it
         (used to initialize a higher-budget search from a lower-budget
-        result).
-
-    Equal-MAC requirement: all ``search_units`` must share the same
-    per-unit MAC. ``build_search_units`` enforces this implicitly via the
-    ``search_ops`` set. ``build_initial_sl_map`` raises if heterogeneous
-    MACs are detected.
+        result). Equal-MAC DP.
+      * ilp: scipy.optimize.milp formulation; handles **arbitrary** MAC
+        spread (qk/av_window 562M ↔ qk/av_global 57.7G ↔ mlp 55.4G all in
+        the same search). Supports per-unit ``floor_top_k`` hard lower
+        bounds for the most-sensitive slots. See ``mp_ilp.py``.
     """
     sl_map = empty_sl_map(op_names, n_blocks)
     fixed_total = 0.0
     total_macs = 0.0
-    # Per-unit effective MAC. Original constraint: must be identical across
-    # search_units so the DP's `sum_of_stoc_lens` directly tracks
-    # `sum_of_bitops`. Relaxed for regimes where the searchable ops have
-    # similar-but-not-identical MAC. Concrete case: det at 1280² puts
-    # mlp_fc1/2 (55.4G), qkv_proj (38.0G) inside a 1.46× spread — adding
-    # qkv_proj to SEARCH_OPS expands the search dimension by 50% with
-    # only mild bitop-budget drift. With mean-MAC approximation, the DP
-    # operates in stoc_len-sum space; actual MAC budget drifts by at
-    # most ``max/min - 1`` from the mean. Hard cap the relaxation: if
-    # the spread exceeds ``mac_spread_tol`` the original strict failure
-    # is preserved (cls regime + det's qk/av windowed-vs-global stay
-    # safely rejected).
+    # Per-unit effective MAC. Equal-MAC DP variants require this to be
+    # near-constant across search_units; ILP mode handles arbitrary spread.
     search_mac_list = [
         float(op_macs_fn(*unit_parent(unit))) /
         (n_bins if len(unit) >= 3 else 1.0)
@@ -504,17 +497,22 @@ def build_initial_sl_map(
     if search_units:
         macs_min = min(search_mac_list)
         macs_max = max(search_mac_list)
-        mac_spread_tol = 1.5  # allow up to 50% max/min ratio
-        if macs_max / max(macs_min, 1e-9) > mac_spread_tol:
+        mac_spread_tol = 1.5  # allow up to 50% max/min ratio for the DP modes
+        # ILP mode bypasses this check — multiple-choice knapsack handles
+        # arbitrary MAC heterogeneity natively. The DP modes need it
+        # because they track ``sum_of_stoc_lens`` instead of bit-ops, which
+        # is only valid when MACs are (approximately) uniform.
+        if init_mode != "ilp" and macs_max / max(macs_min, 1e-9) > mac_spread_tol:
             raise ValueError(
                 "MP-budget swap search: search-unit per-unit MACs span "
                 f"[{macs_min:.3g}, {macs_max:.3g}], ratio "
                 f"{macs_max/max(macs_min,1e-9):.2f}× > tolerance "
-                f"{mac_spread_tol}×. Restrict --search_ops to ops whose "
-                "MACs are within 1.5× of each other "
-                "(e.g. cls's `proj,mlp_fc1,mlp_fc2`; det at 1280²: add qk,av).")
+                f"{mac_spread_tol}×. Either restrict --search_ops to ops "
+                "whose MACs are within 1.5× of each other (cls's "
+                "`proj,mlp_fc1,mlp_fc2`; det 1280²: mlp_fc1,mlp_fc2[,qkv_proj]) "
+                "or switch to --init_mode ilp which handles arbitrary spread.")
         search_mac = sum(search_mac_list) / len(search_mac_list)
-        if macs_max / max(macs_min, 1e-9) > 1.05:
+        if init_mode != "ilp" and macs_max / max(macs_min, 1e-9) > 1.05:
             print(f"[mp_search] heterogeneous MACs in search units "
                   f"(spread {macs_max/macs_min:.2f}×); using mean MAC "
                   f"{search_mac:.3g} for budget DP. Actual bitop budget "
@@ -534,10 +532,11 @@ def build_initial_sl_map(
     target_total = float(target_main_sl) * total_macs
     if search_units:
         remaining = target_total - fixed_total
-        target_sum_sl = int(round(remaining / search_mac))
+        target_sum_sl = int(round(remaining / search_mac)) if search_mac > 0 else 0
         min_sum = sum(min(level_spaces[unit]) for unit in search_units)
         max_sum = sum(max(level_spaces[unit]) for unit in search_units)
         clipped_target = min(max(target_sum_sl, min_sum), max_sum)
+        ilp_meta: Optional[dict] = None
         if init_mode == "uniform_repair":
             base_target = target_main_sl if init_level is None else int(init_level)
             base_levels: dict[tuple, int] = {}
@@ -581,6 +580,24 @@ def build_initial_sl_map(
                 search_units=search_units, spaces=level_spaces,
                 target_sum_sl=clipped_target, sens_map=sens_map,
             )
+        elif init_mode == "ilp":
+            # ILP mode: budget is in bit-ops, no equal-MAC requirement.
+            # ``chosen_sum`` is reported as Σ stoc_len (unweighted) for
+            # parity with the DP meta fields; the actual bit-op-level
+            # check is in ``ilp_meta['budget_gap_signed']``.
+            from sc_integration.mp_ilp import ilp_init_levels
+            target_bitops = float(target_main_sl) * total_macs - fixed_total
+            assignment, chosen_bitops, util, ilp_meta = ilp_init_levels(
+                search_units=search_units,
+                spaces=level_spaces,
+                target_bitops=target_bitops,
+                sens_map=sens_map,
+                op_macs_fn=op_macs_fn,
+                util_mode=ilp_util_mode,
+                floor_top_k=int(ilp_floor_top_k),
+                floor_min_sl=int(ilp_floor_min_sl),
+            )
+            chosen_sum = sum(int(sl) for sl in assignment.values())
         else:
             raise ValueError(f"unknown init_mode: {init_mode}")
         for unit, sl in assignment.items():
@@ -590,6 +607,7 @@ def build_initial_sl_map(
         chosen_sum = 0
         util = 0.0
         target_sum_sl = 0
+        ilp_meta = None
 
     actual_main = compute_main_sl(sl_map, active_ops, op_macs_fn)
     meta = {
@@ -605,6 +623,8 @@ def build_initial_sl_map(
         "utility": util,
         "actual_main_sl": actual_main,
     }
+    if ilp_meta is not None:
+        meta["ilp_meta"] = ilp_meta
     return sl_map, meta
 
 
@@ -916,7 +936,11 @@ def _refine_pair_candidates(
                 if best_pair is None or pair_delta < best_delta:
                     best_delta = pair_delta
                     best_pair = {
-                        "step": step,
+                        # Same step-vs-bucket_key split as the main loop:
+                        # ``step`` is always int SL units; ``bucket_key`` is
+                        # whatever the bucket dict was keyed on (int or tuple).
+                        "step": int(abs(int(up["delta_sl"]))),
+                        "bucket_key": step,
                         "upgrade": up,
                         "downgrade": down,
                         "delta_score": pair_delta,
@@ -929,6 +953,42 @@ def _refine_pair_candidates(
 # ============================================================================
 # Main entry point: iterative_swap_search
 # ============================================================================
+
+
+def _build_mac_classes(
+    search_units: list[tuple],
+    op_macs_fn: Callable[[str, int], float],
+    tol: float,
+) -> dict[tuple, int]:
+    """Cluster ``search_units`` into MAC equivalence classes.
+
+    Two units land in the same class iff their per-unit MACs differ by at
+    most ``tol`` (relative). Sort by MAC, scan once, start a new class
+    whenever the next MAC exceeds ``(1+tol)`` of the previous one. This
+    guarantees within-class ``max/min ≤ (1+tol)``.
+
+    Returns ``{unit: class_id}``. Class ids are 0-indexed integers.
+
+    With ``tol=0.0`` (default for backward-compat), only exact-MAC
+    matches share a class — equivalent to the old ``Δ_sl``-only bucket
+    when search_ops are restricted to a single MAC.
+    """
+    if not search_units:
+        return {}
+    if tol < 0:
+        raise ValueError(f"mac_bucket_tol must be ≥ 0, got {tol}")
+    units_sorted = sorted(search_units,
+                          key=lambda u: op_macs_fn(*unit_parent(u)))
+    classes: dict[tuple, int] = {}
+    cur_cls = 0
+    last_mac: Optional[float] = None
+    for u in units_sorted:
+        m = float(op_macs_fn(*unit_parent(u)))
+        if last_mac is not None and m / max(last_mac, 1e-9) > 1.0 + tol:
+            cur_cls += 1
+        classes[u] = cur_cls
+        last_mac = m
+    return classes
 
 
 def iterative_swap_search(
@@ -950,12 +1010,33 @@ def iterative_swap_search(
     n_bins: int,
     pair_eval_topk: int,
     lookahead_blocks: int,
+    mac_bucket_tol: float = 0.0,
+    drift_warn_threshold: float = 0.01,
     log_fn: Callable[[str], None] = print,
 ) -> tuple[dict[str, list], list[dict[str, object]], dict[str, object]]:
     """Iterative pairwise swap search. Each round: score every ±1-step
     move per unit on the proxy, pick the best zero-budget upgrade+downgrade
     pair (optionally re-scored jointly with downstream lookahead), apply
     if it improves the global proxy. Stops when no swap improves.
+
+    Pair bucketing:
+      ``mac_bucket_tol == 0`` (default): bucket by ``|Δ_sl|`` only — the
+        original equal-MAC behavior. Backward-compatible with all existing
+        DP-based init modes that enforce equal MAC across search_units.
+      ``mac_bucket_tol > 0``: bucket by ``(mac_class, |Δ_sl|)``, where two
+        units share a MAC class iff their MACs differ by ≤ ``mac_bucket_tol``
+        (relative). Designed for ``init_mode=ilp`` where search_units span
+        multiple MAC magnitudes (e.g. det's qk/av_window 562M ↔ mlp 55.4G).
+        Within a class, swap pairs are still ±1-step zero-budget; across
+        classes, no pair forms (cross-class budget redistribution is the
+        ILP init's job, not swap's).
+
+    Drift watch:
+      Whenever an accepted pair shifts ``main_sl`` by more than
+      ``drift_warn_threshold`` (relative to the post-init main_sl), log a
+      warning. With ``mac_bucket_tol > 0`` the per-pair drift is bounded
+      by ``tol`` and statistically near-zero, but the cumulative drift
+      across many swaps can grow.
 
     Returns ``(final_sl_map, history, last_iter_meta)``.
     """
@@ -965,6 +1046,10 @@ def iterative_swap_search(
     history: list[dict[str, object]] = []
     iteration_meta: dict[str, object] = {}
     n_loader = getattr(loader.dataset, "__len__", lambda: 0)()
+    mac_classes = _build_mac_classes(search_units, backend.op_macs,
+                                      mac_bucket_tol)
+    initial_main_sl = compute_main_sl(sl_map, active_ops, backend.op_macs)
+    drift_warned = False
 
     for it in range(max_iters):
         t0 = time.time()
@@ -980,8 +1065,12 @@ def iterative_swap_search(
         model_fp = backend.load_model(torch.device("cpu")).eval()
         fp_blocks = backend.get_blocks(model_fp)
 
-        upgrades_by_step: dict[int, list[dict[str, object]]] = defaultdict(list)
-        downgrades_by_step: dict[int, list[dict[str, object]]] = defaultdict(list)
+        # Bucket key: (mac_class, |Δ_sl|) when mac_bucket_tol > 0, else
+        # |Δ_sl| alone (legacy equal-MAC behavior). Both are valid dict keys;
+        # the consumer code (`upgrades_by_step.items()` + `.get(key)`) is
+        # key-type-agnostic.
+        upgrades_by_step: dict = defaultdict(list)
+        downgrades_by_step: dict = defaultdict(list)
         block_reports = []
         search_blocks = sorted({int(unit[1]) for unit in search_units})
         for bi in search_blocks:
@@ -1010,10 +1099,15 @@ def iterative_swap_search(
             })
             for cand in report["candidates"]:
                 step = abs(int(cand["delta_sl"]))
+                if mac_bucket_tol > 0:
+                    cls = mac_classes.get(tuple(cand["slot"]), -1)
+                    key: object = (cls, step)
+                else:
+                    key = step
                 if cand["delta_sl"] > 0:
-                    upgrades_by_step[step].append(cand)
+                    upgrades_by_step[key].append(cand)
                 elif cand["delta_sl"] < 0:
-                    downgrades_by_step[step].append(cand)
+                    downgrades_by_step[key].append(cand)
 
         best_pair = None
         best_delta = 0.0
@@ -1030,7 +1124,11 @@ def iterative_swap_search(
                     if best_pair is None or pair_delta < best_delta:
                         best_delta = pair_delta
                         best_pair = {
-                            "step": step,
+                            # Step in SL units (always int) — the bucket
+                            # key may be a tuple when mac_bucket_tol > 0,
+                            # but the history entry wants a plain int step.
+                            "step": int(abs(int(up["delta_sl"]))),
+                            "bucket_key": step,
                             "upgrade": up,
                             "downgrade": down,
                             "delta_score": pair_delta,
@@ -1088,6 +1186,19 @@ def iterative_swap_search(
         down = best_pair["downgrade"]
         set_unit_level(sl_map, tuple(up["slot"]), int(up["new_sl"]), n_bins)
         set_unit_level(sl_map, tuple(down["slot"]), int(down["new_sl"]), n_bins)
+        main_sl_after = compute_main_sl(sl_map, active_ops, backend.op_macs)
+        # Drift watch: cumulative deviation from post-init main_sl.
+        # When mac_bucket_tol > 0, individual pairs may not be perfectly
+        # zero-budget (within ±tol of MAC), and many swaps can compound.
+        if initial_main_sl > 0:
+            drift_frac = abs(main_sl_after - initial_main_sl) / initial_main_sl
+            if drift_frac > drift_warn_threshold and not drift_warned:
+                log_fn(
+                    f"[swap_search] WARN cumulative main_sl drift {drift_frac:.3%} "
+                    f"exceeds threshold {drift_warn_threshold:.1%} (init {initial_main_sl:.2f} → "
+                    f"now {main_sl_after:.2f}); MAC-tol pairs accumulating budget skew."
+                )
+                drift_warned = True
         history.append({
             "iter": it,
             "delta_score": float(best_pair["delta_score"]),
@@ -1106,7 +1217,10 @@ def iterative_swap_search(
                 "new_sl": int(down["new_sl"]),
                 "delta_score": float(down["delta_score"]),
             },
-            "main_sl_after": compute_main_sl(sl_map, active_ops, backend.op_macs),
+            "main_sl_after": main_sl_after,
         })
 
+    iteration_meta["initial_main_sl"] = float(initial_main_sl)
+    iteration_meta["drift_warned"] = bool(drift_warned)
+    iteration_meta["mac_bucket_tol"] = float(mac_bucket_tol)
     return sl_map, history, iteration_meta

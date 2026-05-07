@@ -22,7 +22,8 @@ from pathlib import Path
 
 import torch
 
-from eval_common import load_model_and_loader, set_evaluator_output_dir
+from eval_common import (load_model_and_loader, set_evaluator_output_dir,
+                         checkpointed_eval, file_sha256)
 
 _HERE = Path(__file__).resolve().parent
 _REPO = _HERE.parent
@@ -134,6 +135,13 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--n-eval", type=int, default=100)
     p.add_argument("--sc_prec", type=int, default=8)
+    p.add_argument("--stoc_len", type=int, default=0,
+                   help="Override SC bitstream length for ALL ops (fast "
+                        "uniform path). Default 0 = use 2**sc_prec. Use this "
+                        "instead of --mp_levels L --mp_fractions 1.0 to avoid "
+                        "the MP routing overhead (extra abs/amax + index_select"
+                        " + index_copy_ per linear, plus a Python BH loop in "
+                        "SCMatMul av).")
 
     # --- Tier 1: per-block JSON schedule ---
     p.add_argument("--sc_ops_per_block_json", default="",
@@ -195,6 +203,21 @@ def main():
                    help="Output directory (containing metrics.json, predictions, "
                         "etc.). Default = det/results/<out-tag>. Use to redirect "
                         "into a sweep RES_DIR — e.g. results/sweep_x/<out-tag>.")
+    p.add_argument("--use_soft_nms", action="store_true",
+                   help="Enable mmcv linear soft NMS in CascadeROIHeads "
+                        "(iou_thresh=0.3, sigma=0.5). Default off — matches "
+                        "prior runs.")
+    p.add_argument("--interp_type", choices=["", "vitdet", "beit"], default="",
+                   help="ViT rel-pos interp type when q/k size != trained "
+                        "(80x80 for EVA at 1280). 'beit' = cubic on log-spaced "
+                        "grid (recommended for off-train res); '' / 'vitdet' "
+                        "= linear interp (default).")
+    p.add_argument("--resume", action="store_true",
+                   help="If checkpoint.pt exists in --out_dir, skip already-"
+                        "evaluated images and append new ones. cfg_sig must "
+                        "match (sched/sl_map files are sha-checked).")
+    p.add_argument("--save_every", type=int, default=50,
+                   help="Checkpoint cadence (images). Also flushed on SIGINT.")
     add_mp_args(p)
     args = p.parse_args()
 
@@ -212,7 +235,9 @@ def main():
           f"start_idx={args.start_idx})")
     model, test_loader, evaluator, subset = load_model_and_loader(
         args.n_eval, d2_datasets=args.d2_datasets, ckpt=args.ckpt,
-        size=args.size, start_idx=args.start_idx)
+        size=args.size, start_idx=args.start_idx,
+        use_soft_nms=args.use_soft_nms,
+        interp_type=args.interp_type)
     set_evaluator_output_dir(evaluator, out_dir)
 
     n_blocks = len(list(model.backbone.net.blocks))
@@ -261,7 +286,13 @@ def main():
         if attn_mp_spec:
             print(f"    attn_mp_spec ops={sorted(attn_mp_spec)}")
 
+        if args.stoc_len and (linear_mp_spec or attn_mp_spec):
+            raise SystemExit("--stoc_len conflicts with --mp_levels / "
+                             "--qk_mp_levels / --av_mp_levels (the whole "
+                             "point of --stoc_len is to skip the MP path).")
+        sl_eff = args.stoc_len or None  # None ⇒ sc_patch_eva uses 2**sc_prec
         print(f"[3] Patching backbone (sc_prec={args.sc_prec}, "
+              f"stoc_len={sl_eff or 2**args.sc_prec}, "
               f"mlp_mode={args.sc_mlp_mode}, proj_mode={args.sc_proj_mode})")
         stats = sc_patch_eva(
             model,
@@ -272,22 +303,46 @@ def main():
             linear_mp_spec=linear_mp_spec,
             attn_mp_spec=attn_mp_spec,
             mlp_chunk_d=args.mlp_chunk_d,
+            stoc_len=sl_eff,
         )
         print(f"    swapped: {stats}")
 
-    from detectron2.evaluation import inference_on_dataset
     from sc_triton import det_kernel_tuning
 
-    print(f"[4] Running inference on {args.n_eval} images")
+    cfg_sig = {
+        "n_eval": args.n_eval,
+        "start_idx": args.start_idx,
+        "size": args.size,
+        "sc_prec": args.sc_prec,
+        "stoc_len": args.stoc_len,
+        "schedule": {k: list(v) for k, v in sched.items()},
+        "sc_ops_per_block_json_sha256": file_sha256(args.sc_ops_per_block_json),
+        "sl_map_json_sha256": file_sha256(args.sl_map_json),
+        "sc_mlp_mode": args.sc_mlp_mode,
+        "sc_proj_mode": args.sc_proj_mode,
+        "mlp_chunk_d": args.mlp_chunk_d,
+        "use_soft_nms": bool(args.use_soft_nms),
+        "interp_type": args.interp_type or "",
+        "mp": mp_args_to_dict(args),
+    }
+    print(f"[4] Running inference on {args.n_eval} images "
+          f"(resume={args.resume}, save_every={args.save_every})")
     t0 = time.time()
     with torch.no_grad(), det_kernel_tuning():
-        results = inference_on_dataset(model, test_loader, evaluator)
+        results = checkpointed_eval(
+            model, evaluator, subset, out_dir,
+            cfg_sig=cfg_sig, save_every=args.save_every,
+            resume=args.resume, phase="eval", size=args.size,
+        )
     dt = time.time() - t0
-    print(f"    done in {dt:.1f}s ({dt/args.n_eval:.2f}s/img)")
+    print(f"    done in {dt:.1f}s ({dt/max(args.n_eval, 1):.2f}s/img)")
 
     out = {
         "n_eval": args.n_eval,
         "sc_prec": args.sc_prec,
+        "stoc_len": args.stoc_len or (1 << args.sc_prec),
+        "use_soft_nms": bool(args.use_soft_nms),
+        "interp_type": args.interp_type or "vitdet",
         "schedule_tier": tier,
         "sc_mlp_mode": args.sc_mlp_mode,
         "sc_proj_mode": args.sc_proj_mode,

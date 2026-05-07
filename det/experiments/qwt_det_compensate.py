@@ -39,7 +39,8 @@ for p in (_DET, _REPO, _QWT_LIB):
     if str(p) not in sys.path:
         sys.path.insert(0, str(p))
 
-from eval_common import load_model_and_loader, set_evaluator_output_dir
+from eval_common import (load_model_and_loader, set_evaluator_output_dir,
+                         checkpointed_eval, file_sha256)
 from mp_spec import (add_mp_args, build_attn_mp_spec, build_linear_mp_spec,
                      mp_args_to_dict)
 from sc_patch import sc_patch_eva, SC_OP_NAMES
@@ -147,15 +148,23 @@ class BackboneCalibLoader:
 
 
 @torch.no_grad()
-def run_coco_eval(model, test_loader, evaluator, out_dir):
-    from detectron2.evaluation import inference_on_dataset
-    set_evaluator_output_dir(evaluator, out_dir)
-    # det_kernel_tuning() opts in to det-tuned tile sizes for SCMatMul +
-    # SCLinear (commit 256f8ad: 1.81× e2e on EVA-ViTDet, bit-exact). cls
-    # path is unaffected — the context manager flips a re-entrant module
-    # counter that only enable-signal kernels read.
+def run_coco_eval(model, evaluator, subset, out_dir, *,
+                  cfg_sig, resume, save_every, phase, size):
+    """Checkpointed COCO eval. Drops the prior ``inference_on_dataset``
+    one-shot in favor of ``checkpointed_eval`` so a 5000-img run can
+    survive Ctrl-C / walltime kills mid-eval.
+
+    ``det_kernel_tuning()`` opts in to det-tuned tile sizes for SCMatMul +
+    SCLinear (commit 256f8ad: 1.81× e2e on EVA-ViTDet, bit-exact). cls
+    path is unaffected — the context manager flips a re-entrant module
+    counter that only enable-signal kernels read.
+    """
     with det_kernel_tuning():
-        return inference_on_dataset(model, test_loader, evaluator)
+        return checkpointed_eval(
+            model, evaluator, subset, out_dir,
+            cfg_sig=cfg_sig, save_every=save_every,
+            resume=resume, phase=phase, size=size,
+        )
 
 
 def main():
@@ -235,6 +244,14 @@ def main():
                         "the residual dim (EVA-ViTDet: 1408 / 16 = 88).")
     p.add_argument("--out_tag", default="qwt_det")
     p.add_argument("--out_json", default="results/qwt_det/run.json")
+    p.add_argument("--use_soft_nms", action="store_true",
+                   help="Enable mmcv linear soft NMS in CascadeROIHeads.")
+    p.add_argument("--interp_type", choices=["", "vitdet", "beit"], default="",
+                   help="ViT rel-pos interp type (see sc_eval.py for details).")
+    p.add_argument("--stoc_len", type=int, default=0,
+                   help="Override SC bitstream length for ALL ops (fast "
+                        "uniform path). Default 0 = use 2**sc_prec. Use this "
+                        "instead of --mp_levels L --mp_fractions 1.0.")
     p.add_argument("--d2_datasets", type=str, default="",
                    help="DETECTRON2_DATASETS root (default: GreatLakes shared_data).")
     p.add_argument("--ckpt", type=str, default="",
@@ -244,6 +261,14 @@ def main():
                         "experiments/mp_budget_swap_search.py. When set, "
                         "overrides --sc_ops_per_block_json and --mp_* flags; "
                         "patches the SC model per-block via the sl_map.")
+    p.add_argument("--resume", action="store_true",
+                   help="If checkpoint.pt exists in the per-phase output dir "
+                        "(sc_raw/, sc_comp/), skip already-evaluated images "
+                        "and append new ones. Calib is NOT checkpointed: a "
+                        "resume mid-sc_comp redoes calib (~minutes) but "
+                        "keeps the eval predictions already saved (~hours).")
+    p.add_argument("--save_every", type=int, default=50,
+                   help="Checkpoint cadence (images). Also flushed on SIGINT.")
     add_mp_args(p)
     args = p.parse_args()
 
@@ -270,7 +295,8 @@ def main():
           f"n_calib={args.n_calib}  n_eval={args.n_eval}", flush=True)
 
     # --- Load FP + SC models, both with full eval loaders. ---
-    _load_kw = dict(d2_datasets=args.d2_datasets, ckpt=args.ckpt, size=args.size)
+    _load_kw = dict(d2_datasets=args.d2_datasets, ckpt=args.ckpt, size=args.size,
+                    use_soft_nms=args.use_soft_nms, interp_type=args.interp_type)
     print("[model] loading FP reference", flush=True)
     _t = time.time()
     model_fp, test_loader_fp, evaluator_fp, _ = load_model_and_loader(
@@ -280,7 +306,7 @@ def main():
 
     print("[model] loading SC model (fresh copy)", flush=True)
     _t = time.time()
-    model_sc, test_loader_sc, evaluator_sc, _ = load_model_and_loader(
+    model_sc, test_loader_sc, evaluator_sc, subset_eval = load_model_and_loader(
         args.n_eval, start_idx=args.eval_start_idx, **_load_kw)
     model_sc.eval()
     prof["model_load_sc"] = time.time() - _t
@@ -313,12 +339,55 @@ def main():
             print(f"[mp] linear_mp_spec ops={sorted(linear_mp_spec)}", flush=True)
         if attn_mp_spec:
             print(f"[mp] attn_mp_spec ops={sorted(attn_mp_spec)}", flush=True)
-        print(f"[sc] patching model_sc (sc_prec={args.sc_prec})", flush=True)
+        if args.stoc_len and (linear_mp_spec or attn_mp_spec):
+            raise SystemExit("--stoc_len conflicts with --mp_levels (both "
+                             "compete for stoc_len). Use one or the other.")
+        sl_eff = args.stoc_len or None
+        print(f"[sc] patching model_sc (sc_prec={args.sc_prec}, "
+              f"stoc_len={sl_eff or 2**args.sc_prec})", flush=True)
         stats = sc_patch_eva(model_sc, sc_prec=args.sc_prec, sc_ops_per_block=sched,
                             linear_mp_spec=linear_mp_spec,
-                            attn_mp_spec=attn_mp_spec)
+                            attn_mp_spec=attn_mp_spec,
+                            stoc_len=sl_eff)
     prof["patch"] = time.time() - _t
     print(f"[sc] patched: {stats}", flush=True)
+
+    # --- Per-phase cfg signatures for the resumable eval. sc_raw depends
+    # only on the SC patch; sc_comp additionally depends on every calib /
+    # comp knob. A mismatch on resume aborts the run rather than silently
+    # mixing predictions from different configs.
+    sc_eval_sig = {
+        "n_eval": args.n_eval,
+        "eval_start_idx": args.eval_start_idx,
+        "size": args.size,
+        "sc_prec": args.sc_prec,
+        "sc_ops": args.sc_ops,
+        "sc_ops_per_block_json_sha256": file_sha256(args.sc_ops_per_block_json),
+        "sl_map_json_sha256": file_sha256(args.sl_map_json),
+        "stoc_len": args.stoc_len,
+        "use_soft_nms": bool(args.use_soft_nms),
+        "interp_type": args.interp_type or "",
+        "mp": mp_args_to_dict(args),
+    }
+    use_head_aligned = bool(args.head_aligned or args.head_aligned_only)
+    sc_comp_sig = dict(sc_eval_sig)
+    sc_comp_sig.update({
+        "n_calib": args.n_calib,
+        "calib_seed": args.calib_seed,
+        "calib_seed_b": args.calib_seed_b,
+        "ridge": args.ridge,
+        "start_block": args.start_block,
+        "cos_threshold": args.cos_threshold,
+        "last_block_cos_threshold": args.last_block_cos_threshold,
+        "norm_floor": args.norm_floor,
+        "lookahead_veto": bool(args.lookahead_veto),
+        "comp_mode": args.comp_mode,
+        "comp_sc_prec": args.comp_sc_prec,
+        "comp_sc_mode": args.comp_sc_mode,
+        "head_aligned": use_head_aligned,
+        "n_heads": args.n_heads if use_head_aligned else None,
+        "fwd_chunk": args.fwd_chunk,
+    })
 
     # --- SC baseline (optional) ---
     out_dir_base = _DET / "results" / args.out_tag
@@ -327,8 +396,10 @@ def main():
     if not args.skip_baseline:
         print("[eval] SC baseline (no comp)", flush=True)
         t0 = time.time()
-        res_sc_raw = run_coco_eval(model_sc, test_loader_sc, evaluator_sc,
-                                   out_dir_base / "sc_raw")
+        res_sc_raw = run_coco_eval(
+            model_sc, evaluator_sc, subset_eval, out_dir_base / "sc_raw",
+            cfg_sig=sc_eval_sig, resume=args.resume,
+            save_every=args.save_every, phase="sc_raw", size=args.size)
         prof["raw_sc_eval"] = time.time() - t0
         print(f"  bbox AP={res_sc_raw['bbox']['AP']:.2f}  "
               f"segm AP={res_sc_raw['segm']['AP']:.2f}  "
@@ -367,7 +438,7 @@ def main():
                                          max_items=args.n_calib, tag="B")
 
     # --- Comp kernel choice ---
-    use_head_aligned = bool(args.head_aligned or args.head_aligned_only)
+    # use_head_aligned was defined above when we built sc_comp_sig.
     comp_factory = None
     if args.comp_mode == "sc":
         if use_head_aligned:
@@ -455,8 +526,10 @@ def main():
     _, _, evaluator_sc2, _ = load_model_and_loader(
         args.n_eval, start_idx=args.eval_start_idx, **_load_kw)
     t0 = time.time()
-    res_sc_comp = run_coco_eval(model_sc, test_loader_sc, evaluator_sc2,
-                                out_dir_base / "sc_comp")
+    res_sc_comp = run_coco_eval(
+        model_sc, evaluator_sc2, subset_eval, out_dir_base / "sc_comp",
+        cfg_sig=sc_comp_sig, resume=args.resume,
+        save_every=args.save_every, phase="sc_comp", size=args.size)
     prof["comp_eval"] = time.time() - t0
     print(f"  bbox AP={res_sc_comp['bbox']['AP']:.2f}  "
           f"segm AP={res_sc_comp['segm']['AP']:.2f}  "
