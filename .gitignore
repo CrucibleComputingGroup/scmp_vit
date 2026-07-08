@@ -1,0 +1,24 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+logs/
+*.egg-info/
+.venv/
+.env
+.DS_Store
+.ipynb_checkpoints/
+.claude/
+
+# ImageNet parquet cache and other large data
+data/
+
+# Working notes / intermediate research artifacts (kept out of git history)
+IDEA_REPORT.md
+
+# Experiment results (regenerable from code)
+results/
+det/results/
+det/sensitivity/_smoke/
+det/sensitivity/_tmp/
+det/sensitivity/_shards/_tmp_*/

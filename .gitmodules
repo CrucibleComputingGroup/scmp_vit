@@ -1,0 +1,7 @@
+[submodule "QwT-SC"]
+	path = third_party/QwT-SC
+	url = git@github.com:Allenjin123/QwT.git
+[submodule "scmp_kernels"]
+	path = scmp_kernels
+	url = git@github.com:Polarisyjr/scmp_kernels.git
+	branch = vit_mp
