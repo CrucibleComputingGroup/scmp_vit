@@ -58,21 +58,24 @@ HERE = Path(__file__).resolve().parents[2]   # vit_sc/
 CLS = HERE / "cls"
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(CLS))
-sys.path.insert(0, str(HERE / "sc"))
 QWT_SC_LIB = HERE / "third_party" / "QwT-SC" / "QwT-vit-sc"
 if (QWT_SC_LIB / "qwt_sc").exists():
     sys.path.insert(0, str(QWT_SC_LIB))
 
 from eval import build_transform, load_model, seed_all
 from imagenet_parquet import ImageNetParquetVal
-from sc_attention_patch import (
+# Migrated 2026-07-25 off the retired sc/ + sc_integration/ stack onto
+# scmp_kernels (vendored at vit_sc/kernels). MPConfig and RidgeFitter are the
+# same objects, now maintained upstream; RidgeFitter is self-contained, so the
+# comp_residual proxy does NOT require the QwT-SC submodule (only installing
+# real compensation blocks does, which this script never did).
+from model.sc_vit import (
     SC_OP_NAMES,
     SCLinear,
     make_sc_attention_forward,
-    set_noise_model,
+    set_sc_defaults,
 )
-from sc_integration.mp_linear import MPConfig
-from mp_auto_calibrator import RidgeFitter
+from scmp_kernels.mp import MPConfig, RidgeFitter
 
 
 SENSITIVITY_JSON = HERE / "results" / "sensitivity_all_ops.json"
@@ -112,6 +115,11 @@ _FINE_KS = {
 
 
 def _build_skip_worst_k(k: int, n_blocks: int = 24) -> dict[str, list[int]]:
+    # k == 0 ("all_ops") drops nothing, so don't require the sensitivity file
+    # just to slice zero rows off it — that file is a regenerable artifact under
+    # the gitignored results/ tree and is absent in a fresh checkout.
+    if k <= 0:
+        return {name: [1] * n_blocks for name in SC_OP_NAMES}
     with open(SENSITIVITY_JSON) as f:
         data = json.load(f)
     rows = sorted(data["grid"], key=lambda r: r["l2"], reverse=True)
@@ -148,7 +156,26 @@ def build_active_ops(sc_config: str, n_blocks: int = 24) -> set[tuple[str, int]]
     raise ValueError(f"Unknown sc_config: {sc_config}")
 
 
+SENSITIVITY_MISSING = not SENSITIVITY_JSON.exists()
+
+
 def load_sensitivity() -> dict[tuple[str, int], float]:
+    """Per-(op, block) surrogate sensitivity, used only to weight block proxy
+    scores against each other.
+
+    The matrix is a regenerable artifact under the gitignored ``results/`` tree
+    and is produced by ``sensitivity_all_ops.py``, which still depends on the
+    retired Gaussian noise surrogate. When it is absent we fall back to UNIFORM
+    block weights — which is already this code's behaviour for any block missing
+    from the map (``block_weight.get(bi, 1.0)``).
+
+    Caveat worth carrying into any result produced this way: with uniform
+    weights the search values a proxy improvement in block 3 exactly as much as
+    one in block 22, whereas the sensitivity prior says late blocks dominate
+    end-to-end damage. Runs record this under ``block_weighting``.
+    """
+    if SENSITIVITY_MISSING:
+        return {}
     with open(SENSITIVITY_JSON) as f:
         data = json.load(f)
     return {(r["op"], int(r["block"])): float(r["l2"]) for r in data["grid"]}
@@ -856,6 +883,18 @@ def evaluate_block_moves(
 
 def build_block_weight(active_ops: set[tuple[str, int]],
                        sens_map: dict[tuple[str, int], float]) -> dict[int, float]:
+    """Per-block multiplier on proxy deltas.
+
+    NOTE the empty-``sens_map`` case must be handled here, not left to the
+    ``block_weight.get(bi, 1.0)`` fallbacks at the call sites: this function
+    *populates* an entry for every active block, so an absent sensitivity
+    matrix would fill every block with 0.0 rather than fall through to 1.0.
+    Every ``delta_score`` would then be exactly 0, no swap would ever beat the
+    ``>= -1e-12`` stop test, and the search would exit at iteration 0 reporting
+    "converged" while having moved nothing.
+    """
+    if not sens_map:
+        return {bi: 1.0 for _op, bi in active_ops}
     weights: dict[int, float] = defaultdict(float)
     for op, bi in active_ops:
         weights[bi] += sens_map.get((op, bi), 0.0)
@@ -1243,11 +1282,24 @@ def main():
     ap.add_argument("--data_root",
                     default="/scratch/nbleier_owned_root/nbleier_owned1/shared_data/imagenet/data")
     ap.add_argument("--out_json", default="results/mp_budget_swap_search.json")
+    ap.add_argument("--halve", type=int, default=1,
+                    help="uSystolic/HUB bipolar cycle halving. 1 (default) "
+                         "means --levels and --target_main_sl are HALVED "
+                         "cycle counts: effective levels = 2 x value, so the "
+                         "ladder 32/48/64/96/128 spans 64..256 levels.")
+    ap.add_argument("--chunk_d", type=int, default=128,
+                    help="SC linear input chunking. REQUIRED on wide MLPs — "
+                         "chunk_d=0 collapses ViT-L accuracy to ~0.")
     args = ap.parse_args()
 
     os.environ.setdefault("XFORMERS_DISABLED", "1")
     seed_all(args.search_seed)
-    set_noise_model(False)
+    # The legacy `set_noise_model(False)` is gone: the Gaussian SC surrogate was
+    # dropped with sc_integration/, so every path here is real SC already.
+    # `--halve` + `--chunk_d` are the knobs that matter now; both must match the
+    # uniform-SC cells this search is compared against.
+    set_sc_defaults(halve_bipolar_stoc_len=bool(args.halve),
+                    chunk_d=args.chunk_d)
     device = torch.device("cuda")
 
     active_ops = build_active_ops(args.sc_config)
@@ -1274,6 +1326,12 @@ def main():
     op_min_levels = _parse_int_map(args.op_min_levels)
     op_max_levels = _parse_int_map(args.op_max_levels)
     sens_map = load_sensitivity()
+    if SENSITIVITY_MISSING:
+        print(f"[swap_search] WARNING: {SENSITIVITY_JSON} absent -> UNIFORM "
+              f"block weights. Late blocks are no longer prioritised over "
+              f"early ones when scoring swaps; regenerate the matrix with "
+              f"sensitivity_all_ops.py to restore the original weighting.",
+              flush=True)
     init_sl_map = (_load_sl_map_json(args.init_sl_map_json)
                    if args.init_sl_map_json else None)
 
@@ -1346,6 +1404,14 @@ def main():
         "sc_config": args.sc_config,
         "target_main_sl": args.target_main_sl,
         "proxy": args.proxy,
+        # Budgets and levels are HALVED cycle counts when halve=1; effective
+        # levels = 2x. Recorded so a result is never read on the wrong axis.
+        "halve": bool(args.halve),
+        "chunk_d": args.chunk_d,
+        "effective_levels_target": (2 * args.target_main_sl if args.halve
+                                    else args.target_main_sl),
+        "block_weighting": ("uniform (sensitivity matrix absent)"
+                            if SENSITIVITY_MISSING else "surrogate_l2"),
         "levels": levels,
         "search_ops": sorted(search_ops),
         "fraction_ops": sorted(bin_ops),

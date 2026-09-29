@@ -1,3 +1,7 @@
 [submodule "QwT-SC"]
 	path = third_party/QwT-SC
 	url = git@github.com:Allenjin123/QwT.git
+[submodule "kernels"]
+	path = kernels
+	url = git@github.com:CrucibleComputingGroup/scmp_kernels.git
+	branch = HPCA_VIT
